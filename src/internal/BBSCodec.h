@@ -4,16 +4,11 @@
 #include <cstdint>
 #include <cstring>
 
+#include "BBSConfig.h"
 #include "BBSTypes.h"
 
 // Arduino-free codecs (design §2, §6): AD parser, MAC parse/format, HR/CSC/Power
 // measurement parsers. Time is passed in as nowMs; no heap, no String.
-
-// Default lives here for the Arduino-free host tests. Step 3 moves it into
-// BBSConfig.h (design §3).
-#ifndef BBS_POWER_STALE_MS
-#define BBS_POWER_STALE_MS 3000             // cadence → 0 without a new crank event
-#endif
 
 namespace BikeSensor {
 namespace internal {

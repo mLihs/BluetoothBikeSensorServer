@@ -3,19 +3,11 @@
 #include <atomic>
 #include <cstdint>
 
+#include "BBSConfig.h"
 #include "BBSMux.h"
 
-// Defaults live here for the Arduino-free host tests. Step 3 moves them into
-// BBSConfig.h (design §3) so every TU sees one Event layout (ODR).
-#ifndef BBS_EVENT_QUEUE_DEPTH
-#define BBS_EVENT_QUEUE_DEPTH 24
-#endif
-#ifndef BBS_NOTIFY_MAX_LEN
-#define BBS_NOTIFY_MAX_LEN 36               // full CPS measurement is 34 B (§6)
-#endif
 static_assert(BBS_EVENT_QUEUE_DEPTH >= 1 && BBS_EVENT_QUEUE_DEPTH <= 255,
               "ring indices are uint8_t");
-static_assert(BBS_NOTIFY_MAX_LEN >= 20 && BBS_NOTIFY_MAX_LEN <= 38, "Event must stay <= 48 B");
 
 namespace BikeSensor {
 namespace internal {
@@ -96,7 +88,7 @@ class EventQueue {
   }
 
   // Queue side of the §3.2 resync only: update() takes the flag before its
-  // drain and reconciles slots, scan and advertising (not built until §10 step 3).
+  // drain and reconciles slots, scan and advertising (Core::resync).
   void requestResync() { resyncNeeded_.store(true, std::memory_order_release); }
 
   bool takeResync() {
