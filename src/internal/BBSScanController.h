@@ -30,6 +30,11 @@ class ScanController {
   // HOST_RESET, resync and safety exits.
   void forceOff() { owner_ = ScanOwner::OFF; }
 
+  // Drop a remembered sleep-window remainder once a connect succeeds. Otherwise
+  // a tiny leftover (e.g. 200 ms) survives a long SUBSCRIBED session and becomes
+  // the first rescan after a later disconnect + failed direct attempt.
+  void clearRemainder() { remainderMs_ = 0; }
+
   // needScan: a slot is in WAIT_SCAN. slotBusy: a slot is FOUND,
   // STOPPING_FOR_CONNECT, CONNECTING, CANCELLING or DISCOVERING.
   void advance(BlePort& port, uint32_t now, bool needScan, bool slotBusy, Stats& stats) {

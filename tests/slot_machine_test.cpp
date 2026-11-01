@@ -286,6 +286,41 @@ static void testDisconnectDirectAttemptThenSleepScan() {
   assert(r.state() == SlotState::SUBSCRIBED && r.core->slot().failCount == 0);
 }
 
+static void testSleepRemainderClearedOnConnect() {
+  Rig r;
+  r.add();
+  r.update();
+  assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW);
+  assert(r.port.lastDurationMs == BBS_SLEEP_SCAN_DURATION_MS);
+  // Late match: stopForConnect remembers a tiny remainder.
+  r.at(r.now + BBS_SLEEP_SCAN_DURATION_MS - 200);
+  r.match(r.core->scan().epoch());
+  r.update();
+  assert(r.state() == SlotState::CONNECTING && r.port.discCancels == 1);
+  r.connectedEv(r.gen());
+  r.update();
+  assert(r.state() == SlotState::SUBSCRIBED);
+
+  // After a long SUBSCRIBED session, disconnect → direct fail → next sleep
+  // window must be the full duration, not the 200 ms leftover.
+  r.at(r.now + 60000);
+  r.discEv(r.gen());
+  r.update();
+  assert(r.state() == SlotState::CONNECTING);
+  const int startsBeforeFail = r.port.discStarts;
+  r.failEv(r.gen());
+  r.update();
+  assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 1);
+  // Slot backoff holds FOUND connects; WAIT_SCAN may start the sleep window at once.
+  // Without clearRemainder that window would be 200 ms; with it, full duration.
+  if (r.port.discStarts == startsBeforeFail) {
+    r.at(r.now + 1000);
+  }
+  assert(r.port.discStarts == startsBeforeFail + 1);
+  assert(r.port.lastDurationMs == BBS_SLEEP_SCAN_DURATION_MS);
+  assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW);
+}
+
 static void testConnectLostBeforeOnConnect() {
   Rig r;
   r.toConnecting();
@@ -1102,6 +1137,7 @@ int main() {
   testHappyPath();
   testAttemptGenStaleness();
   testDisconnectDirectAttemptThenSleepScan();
+  testSleepRemainderClearedOnConnect();
   testConnectLostBeforeOnConnect();
   testConnectErrorClassification();
   testConnectWatchdogAndCancelling();

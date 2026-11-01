@@ -287,6 +287,7 @@ class Core {
       if (s == SlotState::CONNECTING) {
         stats_.connects++;
         slot_.gattDone = false;
+        scan_.clearRemainder();
         enter(SlotState::DISCOVERING, now);
       } else if (s == SlotState::CANCELLING) {
         port_.disconnect(kSlot);
