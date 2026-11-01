@@ -32,7 +32,8 @@ constexpr uint8_t kAdNameComplete = 0x09;
 struct AdFields {
   const char* name;   // into the AD buffer, not NUL-terminated; nullptr if absent
   uint8_t nameLen;
-  uint8_t typeMask;   // raw typeBit()s; the caller ANDs requested/compiled types
+  bool    nameComplete;  // true if name came from AD 0x09 (for ADV/SCAN_RSP merge)
+  uint8_t typeMask;      // raw typeBit()s; the caller ANDs requested/compiled types
 };
 
 inline uint8_t typeBitForService(uint16_t uuid16) {
@@ -45,13 +46,12 @@ inline uint8_t typeBitForService(uint16_t uuid16) {
 }
 
 // One ADV or SCAN_RSP payload. A complete name (0x09) wins over a shortened
-// one (0x08). A zero length byte ends the payload. Returns false at the first
-// malformed element (runs past the end, odd 16-bit UUID list); fields from the
-// elements before it are kept.
+// one (0x08). A zero length byte ends the payload (padding; later bytes are
+// ignored). Returns false at the first malformed element (runs past the end,
+// odd 16-bit UUID list); fields from the elements before it are kept.
 inline bool parseAd(const uint8_t* data, size_t len, AdFields& out) {
-  out = AdFields{nullptr, 0, 0};
+  out = AdFields{};
   if (data == nullptr) len = 0;
-  bool nameComplete = false;
   size_t off = 0;
   while (off < len) {
     const uint8_t elemLen = data[off];
@@ -65,10 +65,10 @@ inline bool parseAd(const uint8_t* data, size_t len, AdFields& out) {
       for (uint8_t i = 0; i < payloadLen; i += 2) {
         out.typeMask |= typeBitForService(readU16(payload + i));
       }
-    } else if (type == kAdNameComplete || (type == kAdNameShort && !nameComplete)) {
+    } else if (type == kAdNameComplete || (type == kAdNameShort && !out.nameComplete)) {
       out.name = reinterpret_cast<const char*>(payload);
       out.nameLen = payloadLen;
-      nameComplete = (type == kAdNameComplete);
+      out.nameComplete = (type == kAdNameComplete);
     }
     off += 1u + elemLen;
   }
@@ -199,11 +199,14 @@ inline void applyPowerStale(PowerSample& s, const CrankState& crank, uint32_t no
 }
 
 // `sample` is the slot's last measurement (zeroed after a reset). cadence and
-// hasCadence carry over to packets without a new crank event; every other
-// field comes from this packet. Malformed (len < 4 or a flagged field does not
-// fit) → false; sample and crank are unchanged.
+// hasCadence carry over to packets without a new crank event (and stay true
+// when stale; only cadence drops to 0). Every other field comes from this
+// packet. `crankUpdated` is true only when bit 5 produced a valid crank delta
+// (same-ms packets are distinguishable; §6b cadence callback). Malformed
+// (len < 4 or a flagged field does not fit) → false; sample, crank and
+// crankUpdated are unchanged.
 inline bool parsePower(const uint8_t* data, size_t len, uint32_t nowMs, CrankState& crank,
-                       PowerSample& sample) {
+                       PowerSample& sample, bool& crankUpdated) {
   if (data == nullptr || len < 4) return false;
   const uint16_t flags = readU16(data);
   size_t off = 4;
@@ -227,13 +230,16 @@ inline bool parsePower(const uint8_t* data, size_t len, uint32_t nowMs, CrankSta
   next.energyKJ = next.hasEnergy ? readU16(data + energyOff) : 0;
   next.cadence = sample.cadence;
   next.hasCadence = sample.hasCadence;
+  bool updated = false;
   if ((flags & kCpsCrank) &&
       updateCrank(crank, readU16(data + crankOff), readU16(data + crankOff + 2), nowMs,
                   next.cadence)) {
     next.hasCadence = true;
+    updated = true;
   }
   applyPowerStale(next, crank, nowMs);
   sample = next;
+  crankUpdated = updated;
   return true;
 }
 

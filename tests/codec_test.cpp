@@ -40,6 +40,12 @@ static bool nameIs(const AdFields& f, const char* s) {
   return f.name != nullptr && f.nameLen == strlen(s) && memcmp(f.name, s, f.nameLen) == 0;
 }
 
+static bool parsePower(const uint8_t* data, size_t len, uint32_t nowMs, CrankState& crank,
+                       PowerSample& sample) {
+  bool crankUpdated = false;
+  return bs::parsePower(data, len, nowMs, crank, sample, crankUpdated);
+}
+
 // ---- AD parser ----
 
 static void testAdNameAndUuids() {
@@ -55,14 +61,14 @@ static void testAdNameAndUuids() {
   a.u8(5).u8(0x03).u16(0x180D).u16(0x180F);
   a.u8(6).u8(0x09).str("TICKR");
   assert(bs::parseAd(a.d, a.n, f));
-  assert(f.typeMask == kHR && nameIs(f, "TICKR"));
+  assert(f.typeMask == kHR && nameIs(f, "TICKR") && f.nameComplete);
 
   // Incomplete list with CSC + CPS: raw bits, no AND with compiled types here.
   Buf b;
   b.u8(5).u8(0x02).u16(0x1816).u16(0x1818);
   b.u8(4).u8(0x08).str("Ass");
   assert(bs::parseAd(b.d, b.n, f));
-  assert(f.typeMask == (kCSC | kPWR) && nameIs(f, "Ass"));
+  assert(f.typeMask == (kCSC | kPWR) && nameIs(f, "Ass") && !f.nameComplete);
 
   // Two lists accumulate; UUIDs are little endian (0x0D18 is not HR).
   Buf c;
@@ -74,10 +80,10 @@ static void testAdNameAndUuids() {
   // Complete name wins over shortened, in either order.
   Buf d;
   d.u8(4).u8(0x08).str("Ass").u8(8).u8(0x09).str("ASSIOMA");
-  assert(bs::parseAd(d.d, d.n, f) && nameIs(f, "ASSIOMA"));
+  assert(bs::parseAd(d.d, d.n, f) && nameIs(f, "ASSIOMA") && f.nameComplete);
   Buf e;
   e.u8(8).u8(0x09).str("ASSIOMA").u8(4).u8(0x08).str("Ass");
-  assert(bs::parseAd(e.d, e.n, f) && nameIs(f, "ASSIOMA"));
+  assert(bs::parseAd(e.d, e.n, f) && nameIs(f, "ASSIOMA") && f.nameComplete);
 
   // Empty name element and empty UUID list are valid.
   Buf g;
@@ -289,19 +295,19 @@ static void testPowerShortAndMinimal() {
   PowerSample s{};
   const PowerSample empty{};
   Buf b = powerBase(0, -5);
-  assert(!bs::parsePower(nullptr, 4, 0, crank, s));
+  assert(!parsePower(nullptr, 4, 0, crank, s));
   for (size_t n = 0; n < 4; ++n) {
-    assert(!bs::parsePower(b.d, n, 0, crank, s));
+    assert(!parsePower(b.d, n, 0, crank, s));
     assert(sameSample(s, empty));
   }
-  assert(bs::parsePower(b.d, 4, 0, crank, s));
+  assert(parsePower(b.d, 4, 0, crank, s));
   assert(s.watts == -5 && s.flags == 0 && s.balance == 0xFF && !s.balanceIsLeft);
   assert(!s.hasEnergy && s.energyKJ == 0 && !s.hasCadence && s.cadence == 0);
   assert(!crank.crankValid);
 
   // Trailing bytes beyond the flagged fields are ignored.
   b.u8(0x77).u8(0x88);
-  assert(bs::parsePower(b.d, b.n, 0, crank, s) && s.watts == -5);
+  assert(parsePower(b.d, b.n, 0, crank, s) && s.watts == -5);
 }
 
 static void testPowerEachFlagBit() {
@@ -316,7 +322,7 @@ static void testPowerEachFlagBit() {
 
     CrankState crank{};
     PowerSample s{};
-    assert(bs::parsePower(b.d, b.n, 0, crank, s));
+    assert(parsePower(b.d, b.n, 0, crank, s));
     assert(s.watts == 250 && s.flags == flags);
     assert(s.balance == (bit == 0 ? 100 : 0xFF));
     assert(s.balanceIsLeft == (bit == 1));
@@ -329,7 +335,7 @@ static void testPowerEachFlagBit() {
     if (kFieldLen[bit] > 0) {
       CrankState c2{};
       PowerSample s2{};
-      assert(!bs::parsePower(b.d, b.n - 1, 0, c2, s2));
+      assert(!parsePower(b.d, b.n - 1, 0, c2, s2));
       assert(!c2.crankValid && sameSample(s2, PowerSample{}));
     }
   }
@@ -353,7 +359,7 @@ static void testPowerFieldOrder() {
 
   CrankState crank{};
   PowerSample s{};
-  assert(bs::parsePower(b.d, b.n, 0, crank, s));
+  assert(parsePower(b.d, b.n, 0, crank, s));
   assert(s.watts == 321 && s.balance == 60 && s.balanceIsLeft);
   assert(s.hasEnergy && s.energyKJ == 4321 && s.flags == flags);
   assert(crank.crankValid && crank.prevCrankRev == 500 && crank.prevCrankTime == 2048);
@@ -362,13 +368,13 @@ static void testPowerFieldOrder() {
   b.d[1] = 0xFF;
   PowerSample r{};
   CrankState rc{};
-  assert(bs::parsePower(b.d, 34, 0, rc, r) && r.flags == 0xFFFF && r.energyKJ == 4321);
+  assert(parsePower(b.d, 34, 0, rc, r) && r.flags == 0xFFFF && r.energyKJ == 4321);
 
   // Every shorter length of the full packet is malformed.
   for (size_t n = 0; n < 34; ++n) {
     CrankState c2{};
     PowerSample s2{};
-    assert(!bs::parsePower(b.d, n, 0, c2, s2));
+    assert(!parsePower(b.d, n, 0, c2, s2));
     assert(!c2.crankValid);
   }
 
@@ -377,7 +383,9 @@ static void testPowerFieldOrder() {
   const PowerSample last = s;
   Buf c = powerBase(static_cast<uint16_t>((1u << 5) | (1u << 11)), 1);
   c.u16(501).u16(3072).u8(0x01);
-  assert(!bs::parsePower(c.d, c.n, 100, crank, s));
+  bool updated = true;
+  assert(!bs::parsePower(c.d, c.n, 100, crank, s, updated));
+  assert(updated);  // unchanged on failure
   assert(sameCrank(before, crank) && sameSample(last, s));
 }
 
@@ -390,58 +398,68 @@ static Buf powerCrank(uint16_t revs, uint16_t t, int16_t watts = 200) {
 static void testPowerCadence() {
   CrankState crank{};
   PowerSample s{};
+  bool updated = false;
 
   Buf p = powerCrank(10, 0);
-  assert(bs::parsePower(p.d, p.n, 1000, crank, s) && !s.hasCadence && s.cadence == 0);
+  assert(bs::parsePower(p.d, p.n, 1000, crank, s, updated) && !s.hasCadence && s.cadence == 0);
+  assert(!updated);  // first packet after reset: no delta
 
   p = powerCrank(11, 1024);
-  assert(bs::parsePower(p.d, p.n, 2000, crank, s) && s.hasCadence && s.cadence == 60);
-  assert(crank.lastCrankEventMs == 2000);
+  assert(bs::parsePower(p.d, p.n, 2000, crank, s, updated) && s.hasCadence && s.cadence == 60);
+  assert(updated && crank.lastCrankEventMs == 2000);
 
-  // Same crank data: cadence kept, timer not refreshed.
-  assert(bs::parsePower(p.d, p.n, 2050, crank, s) && s.cadence == 60);
+  // Same crank data: cadence kept, timer not refreshed, crankUpdated false.
+  assert(bs::parsePower(p.d, p.n, 2050, crank, s, updated) && s.cadence == 60);
+  assert(!updated && crank.lastCrankEventMs == 2000);
+
+  // Same nowMs as a prior event: before/after lastCrankEventMs would be equal,
+  // so §6b must use crankUpdated (two successive deltas in one ms).
+  p = powerCrank(12, 2048);
+  assert(bs::parsePower(p.d, p.n, 2000, crank, s, updated) && updated && s.cadence == 60);
+  p = powerCrank(13, 3072);
+  assert(bs::parsePower(p.d, p.n, 2000, crank, s, updated) && updated && s.cadence == 60);
   assert(crank.lastCrankEventMs == 2000);
 
   // Packet without bit 5 carries the last cadence.
   Buf noCrank = powerBase(0, 180);
-  assert(bs::parsePower(noCrank.d, noCrank.n, 2100, crank, s));
-  assert(s.watts == 180 && s.hasCadence && s.cadence == 60);
+  assert(bs::parsePower(noCrank.d, noCrank.n, 2100, crank, s, updated));
+  assert(!updated && s.watts == 180 && s.hasCadence && s.cadence == 60);
 
   // Crank wrap at 65535 for revs and time.
   p = powerCrank(65535, 64512);
-  assert(bs::parsePower(p.d, p.n, 3000, crank, s));
+  assert(parsePower(p.d, p.n, 3000, crank, s));
   p = powerCrank(1, 1024);  // 2 revs in 2 s across both wraps
-  assert(bs::parsePower(p.d, p.n, 4000, crank, s) && s.cadence == 60);
+  assert(parsePower(p.d, p.n, 4000, crank, s) && s.cadence == 60);
 
   // Clamp to 0xFFFF.
   p = powerCrank(2001, 1025);
-  assert(bs::parsePower(p.d, p.n, 4100, crank, s) && s.cadence == 0xFFFF);
+  assert(parsePower(p.d, p.n, 4100, crank, s) && s.cadence == 0xFFFF);
 }
 
 static void testPowerStale() {
   CrankState crank{};
   PowerSample s{};
   Buf p = powerCrank(10, 0);
-  assert(bs::parsePower(p.d, p.n, 1000, crank, s));
+  assert(parsePower(p.d, p.n, 1000, crank, s));
   p = powerCrank(12, 1024);  // 120 rpm
-  assert(bs::parsePower(p.d, p.n, 2000, crank, s) && s.cadence == 120);
+  assert(parsePower(p.d, p.n, 2000, crank, s) && s.cadence == 120);
 
   Buf noCrank = powerBase(0, 150);
   const uint32_t edge = 2000 + BBS_POWER_STALE_MS;
-  assert(bs::parsePower(noCrank.d, noCrank.n, edge, crank, s) && s.cadence == 120);
-  assert(bs::parsePower(noCrank.d, noCrank.n, edge + 1, crank, s));
+  assert(parsePower(noCrank.d, noCrank.n, edge, crank, s) && s.cadence == 120);
+  assert(parsePower(noCrank.d, noCrank.n, edge + 1, crank, s));
   assert(s.cadence == 0 && s.hasCadence);
 
   // Packet with bit 5 but no new crank event after stale: still 0.
-  assert(bs::parsePower(p.d, p.n, edge + 500, crank, s) && s.cadence == 0);
+  assert(parsePower(p.d, p.n, edge + 500, crank, s) && s.cadence == 0);
 
   // lastPower()/callback path: stale applied to a copy without a packet.
   PowerSample fresh{};
   CrankState c2{};
   Buf q = powerCrank(1, 0);
-  assert(bs::parsePower(q.d, q.n, 100, c2, fresh));
+  assert(parsePower(q.d, q.n, 100, c2, fresh));
   q = powerCrank(2, 1024);
-  assert(bs::parsePower(q.d, q.n, 200, c2, fresh) && fresh.cadence == 60);
+  assert(parsePower(q.d, q.n, 200, c2, fresh) && fresh.cadence == 60);
   PowerSample view = fresh;
   bs::applyPowerStale(view, c2, 200 + BBS_POWER_STALE_MS);
   assert(view.cadence == 60);
@@ -451,43 +469,43 @@ static void testPowerStale() {
 
   // A new crank event revives the cadence.
   p = powerCrank(14, 2048 + 1024);  // 2 revs in 2 s
-  assert(bs::parsePower(p.d, p.n, edge + 1000, crank, s) && s.cadence == 60);
+  assert(parsePower(p.d, p.n, edge + 1000, crank, s) && s.cadence == 60);
 
   // millis() wrap: elapsed time is unsigned.
   CrankState w{};
   PowerSample ws{};
   q = powerCrank(1, 0);
-  assert(bs::parsePower(q.d, q.n, 0xFFFFFFA0u, w, ws));
+  assert(parsePower(q.d, q.n, 0xFFFFFFA0u, w, ws));
   q = powerCrank(2, 1024);
-  assert(bs::parsePower(q.d, q.n, 0xFFFFFFC0u, w, ws) && ws.cadence == 60);
-  assert(bs::parsePower(noCrank.d, noCrank.n, 0x00000020u, w, ws) && ws.cadence == 60);
+  assert(parsePower(q.d, q.n, 0xFFFFFFC0u, w, ws) && ws.cadence == 60);
+  assert(parsePower(noCrank.d, noCrank.n, 0x00000020u, w, ws) && ws.cadence == 60);
   const uint32_t staleAfterWrap = 0xFFFFFFC0u + BBS_POWER_STALE_MS + 1u;
-  assert(bs::parsePower(noCrank.d, noCrank.n, staleAfterWrap, w, ws) && ws.cadence == 0);
+  assert(parsePower(noCrank.d, noCrank.n, staleAfterWrap, w, ws) && ws.cadence == 0);
 }
 
 static void testPowerResetAfterDisconnect() {
   CrankState crank{};
   PowerSample s{};
   Buf p = powerCrank(100, 0);
-  assert(bs::parsePower(p.d, p.n, 1000, crank, s));
+  assert(parsePower(p.d, p.n, 1000, crank, s));
   p = powerCrank(101, 1024);
-  assert(bs::parsePower(p.d, p.n, 2000, crank, s) && s.cadence == 60);
+  assert(parsePower(p.d, p.n, 2000, crank, s) && s.cadence == 60);
 
   // Without a reset a reconnect would compare against stale counters.
   CrankState noReset = crank;
   PowerSample noResetSample = s;
   Buf jump = powerCrank(160, 2048);
-  assert(bs::parsePower(jump.d, jump.n, 2500, noReset, noResetSample));
+  assert(parsePower(jump.d, jump.n, 2500, noReset, noResetSample));
   assert(noResetSample.cadence == 3540);
 
   // Disconnect: crank state and last measurement are cleared.
   bs::resetCrank(crank);
   s = PowerSample{};
   assert(!crank.crankValid);
-  assert(bs::parsePower(jump.d, jump.n, 2500, crank, s));
+  assert(parsePower(jump.d, jump.n, 2500, crank, s));
   assert(!s.hasCadence && s.cadence == 0);
   p = powerCrank(161, 3072);
-  assert(bs::parsePower(p.d, p.n, 3500, crank, s) && s.hasCadence && s.cadence == 60);
+  assert(parsePower(p.d, p.n, 3500, crank, s) && s.hasCadence && s.cadence == 60);
 }
 
 int main() {
