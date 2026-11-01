@@ -47,6 +47,7 @@ struct SensorSlot {
   bool       removing;                  // remove() in a link state: EMPTY on the outcome
   bool       gattDone;                  // DISCOVERING: pass failed, waiting for DISCONNECTED
   bool       directRetry;               // endAttempt → FOUND (one direct attempt), not WAIT_SCAN
+  bool       failPending;               // watchdog cancel / failed GATT pass: outcome is a hard fail
 };
 
 class Core {
@@ -173,6 +174,7 @@ class Core {
     slot_.removing = false;
     slot_.gattDone = false;
     slot_.directRetry = false;
+    slot_.failPending = false;
   }
 
   // Wait state after an attempt or link ends: MAC → WAIT_SCAN, or FOUND for a
@@ -197,6 +199,7 @@ class Core {
   void retarget(uint32_t now) {
     slot_.failCount = 0;
     slot_.removing = false;
+    slot_.failPending = false;
     switch (slot_.state) {
       case SlotState::CONNECTING:
         port_.cancelConnect(kSlot);
@@ -221,14 +224,25 @@ class Core {
     slot_.directRetry = true;
   }
 
-  void connectFailed(uint32_t now) {
+  // §5.2 hard fail: backoff → WAIT_SCAN, SENSOR_FAILED. connectFails only if
+  // the link never came up.
+  void hardFail(uint32_t now, bool connectFail) {
     if (slot_.failCount < 255) slot_.failCount++;
-    stats_.connectFails++;
+    if (connectFail) stats_.connectFails++;
     const uint8_t shift = slot_.failCount > 6 ? 5 : static_cast<uint8_t>(slot_.failCount - 1);
     const uint32_t backoff = kBackoffMinMs << shift;
     hold(now, backoff > kBackoffMaxMs ? kBackoffMaxMs : backoff);
     enter(SlotState::WAIT_SCAN, now);
     emit(EventType::SENSOR_FAILED, slot_.type);
+  }
+
+  // Outcome of a cancel: hard fail after the watchdog; remove()/replace stay neutral.
+  void endCancel(uint32_t now) {
+    if (slot_.failPending && !slot_.removing) {
+      hardFail(now, true);
+    } else {
+      endAttempt(now);
+    }
   }
 
   void emit(EventType type, SensorType sensorType, int reason = 0) {
@@ -297,17 +311,26 @@ class Core {
     if (ev.kind == Ev::DISCONNECTED) slot_.lastDisconnectReason = ev.reason;
     switch (s) {
       case SlotState::CONNECTING:     // fail, or link lost before onConnect
-        connectFailed(now);
+        hardFail(now, true);
         break;
       case SlotState::CANCELLING:
-        endAttempt(now);
+        endCancel(now);
         break;
       case SlotState::DISCOVERING:
-      case SlotState::SUBSCRIBED: {   // MAC retry after a link: one direct attempt, then sleep scan
-        if (ev.kind != Ev::DISCONNECTED) break;
+      case SlotState::SUBSCRIBED: {   // CONNECT_FAIL here is a link loss (NimBLE reason 0x3E)
+        slot_.lastDisconnectReason = ev.reason;
         stats_.disconnects++;
+        if (slot_.failPending && !slot_.removing) {
+          hardFail(now, false);       // failed/aborted GATT pass
+          break;
+        }
+        if (s == SlotState::DISCOVERING) {   // no SENSOR_CONNECTED yet: neutral, no event
+          endAttempt(now);
+          break;
+        }
+        // MAC retry after a link: one direct attempt, then sleep scan
         const SensorType type = slot_.type;
-        if (s == SlotState::SUBSCRIBED) slot_.directRetry = true;
+        slot_.directRetry = true;
         endAttempt(now);
         emit(EventType::SENSOR_DISCONNECTED, type, ev.reason);
         break;
@@ -329,17 +352,21 @@ class Core {
 
   // §3.2 steps 1, 2 and 4 (central count and advertising come with step 5).
   void resync(uint32_t now) {
+    if (!port_.discActive()) scan_.forceOff();   // first: the slot repair may emit()
     const bool connected = port_.isConnected(kSlot);
     const SlotState s = slot_.state;
     if (s == SlotState::DISCOVERING || s == SlotState::SUBSCRIBED) {
       if (!connected) {
-        // Missed DISCONNECTED: repair state. Only SUBSCRIBED had SENSOR_CONNECTED,
-        // so only then emit SENSOR_DISCONNECTED (reason 0).
+        // Missed DISCONNECTED: repair state. A failed pass is a hard fail; only
+        // SUBSCRIBED had SENSOR_CONNECTED, so only then SENSOR_DISCONNECTED (reason 0).
         const SensorType type = slot_.type;
-        const bool wasSubscribed = (s == SlotState::SUBSCRIBED);
         stats_.disconnects++;
+        if (slot_.failPending && !slot_.removing) {
+          hardFail(now, false);
+          return;
+        }
         endAttempt(now);
-        if (wasSubscribed) emit(EventType::SENSOR_DISCONNECTED, type, 0);
+        if (s == SlotState::SUBSCRIBED) emit(EventType::SENSOR_DISCONNECTED, type, 0);
       }
     } else if (connected) {
       port_.disconnect(kSlot);
@@ -347,7 +374,6 @@ class Core {
                !port_.connActive()) {
       endAttempt(now);
     }
-    if (!port_.discActive()) scan_.forceOff();
   }
 
   // §5.1 step 4: one blocking pass under the watchdog.
@@ -369,6 +395,7 @@ class Core {
     }
     if (aborted) stats_.gattBudgetAborts++;
     slot_.gattDone = true;
+    slot_.failPending = true;
     port_.disconnect(kSlot);
   }
 
@@ -391,6 +418,7 @@ class Core {
       case SlotState::CONNECTING:
         if (now - slot_.stateSinceMs >= kConnectWatchdogMs) {
           port_.cancelConnect(kSlot);
+          slot_.failPending = true;
           enter(SlotState::CANCELLING, now);
         }
         return;
@@ -399,7 +427,7 @@ class Core {
             !port_.isConnected(kSlot)) {
           queue_.requestResync();
           stats_.cancelSafetyExits++;
-          endAttempt(now);
+          endCancel(now);
         }
         return;
       default:
@@ -421,6 +449,7 @@ class Core {
       return;
     }
     if (port_.connActive()) return;
+    slot_.failPending = false;
     slot_.attemptGen.store(static_cast<uint16_t>(slot_.attemptGen.load() + 1),
                            std::memory_order_release);
     if (port_.connect(kSlot, slot_.mac, slot_.addrType)) {
@@ -435,7 +464,7 @@ class Core {
       hold(now, BBS_SCAN_START_BACKOFF_MS);
       enter(SlotState::FOUND, now);
     } else {
-      connectFailed(now);
+      hardFail(now, true);
     }
   }
 

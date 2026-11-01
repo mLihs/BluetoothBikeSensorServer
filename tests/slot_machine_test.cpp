@@ -220,7 +220,7 @@ static void testHappyPath() {
   assert(r.state() == SlotState::CONNECTING);
   assert(r.port.discCancels == 1 && r.core->scan().owner() == ScanOwner::OFF);
   assert(r.port.connects == 1 && r.port.lastAddrType == 1);   // address type from the report
-  assert(r.gen() == 1);
+  assert(r.core->slot().addrType == 1 && r.gen() == 1);
 
   r.connectedEv(1);
   r.update();                                          // DISCOVERING → GATT pass, one pass
@@ -231,6 +231,17 @@ static void testHappyPath() {
   assert(r.core->stats().connects == 1 && r.core->stats().gattBudgetAborts == 0);
   r.update();
   assert(r.port.gattPasses == 1 && r.port.discStarts == 1);   // no rescan while subscribed
+}
+
+static void testScanMatchAddrTypeWins() {
+  Rig r;                                               // configured random, advertiser public
+  assert(r.core->addByMac(SensorType::HEART_RATE, kMacStr, 1, "HRM", r.now));
+  assert(r.core->slot().addrType == 1);
+  r.update();
+  r.match(r.core->scan().epoch(), kMac, 0);
+  r.update();
+  assert(r.state() == SlotState::CONNECTING);
+  assert(r.core->slot().addrType == 0 && r.port.lastAddrType == 0);
 }
 
 static void testAttemptGenStaleness() {
@@ -247,11 +258,61 @@ static void testAttemptGenStaleness() {
   r.connectedEv(g);
   r.update();
   assert(r.state() == SlotState::SUBSCRIBED);
+  g_eventCount = 0;
   r.discEv(static_cast<uint16_t>(g - 1));
-  r.failEv(g);                                         // CONNECT_FAIL is not a link event
+  r.failEv(static_cast<uint16_t>(g - 1));
   r.port.connected = true;
   r.update();
   assert(r.state() == SlotState::SUBSCRIBED && r.core->stats().disconnects == 0);
+
+  r.port.connected = false;
+  r.failEv(g, 0x3e);                                   // CONNECT_FAIL on a link = link loss
+  r.update();
+  assert(r.state() == SlotState::CONNECTING && r.gen() == g + 1);   // direct attempt
+  assert(r.core->stats().disconnects == 1 && r.core->stats().connectFails == 0);
+  assert(r.core->slot().lastDisconnectReason == 0x3e && r.core->slot().failCount == 0);
+  assert(g_eventCount == 1);
+  expectEvent(0, EventType::SENSOR_DISCONNECTED, SlotState::FOUND, 0x3e);
+}
+
+static void testConnectFailInDiscovering() {
+  {
+    Rig r;                                             // before the pass: neutral, no event
+    r.toConnecting();
+    g_eventCount = 0;
+    const uint16_t g = r.gen();
+    r.connectedEv(g);
+    r.failEv(g, 0x3e);
+    r.port.connected = false;
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.port.gattPasses == 0);
+    assert(r.core->stats().disconnects == 1 && r.core->slot().failCount == 0);
+    assert(r.core->slot().lastDisconnectReason == 0x3e && r.core->stats().connectFails == 0);
+    assert(g_eventCount == 0);
+  }
+  {
+    Rig r;                                             // after a failed pass: hard fail
+    r.port.gattOk = false;
+    r.toConnecting();
+    r.connectedEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::DISCOVERING);
+    g_eventCount = 0;
+    r.failEv(r.gen(), 0x3e);
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 1);
+    assert(r.core->stats().disconnects == 1 && r.core->stats().connectFails == 0);
+    assert(g_eventCount == 1);
+    expectEvent(0, EventType::SENSOR_FAILED, SlotState::WAIT_SCAN);
+  }
+  {
+    Rig r;                                             // remove pending: EMPTY
+    r.toSubscribed();
+    r.core->remove(r.now);
+    r.failEv(r.gen(), 0x3e);
+    r.update();
+    assert(r.state() == SlotState::EMPTY && r.core->stats().disconnects == 1);
+  }
 }
 
 static void testDisconnectDirectAttemptThenSleepScan() {
@@ -391,8 +452,10 @@ static void testConnectWatchdogAndCancelling() {
     r.at(t + BBS_CONNECT_TIMEOUT_MS + 2000);
     assert(r.state() == SlotState::CANCELLING && r.port.cancelConnects == 1);
     r.failEv(r.gen());
-    r.update();
-    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 0);
+    r.update();                                        // watchdog cancel = hard fail
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 1);
+    assert(r.core->stats().connectFails == 1 && r.core->slot().holdMs == 1000);
+    assert(countEvents(EventType::SENSOR_FAILED) == 1);
   }
   {
     Rig r;                                             // CONNECTED while cancelling
@@ -405,7 +468,39 @@ static void testConnectWatchdogAndCancelling() {
     assert(r.port.gattPasses == 0);
     r.discEv(r.gen());
     r.update();
-    assert(r.state() == SlotState::WAIT_SCAN);
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 1);
+    assert(r.core->stats().connectFails == 1 && r.core->stats().disconnects == 0);
+    assert(countEvents(EventType::SENSOR_FAILED) == 1);
+  }
+  {
+    Rig r;                                             // HOST_RESET during a watchdog cancel
+    r.toConnecting();
+    r.at(r.now + BBS_CONNECT_TIMEOUT_MS + 2000);
+    assert(r.state() == SlotState::CANCELLING);
+    g_eventCount = 0;
+    r.port.connOn = false;
+    assert(bs::pushHostReset(r.core->queue()));        // neutral: wait state, no fail
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 0);
+    assert(r.core->stats().connectFails == 0 && r.core->slot().holdMs == 0);
+    assert(g_eventCount == 1);
+    expectEvent(0, EventType::HOST_RESET, SlotState::WAIT_SCAN, 0, SensorType{});
+    r.failEv(r.gen());                                 // late outcome: no state to act on
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 0);
+    assert(countEvents(EventType::SENSOR_FAILED) == 0);
+
+    r.at(r.now + BBS_SCAN_START_BACKOFF_MS + 40000);   // flag cleared on the next attempt
+    r.match(r.core->scan().epoch());
+    r.update();
+    assert(r.state() == SlotState::CONNECTING);
+    const uint16_t g = r.gen();
+    r.connectedEv(g);
+    r.discEv(g, 0x08);                                 // link lost before the pass: neutral
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 0);
+    assert(countEvents(EventType::SENSOR_FAILED) == 0);
+    assert(countEvents(EventType::SENSOR_DISCONNECTED) == 0);
   }
 }
 
@@ -433,6 +528,8 @@ static void testCancelSafety() {
   r.at(t + BBS_CANCEL_SAFETY_MS + 2);
   assert(r.state() == SlotState::WAIT_SCAN && r.core->stats().cancelSafetyExits == 1);
   assert(r.core->queue().takeResync());
+  assert(r.core->slot().failCount == 1 && r.core->stats().connectFails == 1);   // watchdog cancel
+  assert(countEvents(EventType::SENSOR_FAILED) == 1);
 
   r.at(r.now + 40000);
   r.match(r.core->scan().epoch());
@@ -644,8 +741,10 @@ static void testGattAbortAndFailure() {
     r.update();
     assert(r.port.gattPasses == 1);                    // no second pass on the same link
     r.discEv(r.gen(), 0x216);
-    r.update();
+    r.update();                                        // hard fail, link was up: no connectFails
     assert(r.state() == SlotState::WAIT_SCAN && r.core->stats().disconnects == 1);
+    assert(r.core->slot().failCount == 1 && r.core->stats().connectFails == 0);
+    assert(r.core->slot().holdMs == 1000 && r.core->slot().lastDisconnectReason == 0x216);
   }
   {
     Rig r;                                             // pass "ok" but the timer cut it
@@ -654,6 +753,10 @@ static void testGattAbortAndFailure() {
     r.connectedEv(r.gen());
     r.update();
     assert(r.state() == SlotState::DISCOVERING && r.core->stats().gattBudgetAborts == 1);
+    assert(countEvents(EventType::SENSOR_CONNECTED) == 0);
+    r.discEv(r.gen(), 0x216);
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 1);
   }
   {
     Rig r;                                             // plain failure: no abort count
@@ -666,7 +769,22 @@ static void testGattAbortAndFailure() {
     assert(!r.core->watchdog().onTimer());             // disarmed after the pass
     r.discEv(r.gen());
     r.update();
-    assert(r.state() == SlotState::WAIT_SCAN);
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 1);
+    assert(r.core->stats().connectFails == 0 && countEvents(EventType::SENSOR_FAILED) == 1);
+    // Backoff holds the next connect; a good pass resets failCount.
+    const uint32_t failedAt = r.now;
+    r.port.gattOk = true;
+    assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW);
+    r.match(r.core->scan().epoch());
+    r.update();
+    assert(r.state() == SlotState::FOUND);
+    r.at(failedAt + 999);
+    assert(r.state() == SlotState::FOUND);
+    r.at(failedAt + 1000);
+    assert(r.state() == SlotState::CONNECTING);
+    r.connectedEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::SUBSCRIBED && r.core->slot().failCount == 0);
   }
 }
 
@@ -763,7 +881,7 @@ static void testResync() {
     expectEvent(0, EventType::SENSOR_DISCONNECTED, SlotState::WAIT_SCAN, 0);
   }
   {
-    Rig r;                                             // lost link in DISCOVERING: no app event
+    Rig r;                                             // lost link after a failed pass: hard fail
     r.port.gattOk = false;
     r.toConnecting();
     r.connectedEv(r.gen());
@@ -773,9 +891,39 @@ static void testResync() {
     r.port.connected = false;
     fillQueueToResync(*r.core);
     r.update();
-    assert(r.state() == SlotState::WAIT_SCAN);
-    assert(countEvents(EventType::SENSOR_DISCONNECTED) == 0);
-    assert(countEvents(EventType::SENSOR_CONNECTED) == 0);
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 1);
+    assert(r.core->slot().holdMs == 1000 && r.core->stats().disconnects == 1);
+    assert(r.core->stats().connectFails == 0);
+    assert(g_eventCount == 1);
+    expectEvent(0, EventType::SENSOR_FAILED, SlotState::WAIT_SCAN);
+  }
+  {
+    Rig r;                                             // pass skipped by a replace: neutral
+    r.port.gattOk = false;
+    r.toConnecting();
+    r.connectedEv(r.gen());
+    r.update();
+    r.replace();
+    g_eventCount = 0;
+    r.port.connected = false;
+    fillQueueToResync(*r.core);
+    r.update();                                        // direct attempt to the new MAC
+    assert(r.state() == SlotState::CONNECTING && r.core->slot().failCount == 0);
+    assert(r.core->stats().disconnects == 1 && g_eventCount == 0);
+  }
+  {
+    Rig r;                                             // failed pass, remove pending: EMPTY
+    r.port.gattOk = false;
+    r.toConnecting();
+    r.connectedEv(r.gen());
+    r.update();
+    r.core->remove(r.now);
+    g_eventCount = 0;
+    r.port.connected = false;
+    fillQueueToResync(*r.core);
+    r.update();
+    assert(r.state() == SlotState::EMPTY && r.core->slot().failCount == 0);
+    assert(g_eventCount == 0);
   }
   {
     Rig r;                                             // scan owner OFF if disc idle
@@ -852,15 +1000,18 @@ static void testRemoveFromEveryState() {
     assert(r.state() == SlotState::CANCELLING);
     r.failEv(r.gen());
     r.update();
-    assert(r.state() == SlotState::EMPTY);
+    assert(r.state() == SlotState::EMPTY && r.core->stats().connectFails == 0);
+    assert(countEvents(EventType::SENSOR_FAILED) == 0);
   }
-  {
+  for (bool watchdog : viaFail) {
     Rig r;                                             // CANCELLING safety exit while removing
     r.toConnecting();
+    if (watchdog) r.at(r.now + BBS_CONNECT_TIMEOUT_MS + 2000);
     r.core->remove(r.now);
     r.port.connOn = false;
     r.at(r.now + BBS_CANCEL_SAFETY_MS);
-    assert(r.state() == SlotState::EMPTY);
+    assert(r.state() == SlotState::EMPTY && r.core->stats().cancelSafetyExits == 1);
+    assert(r.core->stats().connectFails == 0 && countEvents(EventType::SENSOR_FAILED) == 0);
   }
   {
     Rig r;                                             // DISCOVERING (failed pass)
@@ -873,7 +1024,8 @@ static void testRemoveFromEveryState() {
     assert(r.state() == SlotState::DISCOVERING && r.port.disconnects == 2);
     r.discEv(r.gen());
     r.update();
-    assert(r.state() == SlotState::EMPTY);
+    assert(r.state() == SlotState::EMPTY && countEvents(EventType::SENSOR_FAILED) == 0);
+    assert(countEvents(EventType::SENSOR_DISCONNECTED) == 0);   // never SENSOR_CONNECTED
   }
   {
     Rig r;                                             // SUBSCRIBED
@@ -964,15 +1116,16 @@ static void testLifecycleEvents() {
     expectEvent(1, EventType::SENSOR_FAILED, SlotState::WAIT_SCAN);
   }
   {
-    Rig r;                                             // cancel outcome: no event
+    Rig r;                                             // watchdog cancel outcome: failed
     r.toConnecting();
     r.at(r.now + BBS_CONNECT_TIMEOUT_MS + 2000);
     r.failEv(r.gen());
     r.update();
-    assert(r.state() == SlotState::WAIT_SCAN && g_eventCount == 1);
+    assert(r.state() == SlotState::WAIT_SCAN && g_eventCount == 2);
+    expectEvent(1, EventType::SENSOR_FAILED, SlotState::WAIT_SCAN);
   }
   {
-    Rig r;                                             // DISCOVERING: disconnected, never connected
+    Rig r;                                             // failed GATT pass: failed only
     r.port.gattOk = false;
     r.toConnecting();
     r.connectedEv(r.gen());
@@ -981,7 +1134,7 @@ static void testLifecycleEvents() {
     r.discEv(r.gen(), 0x216);
     r.update();
     assert(g_eventCount == 2);
-    expectEvent(1, EventType::SENSOR_DISCONNECTED, SlotState::WAIT_SCAN, 0x216);
+    expectEvent(1, EventType::SENSOR_FAILED, SlotState::WAIT_SCAN);
   }
   {
     Rig r;                                             // remove-driven teardown keeps the type
@@ -999,6 +1152,50 @@ static void testLifecycleEvents() {
     r.update();
     assert(g_eventCount == 3);
     expectEvent(2, EventType::HOST_RESET, SlotState::SUBSCRIBED, 0, SensorType{});
+  }
+}
+
+static Core* g_removeCore = nullptr;
+static EventType g_removeOn = EventType::SENSOR_FAILED;
+static uint32_t g_removeNow = 0;
+
+static void onEventRemoving(const EventInfo& info) {
+  onEvent(info);
+  if (info.type == g_removeOn) g_removeCore->remove(g_removeNow);
+}
+
+// emit() runs after the state change, so the app may remove() from the callback.
+static void testRemoveFromCallback() {
+  {
+    Rig r;                                             // SENSOR_FAILED (watchdog cancel)
+    r.core->setEventCallback(onEventRemoving);
+    g_removeCore = r.core.get();
+    g_removeOn = EventType::SENSOR_FAILED;
+    r.toConnecting();
+    r.at(r.now + BBS_CONNECT_TIMEOUT_MS + 2000);
+    g_removeNow = r.now;
+    r.failEv(r.gen());
+    r.update();
+    expectEvent(1, EventType::SENSOR_FAILED, SlotState::WAIT_SCAN);
+    assert(r.state() == SlotState::EMPTY && !r.core->scanFilterMatch(kMac));
+    assert(r.core->scan().owner() == ScanOwner::OFF);
+    r.at(r.now + 40000);
+    assert(r.state() == SlotState::EMPTY && r.port.connects == 1 && g_eventCount == 2);
+  }
+  {
+    Rig r;                                             // SENSOR_DISCONNECTED (direct retry pending)
+    r.core->setEventCallback(onEventRemoving);
+    g_removeCore = r.core.get();
+    g_removeOn = EventType::SENSOR_DISCONNECTED;
+    r.toSubscribed();
+    g_removeNow = r.now;
+    r.discEv(r.gen(), 0x208);
+    r.update();
+    expectEvent(2, EventType::SENSOR_DISCONNECTED, SlotState::FOUND, 0x208);
+    assert(r.state() == SlotState::EMPTY && r.port.connects == 1);
+    assert(r.core->slot().failCount == 0 && !r.core->slot().directRetry);
+    r.at(r.now + 40000);
+    assert(r.state() == SlotState::EMPTY && r.port.connects == 1 && g_eventCount == 3);
   }
 }
 
@@ -1081,6 +1278,8 @@ static void testReplace() {
     r.discEv(r.gen());
     r.update();
     assert(r.state() == SlotState::CONNECTING && r.port.connects == 2);
+    assert(r.core->slot().failCount == 0 && r.core->stats().connectFails == 0);
+    assert(countEvents(EventType::SENSOR_FAILED) == 0);
   }
   {
     Rig r;                                             // DISCOVERING (failed pass)
@@ -1097,6 +1296,8 @@ static void testReplace() {
     r.discEv(r.gen());
     r.update();
     assert(r.state() == SlotState::CONNECTING && r.port.connects == 2);
+    assert(r.core->slot().failCount == 0 && countEvents(EventType::SENSOR_FAILED) == 0);
+    assert(countEvents(EventType::SENSOR_DISCONNECTED) == 0);
   }
   for (bool removeFirst : viaRemove) {
     Rig r;                                             // SUBSCRIBED (or remove pending)
@@ -1135,7 +1336,9 @@ static void testReplace() {
 int main() {
   testAddByMac();
   testHappyPath();
+  testScanMatchAddrTypeWins();
   testAttemptGenStaleness();
+  testConnectFailInDiscovering();
   testDisconnectDirectAttemptThenSleepScan();
   testSleepRemainderClearedOnConnect();
   testConnectLostBeforeOnConnect();
@@ -1152,6 +1355,7 @@ int main() {
   testOrphanSweep();
   testDrainBound();
   testLifecycleEvents();
+  testRemoveFromCallback();
   testReplace();
   return 0;
 }
