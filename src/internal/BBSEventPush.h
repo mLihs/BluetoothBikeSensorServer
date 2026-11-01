@@ -60,6 +60,7 @@ inline bool pushDisconnected(EventQueue& q, uint8_t slot, uint16_t attemptGen,
 // so update() can detect truncation (reason > notify.len).
 inline bool pushNotify(EventQueue& q, uint8_t slot, uint16_t attemptGen,
                        const uint8_t* data, size_t len) {
+  if (data == nullptr) len = 0;
   const int16_t original = len > INT16_MAX ? INT16_MAX : static_cast<int16_t>(len);
   Event ev = makeEvent(Ev::NOTIFY, slot, original, attemptGen);
   const size_t copied = len > BBS_NOTIFY_MAX_LEN ? BBS_NOTIFY_MAX_LEN : len;

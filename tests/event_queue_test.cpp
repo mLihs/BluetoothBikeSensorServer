@@ -17,6 +17,7 @@ static_assert(sizeof(Event) <= 48, "");
 static_assert(sizeof(Event) == 46, "default layout is 46 B (§3.2)");
 
 constexpr uint8_t kDepth = BBS_EVENT_QUEUE_DEPTH;
+static_assert(kDepth >= 3, "tests assume depth >= 3");
 static const uint8_t kAddr[6] = {1, 2, 3, 4, 5, 6};
 static const uint8_t kData[4] = {0xAA, 0xBB, 0xCC, 0xDD};
 
@@ -107,6 +108,49 @@ static void testProtectedEvictsOldestDroppable() {
   assert(sub.kind == Ev::SUBSCRIBE && sub.sub.subValue == 1);
   Event none{};
   assert(!q->pop(none));
+}
+
+static void testEvictionAtHead() {
+  auto q = std::make_unique<EventQueue>();
+  // Oldest droppable is at head (k == 0): zero shifts in evictOldestDroppable.
+  pushMatch(*q, 0);
+  for (uint16_t i = 1; i < kDepth; ++i) assert(bs::pushConnected(*q, 0, i));
+  assert(bs::pushDisconnected(*q, 0, 99, 1));
+  assert(q->counters().matchesDropped == 1);
+  assert(!q->takeResync());
+  for (uint16_t i = 1; i < kDepth; ++i) {
+    Event ev = popOne(*q);
+    assert(ev.kind == Ev::CONNECTED && ev.gen == i);
+  }
+  Event disc = popOne(*q);
+  assert(disc.kind == Ev::DISCONNECTED && disc.gen == 99);
+}
+
+static void testMultiEvictionInterleave() {
+  auto q = std::make_unique<EventQueue>();
+  // [P, D, P, D, ...] then several protected pushes; each evicts the oldest D.
+  for (uint16_t i = 0; i < kDepth; ++i) {
+    if ((i % 2) == 0) {
+      assert(bs::pushConnected(*q, 0, i));
+    } else {
+      pushMatch(*q, i);
+    }
+  }
+  const uint16_t droppable = (kDepth / 2);
+  for (uint16_t n = 0; n < droppable; ++n) {
+    assert(bs::pushDisconnected(*q, 0, static_cast<uint16_t>(1000 + n), 0));
+  }
+  QueueCounters c = q->counters();
+  assert(c.matchesDropped == droppable && c.eventsDropped == 0);
+  assert(!q->takeResync());
+  assert(q->size() == kDepth);
+  uint16_t protectedLeft = 0;
+  for (uint16_t i = 0; i < kDepth; ++i) {
+    Event ev = popOne(*q);
+    assert(ev.kind != Ev::SCAN_MATCH && ev.kind != Ev::NOTIFY);
+    if (ev.kind == Ev::CONNECTED) protectedLeft++;
+  }
+  assert(protectedLeft == (kDepth - droppable));
 }
 
 static void testEvictionAcrossWrap() {
@@ -231,7 +275,16 @@ int main() {
   testPushPopFifoAndWrap();
   testDroppableOverflow();
   testProtectedEvictsOldestDroppable();
+  testEvictionAtHead();
+  testMultiEvictionInterleave();
   testEvictionAcrossWrap();
+  // nullptr notify payload must not crash (caller hygiene).
+  {
+    auto q = std::make_unique<EventQueue>();
+    assert(bs::pushNotify(*q, 0, 1, nullptr, 8));
+    Event ev = popOne(*q);
+    assert(ev.notify.len == 0 && ev.reason == 0);
+  }
   testProtectedOnlyFullRequestsResync();
   testNotifyCopy();
   testMatchCopy();

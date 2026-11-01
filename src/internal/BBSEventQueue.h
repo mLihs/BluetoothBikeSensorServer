@@ -5,6 +5,8 @@
 
 #include "BBSMux.h"
 
+// Defaults live here for the Arduino-free host tests. Step 3 moves them into
+// BBSConfig.h (design §3) so every TU sees one Event layout (ODR).
 #ifndef BBS_EVENT_QUEUE_DEPTH
 #define BBS_EVENT_QUEUE_DEPTH 24
 #endif
