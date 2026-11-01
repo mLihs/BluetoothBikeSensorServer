@@ -313,6 +313,24 @@ static void testConnectFailInDiscovering() {
     r.update();
     assert(r.state() == SlotState::EMPTY && r.core->stats().disconnects == 1);
   }
+  {
+    Rig r;                                             // DISCOVERING, remove pending: EMPTY, no event
+    r.port.gattOk = false;
+    r.toConnecting();
+    r.connectedEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::DISCOVERING);
+    r.core->remove(r.now);
+    g_eventCount = 0;
+    r.failEv(r.gen(), 0x3e);
+    r.port.connected = false;
+    r.update();
+    assert(r.state() == SlotState::EMPTY && r.core->stats().disconnects == 1);
+    assert(r.core->slot().failCount == 0 && r.core->stats().connectFails == 0);
+    assert(g_eventCount == 0);
+    r.at(r.now + 40000);
+    assert(r.state() == SlotState::EMPTY && r.port.connects == 1 && g_eventCount == 0);
+  }
 }
 
 static void testDisconnectDirectAttemptThenSleepScan() {
@@ -788,6 +806,28 @@ static void testGattAbortAndFailure() {
   }
 }
 
+static void testGattFailBackoff() {
+  Rig r;                                               // same 1 s → 30 s table as connect errors
+  r.port.gattOk = false;
+  r.add();
+  const uint32_t expected[] = {1000, 2000, 4000, 8000, 16000, 30000, 30000};
+  for (uint8_t i = 0; i < 7; ++i) {
+    r.at(r.now + 40000);                               // past backoff and sleep interval
+    assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW);
+    r.match(r.core->scan().epoch());
+    r.update();
+    assert(r.state() == SlotState::CONNECTING);
+    r.connectedEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::DISCOVERING && r.port.gattPasses == i + 1);
+    r.discEv(r.gen(), 0x216);
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == i + 1);
+    assert(r.core->slot().holdMs == expected[i] && r.core->stats().connectFails == 0);
+    assert(r.core->stats().disconnects == i + 1u && countEvents(EventType::SENSOR_FAILED) == i + 1);
+  }
+}
+
 static void testHostReset() {
   {
     Rig r;
@@ -835,6 +875,38 @@ static void testHostReset() {
     assert(bs::pushHostReset(r.core->queue()));
     r.update();
     assert(r.state() == SlotState::EMPTY);
+  }
+  {
+    Rig r;                                             // DISCOVERING after a failed pass: neutral
+    r.port.gattOk = false;
+    r.toConnecting();
+    r.connectedEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::DISCOVERING && r.core->slot().failPending);
+    g_eventCount = 0;
+    r.port.connected = false;
+    assert(bs::pushHostReset(r.core->queue()));
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 0);
+    assert(r.core->slot().holdMs == 0 && r.core->stats().connectFails == 0);
+    assert(r.core->stats().disconnects == 0);
+    assert(g_eventCount == 1);
+    expectEvent(0, EventType::HOST_RESET, SlotState::WAIT_SCAN, 0, SensorType{});
+    r.discEv(r.gen(), 0x16);                           // late outcome: no state to act on
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 0);
+    assert(r.core->stats().disconnects == 0 && g_eventCount == 1);
+
+    r.at(r.now + BBS_SCAN_START_BACKOFF_MS + 40000);   // flags cleared on the next attempt
+    r.match(r.core->scan().epoch());
+    r.update();
+    assert(r.state() == SlotState::CONNECTING);
+    const uint16_t g = r.gen();
+    r.connectedEv(g);
+    r.discEv(g, 0x08);                                 // link lost before the pass: neutral
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 0);
+    assert(countEvents(EventType::SENSOR_FAILED) == 0);
   }
 }
 
@@ -1197,6 +1269,136 @@ static void testRemoveFromCallback() {
     r.at(r.now + 40000);
     assert(r.state() == SlotState::EMPTY && r.port.connects == 1 && g_eventCount == 3);
   }
+  {
+    Rig r;                                             // SENSOR_FOUND: no connect
+    r.core->setEventCallback(onEventRemoving);
+    g_removeCore = r.core.get();
+    g_removeOn = EventType::SENSOR_FOUND;
+    r.add();
+    r.update();
+    g_removeNow = r.now;
+    r.match(r.core->scan().epoch());
+    r.update();
+    expectEvent(0, EventType::SENSOR_FOUND, SlotState::FOUND);
+    assert(r.state() == SlotState::EMPTY && r.port.connects == 0);
+    assert(r.core->scan().owner() == ScanOwner::OFF && !r.core->scanFilterMatch(kMac));
+    r.at(r.now + 40000);
+    assert(r.state() == SlotState::EMPTY && r.port.connects == 0 && g_eventCount == 1);
+  }
+  {
+    Rig r;                                             // SENSOR_CONNECTED: teardown, no retry
+    r.core->setEventCallback(onEventRemoving);
+    g_removeCore = r.core.get();
+    g_removeOn = EventType::SENSOR_CONNECTED;
+    r.toConnecting();
+    g_removeNow = r.now;
+    r.connectedEv(r.gen());
+    r.update();
+    expectEvent(1, EventType::SENSOR_CONNECTED, SlotState::SUBSCRIBED);
+    assert(r.state() == SlotState::SUBSCRIBED && r.port.disconnects == 1);
+    r.discEv(r.gen(), 0x16);
+    r.update();
+    expectEvent(2, EventType::SENSOR_DISCONNECTED, SlotState::EMPTY, 0x16);
+    assert(r.state() == SlotState::EMPTY && r.port.connects == 1);
+    r.at(r.now + 40000);
+    assert(r.state() == SlotState::EMPTY && r.port.connects == 1 && g_eventCount == 3);
+  }
+  {
+    Rig r;                                             // HOST_RESET mid-attempt: late outcome ignored
+    r.core->setEventCallback(onEventRemoving);
+    g_removeCore = r.core.get();
+    g_removeOn = EventType::HOST_RESET;
+    r.toConnecting();
+    const uint16_t g = r.gen();
+    g_removeNow = r.now;
+    r.port.connOn = false;
+    assert(bs::pushHostReset(r.core->queue()));
+    r.update();
+    expectEvent(1, EventType::HOST_RESET, SlotState::WAIT_SCAN, 0, SensorType{});
+    assert(r.state() == SlotState::EMPTY && !r.core->scanFilterMatch(kMac));
+    r.failEv(g);
+    r.update();
+    r.at(r.now + 40000);
+    assert(r.state() == SlotState::EMPTY && r.port.connects == 1 && g_eventCount == 2);
+    assert(r.core->slot().failCount == 0 && r.core->stats().connectFails == 0);
+  }
+  {
+    Rig r;                                             // HOST_RESET on a link: EMPTY on DISCONNECTED
+    r.core->setEventCallback(onEventRemoving);
+    g_removeCore = r.core.get();
+    g_removeOn = EventType::HOST_RESET;
+    r.toSubscribed();
+    g_removeNow = r.now;
+    assert(bs::pushHostReset(r.core->queue()));
+    r.update();
+    expectEvent(2, EventType::HOST_RESET, SlotState::SUBSCRIBED, 0, SensorType{});
+    assert(r.state() == SlotState::SUBSCRIBED && r.port.disconnects == 1);
+    r.discEv(r.gen(), 0x16);
+    r.update();
+    expectEvent(3, EventType::SENSOR_DISCONNECTED, SlotState::EMPTY, 0x16);
+    assert(r.state() == SlotState::EMPTY && r.port.connects == 1);
+    r.at(r.now + 40000);
+    assert(r.state() == SlotState::EMPTY && r.port.connects == 1 && g_eventCount == 4);
+  }
+}
+
+static Rig* g_replaceRig = nullptr;
+static EventType g_replaceOn = EventType::SENSOR_FAILED;
+static bool g_replaceArmed = false;
+
+static void onEventReplacing(const EventInfo& info) {
+  onEvent(info);
+  if (g_replaceArmed && info.type == g_replaceOn) {
+    g_replaceArmed = false;
+    g_replaceRig->replace();
+  }
+}
+
+// After a replace from the callback: one direct attempt to the new MAC; its
+// fail goes to the sleep scan.
+static void expectOneDirectAttempt(Rig& r, uint16_t oldGen, int startsBefore) {
+  assert(!g_replaceArmed);
+  assert(r.state() == SlotState::CONNECTING && r.gen() == oldGen + 1);
+  assert(r.port.connects == 2 && r.port.lastAddrType == 1);
+  assert(r.port.discStarts == startsBefore && !r.core->slot().directRetry);
+  assert(r.core->slot().failCount == 0);
+  r.failEv(r.gen());
+  r.update();
+  assert(r.state() == SlotState::WAIT_SCAN && r.core->slot().failCount == 1);
+  r.at(r.now + 40000);
+  assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW && r.port.connects == 2);
+}
+
+static void testReplaceFromCallback() {
+  {
+    Rig r;                                             // SENSOR_DISCONNECTED (direct retry pending)
+    r.core->setEventCallback(onEventReplacing);
+    g_replaceRig = &r;
+    g_replaceOn = EventType::SENSOR_DISCONNECTED;
+    g_replaceArmed = true;
+    r.toSubscribed();
+    const uint16_t g = r.gen();
+    const int startsBefore = r.port.discStarts;
+    r.discEv(g, 0x208);
+    r.update();
+    expectEvent(2, EventType::SENSOR_DISCONNECTED, SlotState::FOUND, 0x208);
+    expectOneDirectAttempt(r, g, startsBefore);
+  }
+  {
+    Rig r;                                             // SENSOR_FAILED (backoff pending)
+    r.core->setEventCallback(onEventReplacing);
+    g_replaceRig = &r;
+    g_replaceOn = EventType::SENSOR_FAILED;
+    g_replaceArmed = true;
+    r.toConnecting();
+    const uint16_t g = r.gen();
+    const int startsBefore = r.port.discStarts;
+    r.failEv(g);
+    r.update();
+    expectEvent(1, EventType::SENSOR_FAILED, SlotState::WAIT_SCAN);
+    assert(r.core->slot().holdMs == 0);
+    expectOneDirectAttempt(r, g, startsBefore);
+  }
 }
 
 static void testReplace() {
@@ -1349,6 +1551,7 @@ int main() {
   testScanController();
   testGattWatchdogUnit();
   testGattAbortAndFailure();
+  testGattFailBackoff();
   testHostReset();
   testResync();
   testRemoveFromEveryState();
@@ -1356,6 +1559,7 @@ int main() {
   testDrainBound();
   testLifecycleEvents();
   testRemoveFromCallback();
+  testReplaceFromCallback();
   testReplace();
   return 0;
 }

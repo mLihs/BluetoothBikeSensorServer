@@ -308,7 +308,10 @@ class Core {
       }
       return;
     }
-    if (ev.kind == Ev::DISCONNECTED) slot_.lastDisconnectReason = ev.reason;
+    if (ev.kind == Ev::DISCONNECTED || s == SlotState::DISCOVERING ||
+        s == SlotState::SUBSCRIBED) {
+      slot_.lastDisconnectReason = ev.reason;
+    }
     switch (s) {
       case SlotState::CONNECTING:     // fail, or link lost before onConnect
         hardFail(now, true);
@@ -318,7 +321,6 @@ class Core {
         break;
       case SlotState::DISCOVERING:
       case SlotState::SUBSCRIBED: {   // CONNECT_FAIL here is a link loss (NimBLE reason 0x3E)
-        slot_.lastDisconnectReason = ev.reason;
         stats_.disconnects++;
         if (slot_.failPending && !slot_.removing) {
           hardFail(now, false);       // failed/aborted GATT pass
