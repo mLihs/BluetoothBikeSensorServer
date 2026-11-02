@@ -21,7 +21,7 @@ namespace internal {
 
 class NimBLEPort final : public BlePort {
  public:
-  static constexpr uint8_t kSlots = 1;
+  static constexpr uint8_t kSlots = kSlotCount;
 
   // After NimBLEDevice::init(). False if a client or the GATT timer cannot be
   // created. One instance per program; gapScanCb finds it through self_.
@@ -165,10 +165,21 @@ class NimBLEPort final : public BlePort {
       const ble_gap_disc_desc& desc = event->disc;
       uint8_t mac[6];
       for (uint8_t i = 0; i < 6; ++i) mac[i] = desc.addr.val[5 - i];
-      if (!core.scanFilterMatch(mac)) return 0;
+      if (core.mode() == Mode::MAC) {
+        if (!core.scanFilterMatch(mac)) return 0;   // any slot's MAC; update() picks the slot
+        AdFields fields;
+        parseAd(desc.data, desc.length_data, fields);  // partial fields are fine for a MAC match
+        pushScanMatch(core.queue(), epoch, mac, desc.addr.type, fields.name, fields.nameLen);
+        return 0;
+      }
+      // NAME: this report alone (ADV or SCAN_RSP, no merge); elements before a
+      // malformed one are kept.
       AdFields fields;
-      parseAd(desc.data, desc.length_data, fields);  // partial fields are fine for a MAC match
-      pushScanMatch(core.queue(), epoch, mac, desc.addr.type, fields.name, fields.nameLen);
+      parseAd(desc.data, desc.length_data, fields);
+      const int slot = core.scanNameMatch(fields.name, fields.nameLen);
+      if (slot < 0) return 0;
+      pushScanMatch(core.queue(), epoch, mac, desc.addr.type, fields.name, fields.nameLen,
+                    static_cast<uint8_t>(slot));
     } else if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
       pushScanEnd(core.queue(), epoch, clampReason(event->disc_complete.reason));
     }

@@ -25,7 +25,7 @@ const char* HR_SENSOR_MAC = "f0:13:c3:ee:56:97";
 const int8_t HR_ADDR_TYPE = 0;
 
 bs::internal::NimBLEPort port;
-bs::internal::Core core(port);
+bs::internal::Core core(port, bs::Mode::MAC);
 
 const char* eventName(bs::EventType type) {
   switch (type) {
@@ -50,7 +50,8 @@ void addSensor() {
 }
 
 void printStatus() {
-  const bs::internal::SensorSlot& slot = core.slot();
+  const bs::internal::SensorSlot& slot =
+      core.slot(bs::internal::slotIndex(bs::SensorType::HEART_RATE));
   const bs::Stats& s = core.stats();
   Serial.printf("state=%u battery=%u failCount=%u lastReason=0x%x heap=%lu\n",
                 static_cast<unsigned>(slot.state), slot.battery, slot.failCount,
@@ -82,7 +83,10 @@ void loop() {
   if (Serial.available()) {
     switch (Serial.read()) {
       case 'a': addSensor(); break;
-      case 'r': core.remove(millis()); Serial.println("remove()"); break;
+      case 'r':
+        core.remove(bs::SensorType::HEART_RATE, millis());
+        Serial.println("remove()");
+        break;
       case 's': printStatus(); break;
       default: break;
     }

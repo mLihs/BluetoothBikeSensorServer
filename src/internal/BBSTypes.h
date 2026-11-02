@@ -14,6 +14,7 @@ enum class SlotState : uint8_t {
   EMPTY = 0, IDLE = 1, WAIT_SCAN = 2, FOUND = 3, STOPPING_FOR_CONNECT = 4,
   CONNECTING = 5, CANCELLING = 6, DISCOVERING = 7, SUBSCRIBED = 8
 };
+enum class Mode : uint8_t { NAME = 0, MAC = 1 };
 
 enum class EventType : uint8_t {
   SENSOR_FOUND = 0, SENSOR_CONNECTED = 1, SENSOR_DISCONNECTED = 2, SENSOR_FAILED = 3,

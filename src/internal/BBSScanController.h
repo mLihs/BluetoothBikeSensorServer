@@ -6,16 +6,19 @@
 #include "BBSConfig.h"
 #include "BBSTypes.h"
 
-// Raw-GAP scan owner (§5.3). MAC SLEEP windows only; NAME_SCAN (step 4) and
-// DISCOVERY_PENDING/DISCOVERY (step 6) are not built yet. update() task only.
+// Raw-GAP scan owner (§5.3): NAME_SCAN windows (NAME mode) and SLEEP windows
+// (MAC mode); DISCOVERY_PENDING/DISCOVERY (step 6) are not built yet.
+// update() task only.
 
 namespace BikeSensor {
 namespace internal {
 
-enum class ScanOwner : uint8_t { OFF, SLEEP_WINDOW };
+enum class ScanOwner : uint8_t { OFF, NAME_SCAN, SLEEP_WINDOW };
 
 class ScanController {
  public:
+  explicit ScanController(Mode mode) : mode_(mode) {}
+
   ScanOwner owner() const { return owner_; }
   uint16_t epoch() const { return epoch_; }
 
@@ -35,10 +38,11 @@ class ScanController {
   // the first rescan after a later disconnect + failed direct attempt.
   void clearRemainder() { remainderMs_ = 0; }
 
-  // needScan: a slot is in WAIT_SCAN. slotBusy: a slot is FOUND,
-  // STOPPING_FOR_CONNECT, CONNECTING, CANCELLING or DISCOVERING.
+  // needScan: NAME mode → a slot is IDLE; MAC mode → a slot is WAIT_SCAN.
+  // slotBusy: a slot is FOUND, STOPPING_FOR_CONNECT, CONNECTING, CANCELLING or
+  // DISCOVERING.
   void advance(BlePort& port, uint32_t now, bool needScan, bool slotBusy, Stats& stats) {
-    if (owner_ == ScanOwner::SLEEP_WINDOW) {
+    if (owner_ != ScanOwner::OFF) {
       if (!needScan) {
         port.discCancel();
         owner_ = ScanOwner::OFF;
@@ -53,7 +57,10 @@ class ScanController {
       hold(now, BBS_SCAN_START_BACKOFF_MS);
       return;
     }
-    const uint32_t duration = remainderMs_ != 0 ? remainderMs_ : BBS_SLEEP_SCAN_DURATION_MS;
+    const bool name = mode_ == Mode::NAME;
+    const uint32_t duration = name                ? BBS_NAME_SCAN_WINDOW_MS
+                              : remainderMs_ != 0 ? remainderMs_
+                                                  : BBS_SLEEP_SCAN_DURATION_MS;
     epoch_ = static_cast<uint16_t>(epoch_ + 1);
     if (epoch_ == 0) epoch_ = 1;
     if (port.discStart(epoch_, duration) != 0) {
@@ -62,22 +69,27 @@ class ScanController {
       return;
     }
     stats.scansStarted++;
-    remainderMs_ = 0;
-    owner_ = ScanOwner::SLEEP_WINDOW;
+    owner_ = name ? ScanOwner::NAME_SCAN : ScanOwner::SLEEP_WINDOW;
     windowStartMs_ = now;
     windowMs_ = duration;
-    hold(now, duration + BBS_SLEEP_SCAN_INTERVAL_MS);
+    if (name) {
+      hold(now, 0);                     // windows repeat back to back
+    } else {
+      remainderMs_ = 0;
+      hold(now, duration + BBS_SLEEP_SCAN_INTERVAL_MS);
+    }
   }
 
-  // FOUND → STOPPING_FOR_CONNECT. Cancels a running window and remembers its
-  // remainder, so a failed connect resumes scanning at once for that rest.
-  // Returns the cancel rc (0 if nothing was running).
+  // FOUND → STOPPING_FOR_CONNECT. Cancels a running window. A SLEEP window
+  // remembers its remainder, so a failed connect resumes scanning at once for
+  // that rest. Returns the cancel rc (0 if nothing was running).
   int stopForConnect(BlePort& port, uint32_t now) {
-    if (owner_ != ScanOwner::SLEEP_WINDOW) return 0;
+    if (owner_ == ScanOwner::OFF) return 0;
     const int rc = port.discCancel();
+    const bool sleep = owner_ == ScanOwner::SLEEP_WINDOW;
     owner_ = ScanOwner::OFF;
     const uint32_t elapsed = now - windowStartMs_;
-    if (elapsed < windowMs_) {
+    if (sleep && elapsed < windowMs_) {
       remainderMs_ = windowMs_ - elapsed;
       hold(now, 0);
     }
@@ -90,6 +102,7 @@ class ScanController {
     holdMs_ = ms;
   }
 
+  const Mode mode_;
   ScanOwner owner_ = ScanOwner::OFF;
   uint16_t epoch_ = 0;                  // never 0 once a window started
   uint32_t holdFromMs_ = 0;             // next start not before holdFromMs_ + holdMs_

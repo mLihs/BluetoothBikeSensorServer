@@ -34,9 +34,6 @@
 #ifndef BBS_POWER_STALE_MS
 #define BBS_POWER_STALE_MS 3000             // cadence → 0 without a new crank event
 #endif
-#ifndef BBS_NAME_RERESOLVE_FAILS
-#define BBS_NAME_RERESOLVE_FAILS 3
-#endif
 #ifndef BBS_SCAN_END_GRACE_MS
 #define BBS_SCAN_END_GRACE_MS 3000
 #endif

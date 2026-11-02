@@ -21,10 +21,12 @@ inline Event makeEvent(Ev kind, uint8_t slot, int16_t reason, uint16_t gen) {
   return ev;
 }
 
-// name is not NUL-terminated (AD data); kept to 31 bytes plus NUL.
+// name is not NUL-terminated (AD data); kept to 31 bytes plus NUL. slot: the
+// slot whose name matched (NAME mode); MAC mode routes by address.
 inline bool pushScanMatch(EventQueue& q, uint16_t epoch, const uint8_t addr[6],
-                          uint8_t addrType, const char* name, size_t nameLen) {
-  Event ev = makeEvent(Ev::SCAN_MATCH, 0, 0, epoch);
+                          uint8_t addrType, const char* name, size_t nameLen,
+                          uint8_t slot = 0) {
+  Event ev = makeEvent(Ev::SCAN_MATCH, slot, 0, epoch);
   memcpy(ev.match.addr, addr, sizeof(ev.match.addr));
   ev.match.addrType = addrType;
   if (name == nullptr) nameLen = 0;
