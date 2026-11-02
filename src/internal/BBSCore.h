@@ -130,10 +130,11 @@ class Core {
 
   // MAC mode only. addrType: 0 public, 1 random, -1 auto-detect from the MAC
   // (2.x rule: top two bits 11 → random). The same type on a non-EMPTY slot
-  // replaces the identity (§4); a MAC held by another slot returns false.
+  // replaces the identity (§4); a MAC held by another slot or a type outside
+  // the begin() mask returns false.
   bool addByMac(SensorType type, const char* mac, int8_t addrType, const char* name,
                 uint32_t now) {
-    const int i = slotIndex(type);
+    const int i = enabledSlot(type);
     uint8_t bytes[6];
     if (i < 0 || mode_ != Mode::MAC) return false;
     if (!parseMac(mac, bytes) || addrType < -1 || addrType > 1) return false;
@@ -157,10 +158,11 @@ class Core {
   }
 
   // NAME mode only. The name is matched exactly and case-sensitively, stored
-  // truncated to 31 bytes; a name another slot holds returns false. The same
-  // type on a non-EMPTY slot replaces the identity and goes to IDLE (§4).
+  // truncated to 31 bytes; a name another slot holds or a type outside the
+  // begin() mask returns false. The same type on a non-EMPTY slot replaces the
+  // identity and goes to IDLE (§4).
   bool addByName(SensorType type, const char* name, uint32_t now) {
-    const int i = slotIndex(type);
+    const int i = enabledSlot(type);
     if (i < 0 || mode_ != Mode::NAME || name == nullptr || name[0] == '\0') return false;
     char stored[sizeof(SensorSlot::name)];
     copyName(stored, name);
@@ -224,18 +226,22 @@ class Core {
   }
 
   // §5.4: rebuilds the advertising data (name + UUIDs) and restarts
-  // advertising if the desired state allows it. False if the server is not
+  // advertising under the same rules as the enforcement (desired state, start
+  // hold). True if the new data was applied; false if the server is not
   // started, the data does not fit (previous data and advertising stay
-  // untouched), NimBLE refused a field, or the restart failed.
-  bool refreshAdvertising() {
+  // untouched) or NimBLE refused a field. A failed restart is not a failure.
+  bool refreshAdvertising(uint32_t now) {
     if (!serverStarted_) return false;
     char name[kServerNameSize];
     serverName(name, sizeof(name));
     if (!advertisingFits(strlen(name), localTypes())) return false;
-    if (port_.advActive()) port_.advStop();
+    if (port_.advActive()) {
+      advHeld_ = false;                 // a start has succeeded since the failure
+      port_.advStop();
+    }
     const bool dataOk = port_.advSetData(name, localTypes());
-    const bool started = !advertisingDesired() || port_.advStart();
-    return dataOk && started;
+    enforceAdvertising(now);
+    return dataOk;
   }
 
   // Takes effect through refreshAdvertising().
@@ -276,7 +282,7 @@ class Core {
     if (queue_.takeResync()) resync(now);
     Event ev;
     for (uint8_t i = 0; i < BBS_EVENT_QUEUE_DEPTH && queue_.pop(ev); ++i) handle(ev, now);
-    enforceAdvertising();
+    enforceAdvertising(now);
     gattStep(now);
     for (uint8_t i = 0; i < kSlotCount; ++i) advanceSlot(i, now);
     orphanSweep();
@@ -554,6 +560,7 @@ class Core {
         emit(EventType::CENTRAL_CONNECTED, SensorType{}, 0, refreshCentralCount());
         break;
       case Ev::CENTRAL_DISCONNECT:
+        advHeld_ = false;
         emit(EventType::CENTRAL_DISCONNECTED, SensorType{}, ev.reason, refreshCentralCount());
         break;
       case Ev::SUBSCRIBE:
@@ -646,20 +653,35 @@ class Core {
   // resync. Also stops NimBLE's own restarts (§0.9).
   bool advertisingDesired() const { return serverStarted_ && !paused_ && !quiesced_; }
 
+  // Slot of a type in the begin() mask (rev 28), or -1.
+  int enabledSlot(SensorType type) const {
+    return (enabled_ & typeBit(type)) != 0 ? slotIndex(type) : -1;
+  }
+
   // Enabled types with a local service; the local CPS is §10 step 8.
   uint8_t localTypes() const {
     return enabled_ & (typeBit(SensorType::HEART_RATE) | typeBit(SensorType::SPEED_CADENCE));
   }
 
-  void enforceAdvertising() {
+  // Rev 28: a failed start holds the next one for BBS_SCAN_START_BACKOFF_MS
+  // (all connections in use → BLE_HS_ENOMEM on every attempt). Stops are never
+  // held; a connection freed, HOST_RESET and resync end the hold.
+  void enforceAdvertising(uint32_t now) {
     const bool desired = advertisingDesired();
     const bool active = port_.advActive();
+    if (active) advHeld_ = false;       // a start has succeeded since the failure
     if (desired && !active) {
-      port_.advStart();
+      if (advHeld_ && now - advHeldSinceMs_ < BBS_SCAN_START_BACKOFF_MS) return;
+      startAdvertising(now);
     } else if (!desired && active) {
       port_.advStop();
       stats_.advertisingEnforced++;
     }
+  }
+
+  void startAdvertising(uint32_t now) {
+    advHeld_ = !port_.advStart();
+    advHeldSinceMs_ = now;
   }
 
   // §5.1 SCAN_MATCH (epoch already checked). The report's address and
@@ -713,6 +735,7 @@ class Core {
     if (ev.kind == Ev::DISCONNECTED || state == SlotState::DISCOVERING ||
         state == SlotState::SUBSCRIBED) {
       s.lastDisconnectReason = ev.reason;
+      advHeld_ = false;                 // a connection is free again
     }
     // CONNECT_FAIL in DISCOVERING/SUBSCRIBED is a link loss (NimBLE reason 0x3E).
     switch (state) {
@@ -746,7 +769,8 @@ class Core {
         leaveAttempt(i, now, Outcome::NEUTRAL);
       }
     }
-    enforceAdvertising();
+    advHeld_ = false;
+    enforceAdvertising(now);
     stats_.hostResets++;
     emit(EventType::HOST_RESET, SensorType{});
   }
@@ -756,7 +780,8 @@ class Core {
     if (!port_.discActive()) scan_.forceOff();   // step 4 first: the slot repair may emit()
     for (uint8_t i = 0; i < kSlotCount; ++i) resyncSlot(i, now);
     refreshCentralCount();
-    enforceAdvertising();
+    advHeld_ = false;
+    enforceAdvertising(now);
   }
 
   void resyncSlot(uint8_t i, uint32_t now) {
@@ -901,6 +926,8 @@ class Core {
   char prefix_[kNamePrefixMax + 1] = "homewind";   // under tableMux_
   uint8_t centralCount_ = 0;            // under tableMux_
   bool serverStarted_ = false;
+  bool advHeld_ = false;                // last advStart() failed (rev 28 hold)
+  uint32_t advHeldSinceMs_ = 0;
   bool paused_ = false;                 // pause latch (§5.5)
   bool quiesced_ = false;               // quiesce latch (§4)
 };

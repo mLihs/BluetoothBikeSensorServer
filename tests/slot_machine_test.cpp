@@ -2807,10 +2807,72 @@ static void testAdvertisingDesiredState() {
   assert(r.port.advOn && r.port.advStarts == 2);
   r.port.advOn = false;                                // start refused (e.g. no free connection)
   r.port.advStartOk = false;
+  const uint32_t failedAt = r.now;
   r.update();
+  assert(!r.port.advOn && r.port.advStarts == 3);
   r.update();
-  assert(!r.port.advOn && r.port.advStarts == 4);      // retried on every update()
+  r.at(failedAt + BBS_SCAN_START_BACKOFF_MS - 1);
+  assert(r.port.advStarts == 3);                       // held (rev 28)
+  r.at(failedAt + BBS_SCAN_START_BACKOFF_MS);
+  assert(r.port.advStarts == 4);                       // retried once the hold expires
+  r.at(r.now + 1);
+  assert(r.port.advStarts == 4);                       // that failure holds again
   assert(r.core->stats().advertisingEnforced == 1 && r.port.advStops == 1);
+
+  r.port.advStartOk = true;                            // NimBLE restarted it while held:
+  r.port.advOn = true;                                 // left alone, and the hold ends
+  r.update();
+  assert(r.port.advStarts == 4 && r.port.advStops == 1);
+  r.port.advOn = false;
+  r.update();
+  assert(r.port.advOn && r.port.advStarts == 5);
+}
+
+// Rev 28: the start hold ends early when a connection may be free again.
+static void testAdvertisingHoldReleases() {
+  struct Release { const char* what; void (*apply)(Rig&); };
+  const Release releases[] = {
+      {"CENTRAL_DISCONNECT", [](Rig& r) { assert(bs::pushCentralDisconnect(r.core->queue(), 0x13)); }},
+      {"sensor DISCONNECTED", [](Rig& r) { r.discEv(r.gen(), 0x08); }},
+      {"link-loss CONNECT_FAIL", [](Rig& r) {
+         r.port.connected = false;
+         r.failEv(r.gen(), 0x3E);
+       }},
+      {"HOST_RESET", [](Rig& r) { assert(bs::pushHostReset(r.core->queue())); }},
+      {"resync", [](Rig& r) { r.core->queue().requestResync(); }},
+  };
+  for (const Release& rel : releases) {
+    Rig r;
+    r.toSubscribed();
+    assert(r.core->startServer());
+    r.port.advStartOk = false;
+    r.update();
+    assert(r.port.advStarts == 1);
+    r.update();
+    assert(r.port.advStarts == 1);                     // held
+    r.port.advStartOk = true;
+    rel.apply(r);
+    r.update();
+    assert(r.port.advStarts == 2 && r.port.advOn);
+  }
+  {
+    Rig r;                                             // stale DISCONNECTED and a plain
+    r.toConnecting();                                  // CONNECT_FAIL keep the hold
+    assert(r.core->startServer());
+    r.port.advStartOk = false;
+    r.update();
+    assert(r.port.advStarts == 1);
+    r.port.advStartOk = true;
+    r.discEv(static_cast<uint16_t>(r.gen() - 1), 0x08);
+    r.update();
+    assert(r.port.advStarts == 1);
+    r.failEv(r.gen(), 13);
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.port.advStarts == 1);
+    assert(bs::pushCentralConnect(r.core->queue()));
+    r.update();
+    assert(r.port.advStarts == 1);
+  }
 }
 
 static void testAdvertisingAfterHostResetAndResync() {
@@ -2965,16 +3027,6 @@ static void testCadenceData() {
   assert(notifyEv(r, next, sizeof(next), kCsc));
   r.update();
   assert(g_cadCalls == 2);
-
-  Rig s(Mode::MAC, 0x01 | 0x04);                       // CSC not enabled: no cadence source
-  s.core->setCadenceCallback(onCadence);
-  resetValues(s);
-  cscToSubscribed(s);
-  g_eventCount = 0;
-  assert(notifyEv(s, kCscFirst, sizeof(kCscFirst), kCsc));
-  assert(notifyEv(s, kCsc60, sizeof(kCsc60), kCsc));
-  s.update();
-  assert(g_cadCalls == 0 && countEvents(EventType::DATA) == 2);
 }
 
 static uint16_t g_getterValue = 0;
@@ -3082,11 +3134,34 @@ static void testCadenceGetter() {
   assert(!r.core->lastCadence(rpm, age, r.now));
 
   Rig s(Mode::MAC, 0x01 | 0x04);                       // CSC not in begin(): source none
-  cscToSubscribed(s);
-  assert(notifyEv(s, kCscFirst, sizeof(kCscFirst), kCsc));
-  assert(notifyEv(s, kCsc60, sizeof(kCsc60), kCsc));
-  s.update();
+  assert(!s.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 0, "CSC", s.now));
   assert(!s.core->lastCadence(rpm, age, s.now));
+}
+
+// Rev 28: addBy* rejects a type outside the begin() mask.
+static void testAddOutsideMask() {
+  const SensorType types[] = {SensorType::HEART_RATE, SensorType::SPEED_CADENCE,
+                              SensorType::POWER};
+  for (SensorType type : types) {
+    const uint8_t others = static_cast<uint8_t>(0x07 & ~BikeSensor::typeBit(type));
+    const int slot = bs::slotIndex(type);
+    Rig r(Mode::MAC, others);
+    assert(!r.core->addByMac(type, kOtherMacStr, 0, "X", r.now));
+    if (slot >= 0) assert(r.core->slot(static_cast<uint8_t>(slot)).state == SlotState::EMPTY);
+    assert(!r.core->scanFilterMatch(kOtherMac));
+    Rig n(Mode::NAME, others);
+    assert(!n.core->addByName(type, "X", n.now));
+    if (slot >= 0) assert(n.core->slot(static_cast<uint8_t>(slot)).state == SlotState::EMPTY);
+
+    Rig ok(Mode::MAC, BikeSensor::typeBit(type));              // in the mask: accepted if compiled
+    assert(ok.core->addByMac(type, kOtherMacStr, 0, "X", ok.now) == (slot >= 0));
+    Rig okName(Mode::NAME, BikeSensor::typeBit(type));
+    assert(okName.core->addByName(type, "X", okName.now) == (slot >= 0));
+  }
+  Rig r(Mode::MAC, 0x07);
+  assert(!r.core->addByMac(SensorType{}, kOtherMacStr, 0, "X", r.now));
+  r.update();
+  assert(r.port.discStarts == 0);                      // nothing to scan for
 }
 
 static void testServerTypes() {
@@ -3111,7 +3186,7 @@ static void testServerTypes() {
   assert(!r.core->startServer() && r.port.advDataSets == 1);
   r.update();
   assert(!r.port.advOn && r.port.advStarts == 0);
-  assert(!r.core->refreshAdvertising());               // not started
+  assert(!r.core->refreshAdvertising(r.now));               // not started
   r.port.advDataOk = true;
   assert(r.core->startServer() && r.port.serverStarts == 3);
   r.update();
@@ -3144,16 +3219,16 @@ static void testAdvertisingBudget() {
   r.update();
   assert(r.port.advOn && r.port.advStarts == 1);
   r.core->setNamePrefix("abcdefghijkl");
-  assert(!r.core->refreshAdvertising());
+  assert(!r.core->refreshAdvertising(r.now));
   assert(r.port.advOn && r.port.advStops == 0 && r.port.advStarts == 1);
   assert(r.port.advDataSets == 1 && strcmp(r.port.advName, "homewind-da4eb580") == 0);
   r.port.advOn = false;                                // not advertising: stays off
-  assert(!r.core->refreshAdvertising());
+  assert(!r.core->refreshAdvertising(r.now));
   assert(!r.port.advOn && r.port.advStarts == 1 && r.port.advDataSets == 1);
   r.update();                                          // enforcement restarts the old data
   assert(r.port.advOn && r.port.advStarts == 2 && r.port.advDataSets == 1);
   r.core->setNamePrefix("abcdefghijk");
-  assert(r.core->refreshAdvertising());
+  assert(r.core->refreshAdvertising(r.now));
   assert(r.port.advDataSets == 2 && strcmp(r.port.advName, "abcdefghijk-da4eb580") == 0);
 }
 
@@ -3265,7 +3340,7 @@ static void testRefreshFromEventCallback() {
     bool refreshed = false;
     g_hook = [&r, &refreshed, type](const EventInfo& info) {
       if (info.type != type) return;
-      refreshed = r.core->refreshAdvertising();
+      refreshed = r.core->refreshAdvertising(r.now);
     };
     if (type == EventType::HOST_RESET) {
       assert(bs::pushHostReset(r.core->queue()));
@@ -3382,7 +3457,7 @@ static void testServerName() {
 static void testRefreshAdvertising() {
   Rig r;
   r.core->setNamePrefix("Bike");
-  assert(!r.core->refreshAdvertising());               // no server yet
+  assert(!r.core->refreshAdvertising(r.now));               // no server yet
   assert(r.port.advDataSets == 0 && r.port.advStarts == 0);
   assert(r.core->startServer());
   assert(strcmp(r.port.advName, "bike-da4eb580") == 0);
@@ -3392,23 +3467,37 @@ static void testRefreshAdvertising() {
   r.core->setNamePrefix("Trainer");                    // only through refreshAdvertising()
   r.update();
   assert(r.port.advDataSets == 1 && strcmp(r.port.advName, "bike-da4eb580") == 0);
-  assert(r.core->refreshAdvertising());
+  assert(r.core->refreshAdvertising(r.now));
   assert(r.port.advDataSets == 2 && strcmp(r.port.advName, "trainer-da4eb580") == 0);
   assert(!r.port.advOnAtDataSet && r.port.advStops == 1);   // stopped before the rebuild
   assert(r.port.advOn && r.port.advStarts == 2 && r.port.advMask == 0x03);
   assert(r.core->stats().advertisingEnforced == 0);
 
   r.port.advOn = false;                                // not advertising: no stop
-  assert(r.core->refreshAdvertising());
+  assert(r.core->refreshAdvertising(r.now));
   assert(r.port.advStops == 1 && r.port.advOn && r.port.advStarts == 3);
 
-  r.port.advStartOk = false;
+  r.port.advStartOk = false;                           // restart refused: still applied (rev 28)
   r.port.advOn = false;
-  assert(!r.core->refreshAdvertising() && r.port.advDataSets == 4);
+  assert(r.core->refreshAdvertising(r.now) && r.port.advDataSets == 4);
+  assert(r.port.advStarts == 4 && !r.port.advOn);
+  assert(r.core->refreshAdvertising(r.now) && r.port.advDataSets == 5);
+  assert(r.port.advStarts == 4);                       // the restart follows the start hold
   r.port.advStartOk = true;
-  r.port.advDataOk = false;                            // data did not fit: started anyway
-  assert(!r.core->refreshAdvertising());
+  r.now += BBS_SCAN_START_BACKOFF_MS;
+  r.port.advDataOk = false;                            // NimBLE refused a field
+  assert(!r.core->refreshAdvertising(r.now));
   assert(r.port.advOn && r.port.advStarts == 5);
+
+  r.port.advDataOk = true;                             // held, then NimBLE restarted it:
+  r.port.advOn = false;                                // the refresh restarts it at once
+  r.port.advStartOk = false;
+  r.update();
+  assert(r.port.advStarts == 6 && !r.port.advOn);
+  r.port.advStartOk = true;
+  r.port.advOn = true;
+  assert(r.core->refreshAdvertising(r.now));
+  assert(r.port.advOn && r.port.advStarts == 7 && r.port.advStops == 2);
 }
 
 int main() {
@@ -3479,6 +3568,8 @@ int main() {
   testCentralCountResync();
   testAdvertisingDesiredState();
   testAdvertisingAfterHostResetAndResync();
+  testAdvertisingHoldReleases();
+  testAddOutsideMask();
   testHeartRateData();
   testCadenceData();
   testHeartRateGetter();
