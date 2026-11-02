@@ -59,10 +59,12 @@ class ScanController {
     owner_ = ScanOwner::OFF;
   }
 
-  // Core::begin(): no window, hold or remainder; the epoch keeps counting.
+  // Core::begin(): no window, discovery, hold or remainder; the epoch keeps
+  // counting.
   void reset(Mode mode) {
     mode_ = mode;
     owner_ = ScanOwner::OFF;
+    activeDiscEpoch_.store(0, std::memory_order_release);
     hold(0, 0);
     remainderMs_ = 0;
   }

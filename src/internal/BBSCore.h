@@ -19,9 +19,9 @@
 // slot machine (§5.2), event handling (§5.1), resync (§3.2), HOST_RESET, the
 // app lifecycle, DATA and central events (§4), HR/CSC data callbacks, relay,
 // server name and advertising desired state (§5.4), discovery (§3.3, §5.3),
-// pause/quiesce and begin()/end() (§4), driven through BlePort. Arduino-free; the caller passes millis() as
-// `now`. Everything except the members marked "any task" runs on the update()
-// task.
+// pause/quiesce and begin()/end() (§4), driven through BlePort. Arduino-free;
+// the caller passes millis() as `now`. Everything except the members marked
+// "any task" runs on the update() task.
 
 namespace BikeSensor {
 namespace internal {
@@ -388,9 +388,16 @@ class Core {
   // §4 begin(): stack init if needed, clients and GATT timer, server. A fresh
   // session: every slot EMPTY, no queued events, the given mode and types.
   // False while begun and while quiesced without a successful end(), so the
-  // latch is cleared only after end() returned true.
+  // latch is cleared only after end() returned true. A name and UUID list that
+  // do not fit (§5.4), a failed stack init or open() return false before the
+  // session changes; only the prefix follows deviceName as in initStack().
   bool begin(const char* deviceName, uint8_t typeMask, Mode mode) {
-    if (begun_ || (quiesced_ && !down_) || !initStack(deviceName) || !port_.open()) {
+    if (begun_ || (quiesced_ && !down_)) return false;
+    if (!port_.stackReady()) setNamePrefix(deviceName);
+    char name[kServerNameSize];
+    serverName(name, sizeof(name));
+    if (!advertisingFits(strlen(name), localTypes(typeMask)) || !initStack(deviceName) ||
+        !port_.open()) {
       return false;
     }
     mode_ = mode;
@@ -403,6 +410,7 @@ class Core {
     {
       MuxGuard guard(tableMux_);
       quiesced_ = false;
+      discOpen_ = false;
       centralCount_ = 0;
     }
     down_ = false;
@@ -411,24 +419,23 @@ class Core {
     return begun_;
   }
 
-  // §4 end(), update() task only, never the NimBLE host task. False (not torn
+  // §4 end(), update() task only, never the NimBLE host task, and never from
+  // an event or data callback (it runs update() itself). False (not torn
   // down, reboot) after a timeout in step 2 or 4 or a failed teardown; the
   // quiesce latch stays either way.
   bool end() {
     if (down_) return true;
     quiesce(port_.nowMs());
     if (!driveUntil(kConnectWatchdogMs, [this] { return quiesced(); })) return false;
-    // isConnected() is false while DISCONNECTING; a SUBSCRIBED slot still
-    // waits for its DISCONNECTED.
-    awaitDisc_ = 0;
+    // Every client with a handle, also one DISCONNECTING in a wait state:
+    // deinit(true) cannot delete it (§4 step 4). Its DISCONNECTED is queued
+    // before the handle clears, so one more pass handles it.
     for (uint8_t i = 0; i < kSlotCount; ++i) {
-      if (!port_.isConnected(i) && slots_[i].state != SlotState::SUBSCRIBED) continue;
-      port_.disconnect(i);
-      awaitDisc_ |= static_cast<uint8_t>(1u << i);
+      if (port_.connHandle(i) != kConnHandleNone) port_.disconnect(i);
     }
-    if (!driveUntil(kEndDisconnectMs, [this] { return awaitDisc_ == 0; }) || !port_.close()) {
-      return false;
-    }
+    if (!driveUntil(kEndDisconnectMs, [this] { return !anyConnHandle(); })) return false;
+    update(port_.nowMs());
+    if (!port_.close()) return false;
     serverStarted_ = gattStarted_ = begun_ = false;
     down_ = true;
     return true;
@@ -833,7 +840,6 @@ class Core {
       case Ev::DISCONNECTED:
         if (ev.slot < kSlotCount &&
             ev.gen == slots_[ev.slot].attemptGen.load(std::memory_order_relaxed)) {
-          if (ev.kind != Ev::CONNECTED) awaitDisc_ &= static_cast<uint8_t>(~(1u << ev.slot));
           onClientEvent(ev.slot, ev, now);
         }
         break;
@@ -955,8 +961,10 @@ class Core {
   }
 
   // Enabled types with a local service; the local CPS is §10 step 8.
-  uint8_t localTypes() const {
-    return enabled_ & (typeBit(SensorType::HEART_RATE) | typeBit(SensorType::SPEED_CADENCE));
+  uint8_t localTypes() const { return localTypes(enabled_); }
+  static uint8_t localTypes(uint8_t typeMask) {
+    return typeMask & kCompiledMask &
+           (typeBit(SensorType::HEART_RATE) | typeBit(SensorType::SPEED_CADENCE));
   }
 
   // Rev 28: a failed start holds the next one for BBS_SCAN_START_BACKOFF_MS
@@ -1229,6 +1237,13 @@ class Core {
     }
   }
 
+  bool anyConnHandle() {
+    for (uint8_t i = 0; i < kSlotCount; ++i) {
+      if (port_.connHandle(i) != kConnHandleNone) return true;
+    }
+    return false;
+  }
+
   // §5.1 step 6. Never in CONNECTING (NimBLE reports connected before onConnect).
   void orphanSweep() {
     for (uint8_t i = 0; i < kSlotCount; ++i) {
@@ -1273,7 +1288,6 @@ class Core {
   bool quiesced_ = false;               // quiesce latch (§4), written under tableMux_
   bool begun_ = false;                  // begin() succeeded, no successful end() since
   bool down_ = false;                   // end() tore the stack down; begin() not yet
-  uint8_t awaitDisc_ = 0;               // end() step 4: slots still owing a DISCONNECTED
 };
 
 }  // namespace internal

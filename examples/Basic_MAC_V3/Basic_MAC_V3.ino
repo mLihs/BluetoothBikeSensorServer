@@ -1,13 +1,14 @@
 /**
  * @file Basic_MAC_V3.ino
- * @brief Hardware checkpoint for V3 steps 1–3: one heart-rate sensor by MAC.
+ * @brief V3 hardware checkpoint: one heart-rate sensor by MAC.
  *
  * EXPERIMENTAL: drives the V3 internals (src/internal) directly. This is not
  * the final public API; it will be replaced by the public BikeSensor facade.
  * The 2.x API and examples are unaffected.
  *
- * Sleep scan finds the MAC, connects, subscribes and prints the lifecycle
- * events. Measurements are not relayed yet (step 5).
+ * Core::begin() starts the stack and the relay server, advertised as
+ * "homewind-<chip id>". Sleep scan finds the MAC, connects, subscribes and
+ * prints the lifecycle events; heart-rate notifies are relayed to centrals.
  */
 
 #include <NimBLEDevice.h>

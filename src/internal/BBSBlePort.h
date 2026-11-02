@@ -16,6 +16,7 @@ namespace internal {
 constexpr int kHsEAlready = 2;
 constexpr int kHsEBusy = 15;
 constexpr int kHsENotSynced = 22;
+constexpr uint16_t kConnHandleNone = 0xFFFF;         // BLE_HS_CONN_HANDLE_NONE
 
 class BlePort {
  public:
@@ -33,6 +34,8 @@ class BlePort {
   virtual bool cancelConnect(uint8_t slot) = 0;
   virtual bool disconnect(uint8_t slot) = 0;
   virtual bool isConnected(uint8_t slot) = 0;
+  // Kept while DISCONNECTING; kConnHandleNone only after NimBLE has called
+  // onDisconnect/onConnectFail (NimBLEClient.cpp:1081–1087).
   virtual uint16_t connHandle(uint8_t slot) = 0;
 
   // One blocking GATT pass (§5.2): service, characteristic, subscribe, battery.
@@ -64,6 +67,7 @@ class BlePort {
   // Per-slot clients, reset detector, GATT timer; existing ones are kept.
   virtual bool open() = 0;
   // end() steps 5 and 6: delete the GATT timer, NimBLEDevice::deinit(true).
+  // False without either while a client still has a connection handle.
   virtual bool close() = 0;
   // end() drives update() itself: the clock and a one-tick wait between passes.
   virtual uint32_t nowMs() = 0;

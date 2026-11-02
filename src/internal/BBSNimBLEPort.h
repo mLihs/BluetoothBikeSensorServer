@@ -17,6 +17,7 @@
 static_assert(BLE_HS_EALREADY == BikeSensor::internal::kHsEAlready, "");
 static_assert(BLE_HS_EBUSY == BikeSensor::internal::kHsEBusy, "");
 static_assert(BLE_HS_ENOTSYNCED == BikeSensor::internal::kHsENotSynced, "");
+static_assert(BLE_HS_CONN_HANDLE_NONE == BikeSensor::internal::kConnHandleNone, "");
 
 namespace BikeSensor {
 namespace internal {
@@ -56,9 +57,14 @@ class NimBLEPort final : public BlePort {
     return esp_timer_create(&args, &gattTimer_) == ESP_OK;
   }
 
-  // deinit(true) deletes the server, advertising, scan and clients (all
-  // DISCONNECTED by then; NimBLEDevice.cpp deinit → deleteClient); forget them.
+  // deinit(true) deletes the server, advertising, scan and clients; forget
+  // them. A client with a handle would survive it: ble_hs_stop does not wait
+  // for a terminating link, then deleteClient's disconnect() fails
+  // (NimBLEDevice.cpp:365–369).
   bool close() override {
+    for (NimBLEClient* client : clients_) {
+      if (client != nullptr && client->getConnHandle() != BLE_HS_CONN_HANDLE_NONE) return false;
+    }
     if (gattTimer_ != nullptr) {
       if (esp_timer_delete(gattTimer_) != ESP_OK) return false;
       gattTimer_ = nullptr;
@@ -94,18 +100,31 @@ class NimBLEPort final : public BlePort {
 
   int discCancel() override { return ble_gap_disc_cancel(); }
 
+  // Before the first open(), and after close(), there are no clients:
+  // nothing connects and nothing is connected.
   bool connect(uint8_t slot, const uint8_t mac[6], uint8_t addrType) override {
     NimBLEClient* client = clients_[slot];
+    if (client == nullptr) return false;
     client->setConnectTimeout(BBS_CONNECT_TIMEOUT_MS);
     client->setConnectRetries(0);
     return client->connect(NimBLEAddress(mac, addrType), true, true);
   }
 
-  int lastError(uint8_t slot) override { return clients_[slot]->getLastError(); }
-  bool cancelConnect(uint8_t slot) override { return clients_[slot]->cancelConnect(); }
-  bool disconnect(uint8_t slot) override { return clients_[slot]->disconnect(); }
-  bool isConnected(uint8_t slot) override { return clients_[slot]->isConnected(); }
-  uint16_t connHandle(uint8_t slot) override { return clients_[slot]->getConnHandle(); }
+  int lastError(uint8_t slot) override {
+    return clients_[slot] != nullptr ? clients_[slot]->getLastError() : BLE_HS_ENOTSYNCED;
+  }
+  bool cancelConnect(uint8_t slot) override {
+    return clients_[slot] != nullptr && clients_[slot]->cancelConnect();
+  }
+  bool disconnect(uint8_t slot) override {
+    return clients_[slot] != nullptr && clients_[slot]->disconnect();
+  }
+  bool isConnected(uint8_t slot) override {
+    return clients_[slot] != nullptr && clients_[slot]->isConnected();
+  }
+  uint16_t connHandle(uint8_t slot) override {
+    return clients_[slot] != nullptr ? clients_[slot]->getConnHandle() : BLE_HS_CONN_HANDLE_NONE;
+  }
 
   bool gattPass(uint8_t slot, SensorType type, uint8_t& battery) override {
     NimBLEClient* client = clients_[slot];

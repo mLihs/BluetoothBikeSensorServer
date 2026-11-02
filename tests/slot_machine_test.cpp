@@ -108,7 +108,13 @@ struct FakePort final : BlePort {
     return true;
   }
   bool isConnected(uint8_t slot) override { return linkUp[slot]; }
-  uint16_t connHandle(uint8_t) override { return 7; }
+  // NimBLE keeps the handle while DISCONNECTING (isConnected() false); discEv clears it.
+  bool disconnecting[bs::kSlotCount] = {};
+  std::function<void(uint8_t)> onConnHandle;           // the host task, racing a handle read
+  uint16_t connHandle(uint8_t slot) override {
+    if (onConnHandle) onConnHandle(slot);
+    return linkUp[slot] || disconnecting[slot] ? 7 : bs::kConnHandleNone;
+  }
   bool gattPass(uint8_t slot, SensorType type, uint8_t& battery) override {
     assert(bs::slotIndex(type) == slot);
     gattPasses++;
@@ -168,6 +174,9 @@ struct FakePort final : BlePort {
   }
   bool close() override {
     closes++;
+    for (uint8_t i = 0; i < bs::kSlotCount; ++i) {
+      if (linkUp[i] || disconnecting[i]) return false;   // as NimBLEPort::close()
+    }
     if (closeOk) stackUp = false;
     return closeOk;
   }
@@ -294,6 +303,7 @@ struct Rig {
   void discEv(uint16_t g, int16_t reason = 0x208, uint8_t slot = kHr) {
     port.connOn = false;
     port.linkUp[slot] = false;
+    port.disconnecting[slot] = false;
     assert(bs::pushDisconnected(core->queue(), slot, g, reason));
   }
   // add → scan window → match → CONNECTING.
@@ -4626,6 +4636,7 @@ static void testBeginEnd() {
     r.toSubscribed();
     r.remove();
     r.port.connected = false;                          // DISCONNECTING
+    r.port.disconnecting[kHr] = true;
     bool delivered = false;
     r.port.onTick = [&r, &delivered] {
       if (r.port.ticks == 5) {
@@ -4649,6 +4660,183 @@ static void testBeginEnd() {
     r.core->quiesce(r.now);
     assert(!r.core->begin("homewind", 0x07, Mode::MAC) && r.port.stackInits == 0);
   }
+}
+
+// CONNECTED and a callback's quiesce() in one drain: DISCOVERING, no pass run.
+static void quiesceInDiscovering(Rig& r) {
+  r.core->setEventCallback(onEventHook);
+  g_hook = [&r](const EventInfo& info) {
+    if (info.type == EventType::CENTRAL_CONNECTED) r.core->quiesce(r.now);
+  };
+  r.connectedEv(r.gen());
+  assert(bs::pushCentralConnect(r.core->queue()));
+  r.update();
+  g_hook = nullptr;
+  assert(r.state() == SlotState::DISCOVERING && r.port.gattPasses == 0);
+}
+
+// §4 end() steps 3–4: a client still DISCONNECTING while its slot already
+// waits (resync repaired it) keeps its handle; end() waits for it, or fails.
+static void testEndOrphanDisconnecting() {
+  for (int arrives = 0; arrives < 2; ++arrives) {
+    Rig r;
+    assert(r.core->begin("homewind", 0x07, Mode::MAC));
+    r.toConnecting();
+    quiesceInDiscovering(r);
+    r.port.connected = false;                          // DISCONNECTING, its DISCONNECTED missed
+    r.port.disconnecting[kHr] = true;
+    fillQueueToResync(*r.core);
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->quiesced());
+    r.port.clock = 5000;
+    r.port.onTick = [&r, arrives] {
+      if (arrives && r.port.ticks == 5) r.discEv(r.gen());
+    };
+    if (arrives) {
+      assert(r.core->end() && r.port.ticks == 5 && r.port.closes == 1);
+    } else {
+      assert(!r.core->end() && r.port.closes == 0);
+      assert(r.port.clock - 5000 >= bs::kEndDisconnectMs);
+      assert(!r.core->begin("homewind", 0x07, Mode::MAC));
+    }
+  }
+  {
+    Rig r;                                             // DISCONNECTED queued just before the
+    assert(r.core->begin("homewind", 0x07, Mode::MAC));   // handle clears: handled before close
+    r.toSubscribed();
+    r.port.onConnHandle = [&r](uint8_t slot) {
+      if (slot == kHr && r.port.slotDisconnects[kHr] == 1 && r.port.connected) r.discEv(r.gen());
+    };
+    g_eventCount = 0;
+    assert(r.core->end() && r.port.ticks == 0 && r.port.closes == 1);
+    assert(g_eventCount == 1);
+    expectEvent(0, EventType::SENSOR_DISCONNECTED, SlotState::FOUND, 0x208);
+  }
+}
+
+// §4 begin(): a name and UUID list that do not fit, or a failed stack init,
+// leave the session as it was.
+static void testBeginFailsUnchanged() {
+  {
+    Rig r;                                             // before the first begin()
+    r.add();
+    assert(!r.core->begin("abcdefghijkl", 0x03, Mode::NAME));   // 21-byte name + 2 UUIDs
+    assert(r.port.stackInits == 0 && r.port.opens == 0 && r.port.serverStarts == 0);
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->mode() == Mode::MAC);
+    r.port.stackInitOk = false;
+    assert(!r.core->begin("homewind", 0x03, Mode::NAME));
+    assert(r.port.stackInits == 1 && r.port.opens == 0 && r.state() == SlotState::WAIT_SCAN);
+    r.port.stackInitOk = true;
+    assert(r.core->begin("abcdefghijkl", 0x01, Mode::MAC));     // one UUID fits
+    assert(strcmp(r.port.gapName, "abcdefghijkl-da4eb580") == 0);
+    assert(r.state() == SlotState::EMPTY && r.port.serverMask == 0x01);
+  }
+  {
+    Rig r;                                             // after end(): the latch stays
+    assert(r.core->begin("homewind", 0x07, Mode::MAC));
+    r.add();
+    assert(r.core->end());
+    assert(!r.core->begin("abcdefghijkl", 0x03, Mode::MAC));
+    assert(r.port.stackInits == 1 && r.port.opens == 1 && r.state() == SlotState::WAIT_SCAN);
+    assert(!r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 0, nullptr, r.now));
+    assert(r.core->begin("homewind", 0x07, Mode::MAC) && r.state() == SlotState::EMPTY);
+  }
+}
+
+// begin() after a startDiscovery() before it: no open discovery, no epoch.
+static void testBeginClearsDiscovery() {
+  Rig r;
+  assert(r.core->startDiscovery(0x01, 15000, r.now));
+  r.update();
+  assert(r.core->discovering() && r.core->scan().activeDiscEpoch() != 0);
+  r.port.discOn = false;
+  assert(r.core->begin("homewind", 0x07, Mode::MAC));
+  assert(!r.core->discovering() && r.core->scan().activeDiscEpoch() == 0);
+  assert(r.core->scan().owner() == ScanOwner::OFF && g_eventCount == 0);
+  assert(r.core->startDiscovery(0x01, 15000, r.now));
+}
+
+// A DISCOVERING slot whose pass already failed: quiesce()'s disconnect is a
+// second one (NimBLE: BLE_HS_EALREADY, still true); its one DISCONNECTED is
+// the hard fail.
+static void testQuiesceAfterFailedPass() {
+  Rig r;
+  r.port.gattOk = false;
+  r.toConnecting();
+  r.connectedEv(r.gen());
+  r.update();
+  assert(r.state() == SlotState::DISCOVERING && r.hr().failPending);
+  assert(r.port.slotDisconnects[kHr] == 1 && r.port.gattPasses == 1);
+  r.port.connected = false;
+  r.port.disconnecting[kHr] = true;
+  g_eventCount = 0;
+  r.core->quiesce(r.now);
+  assert(r.state() == SlotState::DISCOVERING && !r.core->quiesced());
+  r.update();
+  assert(r.port.gattPasses == 1 && g_eventCount == 0);
+  r.discEv(r.gen(), 0x16);
+  r.update();
+  assert(r.state() == SlotState::WAIT_SCAN && r.hr().failCount == 1 && r.core->quiesced());
+  assert(r.core->stats().connectFails == 0 && r.core->stats().disconnects == 1);
+  assert(g_eventCount == 1);
+  expectEvent(0, EventType::SENSOR_FAILED, SlotState::WAIT_SCAN);
+  r.at(r.now + 60000);
+  assert(r.port.connects == 1 && r.port.gattPasses == 1);
+}
+
+// HOST_RESET and resync under quiesce: link slots go to their wait state,
+// advertising NimBLE restarted on sync is stopped again, quiesced() follows.
+static void testQuiesceHostResetAndResync() {
+  {
+    Rig r;
+    assert(!r.core->quiesced());
+    assert(r.core->startServer());
+    r.update();
+    r.toConnecting();
+    r.core->quiesce(r.now);
+    assert(r.state() == SlotState::CANCELLING && !r.port.advOn);
+    g_eventCount = 0;
+    r.port.connOn = false;
+    r.port.advOn = true;                               // NimBLEAdvertising::onHostSync
+    assert(bs::pushHostReset(r.core->queue()));
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && !r.port.advOn && r.core->quiesced());
+    assert(r.core->stats().advertisingEnforced == 1 && r.hr().failCount == 0);
+    assert(g_eventCount == 1);
+    expectEvent(0, EventType::HOST_RESET, SlotState::WAIT_SCAN, 0, SensorType{});
+  }
+  {
+    Rig r;
+    assert(r.core->startServer());
+    r.update();
+    r.toConnecting();
+    quiesceInDiscovering(r);
+    assert(!r.port.advOn && !r.core->quiesced());
+    r.port.connected = false;                          // DISCONNECTED missed
+    r.port.advOn = true;
+    fillQueueToResync(*r.core);
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && !r.port.advOn && r.core->quiesced());
+    assert(r.core->stats().advertisingEnforced == 1 && r.hr().failCount == 0);
+    assert(r.port.gattPasses == 0);
+  }
+}
+
+// NAME mode: DISCOVERING under quiesce ends in IDLE, without a pass or a window.
+static void testNameQuiesceDiscovering() {
+  Rig r(Mode::NAME);
+  assert(r.core->addByName(SensorType::HEART_RATE, "HRM", r.now));
+  r.update();
+  assert(r.report(kMac, "HRM"));
+  r.update();
+  assert(r.state() == SlotState::CONNECTING);
+  quiesceInDiscovering(r);
+  assert(r.port.slotDisconnects[kHr] == 1 && !r.core->quiesced());
+  r.discEv(r.gen());
+  r.update();
+  assert(r.state() == SlotState::IDLE && r.hr().failCount == 0 && r.core->quiesced());
+  r.at(r.now + 60000);
+  assert(r.port.discStarts == 1 && r.port.connects == 1 && r.port.gattPasses == 0);
 }
 
 int main() {
@@ -4754,5 +4942,11 @@ int main() {
   testScanning();
   testStatsDropCounters();
   testBeginEnd();
+  testEndOrphanDisconnecting();
+  testBeginFailsUnchanged();
+  testBeginClearsDiscovery();
+  testQuiesceAfterFailedPass();
+  testQuiesceHostResetAndResync();
+  testNameQuiesceDiscovering();
   return 0;
 }
