@@ -4161,6 +4161,26 @@ static void testDiscoveryBlocksConnects() {
   }
 }
 
+static void testDiscoveryStaleEpochWhilePending() {
+  Rig r;                                               // a late report of the finished scan
+  discover(r, 0x01);
+  const uint16_t e = r.core->scan().epoch();
+  r.core->stopDiscovery();
+  expectDone(0, FinishReason::MANUAL, 0, 1);
+  r.port.discOn = true;                                // keeps the next one pending
+  assert(r.core->startDiscovery(0x01, 15000, r.now));
+  r.update();
+  assert(r.core->scan().owner() == ScanOwner::DISCOVERY_PENDING && r.core->scan().epoch() == e);
+  discReport(r, kMac, Ad().uuids({0x180D}).name("HRM"), 0, e);
+  assert(r.core->discoveredCount() == 0);
+  r.port.discOn = false;
+  r.update();
+  assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.core->scan().epoch() == e + 1);
+  discEnd(r);
+  r.update();
+  expectDone(1, FinishReason::NATURAL, 0, 2);         // never entered discBuf
+}
+
 static void testDiscoveryFromCallback() {
   Rig r;                                               // DONE callback starts the next one
   r.core->setEventCallback(onEventHook);
@@ -4314,6 +4334,7 @@ int main() {
   testDiscoveryResync();
   testDiscoveryStartFailed();
   testDiscoveryBlocksConnects();
+  testDiscoveryStaleEpochWhilePending();
   testDiscoveryFromCallback();
   testDiscoveryConcurrentReports();
   return 0;
