@@ -43,7 +43,7 @@ class BlePort {
 
   // Local GATT server (§5.4). serverStart() creates the server, the local
   // measurement characteristics of the typeBit()s in typeMask and their
-  // callbacks; true if already done.
+  // callbacks once, then starts the GATT server; true if already started.
   virtual bool serverStart(uint8_t typeMask) = 0;
   // Replaces the advertising data with name + the service UUIDs of typeMask.
   // Takes effect at the next advStart(). False if a field did not fit.

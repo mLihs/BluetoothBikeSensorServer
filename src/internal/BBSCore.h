@@ -68,6 +68,15 @@ inline void sanitizeNamePrefix(const char* in, char (&out)[kNamePrefixMax + 1]) 
   out[n] = '\0';
 }
 
+// §5.4 budget: flags 3 + name (2 + len) + 16-bit UUID list (2 + 2n) ≤ 31.
+// Checked before NimBLE: it would move UUIDs that do not fit into the
+// (disabled) scan response and still report success.
+inline bool advertisingFits(size_t nameLen, uint8_t typeMask) {
+  size_t uuids = 0;
+  for (uint8_t bits = typeMask; bits != 0; bits &= static_cast<uint8_t>(bits - 1)) ++uuids;
+  return 3 + 2 + nameLen + (uuids > 0 ? 2 + 2 * uuids : 0) <= 31;
+}
+
 constexpr uint32_t kConnectWatchdogMs = BBS_CONNECT_TIMEOUT_MS + 2000;
 constexpr uint32_t kTransientRetryMs = 500;
 constexpr uint32_t kBackoffMinMs = 1000;
@@ -202,21 +211,29 @@ class Core {
 
   // §4 startServer(), device part: local services and advertising data for
   // the enabled types. Advertising follows the desired state from the next
-  // update() on.
+  // update() on. False if the name and UUIDs do not fit (nothing is created
+  // then), or the server or the advertising data cannot be set up.
   bool startServer() {
+    char name[kServerNameSize];
+    serverName(name, sizeof(name));
+    if (!advertisingFits(strlen(name), localTypes())) return false;
     if (!port_.serverStart(localTypes())) return false;
-    setAdvertisingData();
+    if (!port_.advSetData(name, localTypes())) return false;
     serverStarted_ = true;
     return true;
   }
 
   // §5.4: rebuilds the advertising data (name + UUIDs) and restarts
   // advertising if the desired state allows it. False if the server is not
-  // started, a field did not fit, or the restart failed.
+  // started, the data does not fit (previous data and advertising stay
+  // untouched), NimBLE refused a field, or the restart failed.
   bool refreshAdvertising() {
     if (!serverStarted_) return false;
+    char name[kServerNameSize];
+    serverName(name, sizeof(name));
+    if (!advertisingFits(strlen(name), localTypes())) return false;
     if (port_.advActive()) port_.advStop();
-    const bool dataOk = setAdvertisingData();
+    const bool dataOk = port_.advSetData(name, localTypes());
     const bool started = !advertisingDesired() || port_.advStart();
     return dataOk && started;
   }
@@ -555,7 +572,7 @@ class Core {
   // (§10 step 8).
   void onNotify(uint8_t i, const Event& ev, uint32_t now) {
     SensorSlot& s = slots_[i];
-    if (s.type == SensorType::POWER) return;
+    if (s.type == SensorType::POWER) return;  // step 8: count notifies++ above this
     stats_.notifies++;
     if (ev.reason > ev.notify.len) {
       stats_.notifiesTruncated++;
@@ -632,12 +649,6 @@ class Core {
   // Enabled types with a local service; the local CPS is §10 step 8.
   uint8_t localTypes() const {
     return enabled_ & (typeBit(SensorType::HEART_RATE) | typeBit(SensorType::SPEED_CADENCE));
-  }
-
-  bool setAdvertisingData() {
-    char name[kServerNameSize];
-    serverName(name, sizeof(name));
-    return port_.advSetData(name, localTypes());
   }
 
   void enforceAdvertising() {

@@ -115,27 +115,30 @@ class NimBLEPort final : public BlePort {
   // BBS_NOTIFY_MAX_LEN, so setValue() in relay() never reallocates
   // (NimBLEAttValue grows only past its capacity).
   bool serverStart(uint8_t typeMask) override {
-    if (server_ != nullptr) return true;
-    NimBLEServer* server = NimBLEDevice::createServer();
-    if (server == nullptr) return false;
-    server->setCallbacks(&serverCb_, false);
-    server->advertiseOnDisconnect(false);
-    static const uint8_t kZeros[BBS_NOTIFY_MAX_LEN] = {};
-    const SensorType types[] = {SensorType::HEART_RATE, SensorType::SPEED_CADENCE};
-    for (SensorType type : types) {
-      const int slot = slotIndex(type);
-      if (slot < 0 || (typeMask & typeBit(type)) == 0) continue;
-      NimBLEService* service = server->createService(NimBLEUUID(serviceUuid(type)));
-      NimBLECharacteristic* chr = service->createCharacteristic(
-          NimBLEUUID(measurementUuid(type)), NIMBLE_PROPERTY::NOTIFY);
-      chr->setValue(kZeros, sizeof(kZeros));
-      chrCb_[slot].slot = static_cast<uint8_t>(slot);
-      chr->setCallbacks(&chrCb_[slot]);
-      service->start();
-      localChr_[slot] = chr;
+    if (server_ == nullptr) {
+      NimBLEServer* server = NimBLEDevice::createServer();
+      if (server == nullptr) return false;
+      server->setCallbacks(&serverCb_, false);
+      server->advertiseOnDisconnect(false);
+      static const uint8_t kZeros[BBS_NOTIFY_MAX_LEN] = {};
+      const SensorType types[] = {SensorType::HEART_RATE, SensorType::SPEED_CADENCE};
+      for (SensorType type : types) {
+        const int slot = slotIndex(type);
+        if (slot < 0 || (typeMask & typeBit(type)) == 0) continue;
+        NimBLEService* service = server->createService(NimBLEUUID(serviceUuid(type)));
+        NimBLECharacteristic* chr = service->createCharacteristic(
+            NimBLEUUID(measurementUuid(type)), NIMBLE_PROPERTY::NOTIFY);
+        chr->setValue(kZeros, sizeof(kZeros));
+        chrCb_[slot].slot = static_cast<uint8_t>(slot);
+        chr->setCallbacks(&chrCb_[slot]);
+        service->start();
+        localChr_[slot] = chr;
+      }
+      server_ = server;
     }
-    server_ = server;
-    return true;
+    // Must run before the first scan or connect: ble_gatts_start() fails with
+    // BLE_HS_EBUSY while any advertising, scan or connection exists.
+    return server_->start();
   }
 
   // Edits NimBLE's own advertising data (no HCI); start() applies it, also

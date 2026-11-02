@@ -3107,10 +3107,209 @@ static void testServerTypes() {
   r.port.serverOk = false;
   assert(!r.core->startServer() && r.port.advDataSets == 0);
   r.port.serverOk = true;
-  r.port.advDataOk = false;                            // name did not fit: still started
-  assert(r.core->startServer() && r.port.advDataSets == 1);
+  r.port.advDataOk = false;                            // NimBLE refused a field
+  assert(!r.core->startServer() && r.port.advDataSets == 1);
+  r.update();
+  assert(!r.port.advOn && r.port.advStarts == 0);
+  assert(!r.core->refreshAdvertising());               // not started
+  r.port.advDataOk = true;
+  assert(r.core->startServer() && r.port.serverStarts == 3);
   r.update();
   assert(r.port.advOn);
+}
+
+// §5.4 rev 27 budget: flags 3 + name (2 + prefix + 9) + UUIDs (2 + 2n) ≤ 31.
+static void testAdvertisingBudget() {
+  struct Case { uint8_t mask; const char* fits; const char* tooLong; };
+  const Case cases[] = {
+      {0x03, "abcdefghijk", "abcdefghijkl"},                 // HR + CSC: 11 / 12
+      {0x01, "abcdefghijklm", "abcdefghijklmn"},             // one UUID: 13 / 14
+      {0x00, "abcdefghijklmnopq", "abcdefghijklmnopqr"},     // no UUID: 17 / 18
+  };
+  for (const Case& c : cases) {
+    Rig ok(Mode::MAC, c.mask);
+    ok.core->setNamePrefix(c.fits);
+    assert(ok.core->startServer() && ok.port.advDataSets == 1);
+
+    Rig bad(Mode::MAC, c.mask);                        // nothing created, no port call
+    bad.core->setNamePrefix(c.tooLong);
+    assert(!bad.core->startServer());
+    assert(bad.port.serverStarts == 0 && bad.port.advDataSets == 0);
+    bad.update();
+    assert(bad.port.advStarts == 0);
+  }
+
+  Rig r;                                               // refresh keeps the old data on air
+  assert(r.core->startServer());
+  r.update();
+  assert(r.port.advOn && r.port.advStarts == 1);
+  r.core->setNamePrefix("abcdefghijkl");
+  assert(!r.core->refreshAdvertising());
+  assert(r.port.advOn && r.port.advStops == 0 && r.port.advStarts == 1);
+  assert(r.port.advDataSets == 1 && strcmp(r.port.advName, "homewind-da4eb580") == 0);
+  r.port.advOn = false;                                // not advertising: stays off
+  assert(!r.core->refreshAdvertising());
+  assert(!r.port.advOn && r.port.advStarts == 1 && r.port.advDataSets == 1);
+  r.update();                                          // enforcement restarts the old data
+  assert(r.port.advOn && r.port.advStarts == 2 && r.port.advDataSets == 1);
+  r.core->setNamePrefix("abcdefghijk");
+  assert(r.core->refreshAdvertising());
+  assert(r.port.advDataSets == 2 && strcmp(r.port.advName, "abcdefghijk-da4eb580") == 0);
+}
+
+// Data callbacks that remove or replace their own slot.
+static Rig* g_dataRig = nullptr;
+static uint8_t g_dataAction = 0;                       // 1 remove, 2 same-type addByMac
+static void onDataReentrant(uint16_t) {
+  Rig& r = *g_dataRig;
+  if (g_dataAction == 1) {
+    r.remove();
+  } else if (g_dataAction == 2) {
+    r.replace();
+  }
+  g_dataAction = 0;
+}
+static void onCadenceReentrant(uint16_t) {
+  Rig& r = *g_dataRig;
+  if (g_dataAction == 1) {
+    r.core->remove(SensorType::SPEED_CADENCE, r.now);
+  } else if (g_dataAction == 2) {
+    r.port.expect[kCsc] = kOtherMac;
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kOtherMacStr, 1, "CSC2", r.now));
+  }
+  g_dataAction = 0;
+}
+
+static void testDataCallbackReentrancy() {
+  const uint8_t hr[] = {0x00, 72};
+  uint16_t v = 0;
+  uint32_t age = 0;
+  {
+    Rig r;                                             // HR remove()
+    g_dataRig = &r;
+    r.core->setHeartRateCallback(onDataReentrant);
+    r.toSubscribed();
+    g_eventCount = 0;
+    g_dataAction = 1;
+    assert(notifyEv(r, hr, sizeof(hr)));
+    assert(notifyEv(r, hr, sizeof(hr)));               // same drain, still SUBSCRIBED
+    r.update();
+    assert(r.port.disconnects == 1 && r.state() == SlotState::SUBSCRIBED);
+    assert(countEvents(EventType::DATA) == 2 && r.port.relays[kHr] == 2);
+    r.discEv(r.gen(), 0x16);
+    r.update();
+    assert(r.state() == SlotState::EMPTY && !r.core->lastHeartRate(v, age, r.now));
+    assert(!r.core->scanFilterMatch(kMac));
+  }
+  {
+    Rig r;                                             // HR same-type addByMac()
+    g_dataRig = &r;
+    r.core->setHeartRateCallback(onDataReentrant);
+    r.toSubscribed();
+    const uint16_t g = r.gen();
+    g_dataAction = 2;
+    assert(notifyEv(r, hr, sizeof(hr)));
+    r.update();
+    assert(r.port.disconnects == 1 && countEvents(EventType::DATA) == 1);
+    r.discEv(g, 0x16);
+    r.update();
+    assert(r.state() == SlotState::CONNECTING && r.gen() == g + 1);
+    assert(r.port.lastAddrType == 1 && !r.core->lastHeartRate(v, age, r.now));
+  }
+  {
+    Rig r;                                             // cadence remove()
+    g_dataRig = &r;
+    r.core->setCadenceCallback(onCadenceReentrant);
+    cscToSubscribed(r);
+    assert(notifyEv(r, kCscFirst, sizeof(kCscFirst), kCsc));
+    r.update();
+    g_dataAction = 1;
+    assert(notifyEv(r, kCsc60, sizeof(kCsc60), kCsc));
+    r.update();
+    assert(r.port.slotDisconnects[kCsc] == 1 && r.cscState() == SlotState::SUBSCRIBED);
+    r.discEv(r.cscGen(), 0x16, kCsc);
+    r.update();
+    assert(r.cscState() == SlotState::EMPTY && !r.core->lastCadence(v, age, r.now));
+    assert(!r.csc().crank.crankValid);
+  }
+  {
+    Rig r;                                             // cadence same-type addByMac()
+    g_dataRig = &r;
+    r.core->setCadenceCallback(onCadenceReentrant);
+    cscToSubscribed(r);
+    assert(notifyEv(r, kCscFirst, sizeof(kCscFirst), kCsc));
+    r.update();
+    const uint16_t g = r.cscGen();
+    g_dataAction = 2;
+    assert(notifyEv(r, kCsc60, sizeof(kCsc60), kCsc));
+    r.update();
+    assert(r.port.slotDisconnects[kCsc] == 1);
+    r.discEv(g, 0x16, kCsc);
+    r.update();
+    assert(r.cscState() == SlotState::CONNECTING && r.cscGen() == g + 1);
+    assert(r.port.lastConnectSlot == kCsc && r.port.lastAddrType == 1);
+    assert(!r.core->lastCadence(v, age, r.now) && !r.csc().crank.crankValid);
+  }
+}
+
+// Event callback calling refreshAdvertising() inside CENTRAL_CONNECTED / HOST_RESET.
+static void testRefreshFromEventCallback() {
+  const EventType types[] = {EventType::CENTRAL_CONNECTED, EventType::HOST_RESET};
+  for (EventType type : types) {
+    Rig r;
+    r.core->setEventCallback(onEventHook);
+    assert(r.core->startServer());
+    r.update();
+    r.port.advOn = false;
+    r.core->setNamePrefix("trainer");
+    bool refreshed = false;
+    g_hook = [&r, &refreshed, type](const EventInfo& info) {
+      if (info.type != type) return;
+      refreshed = r.core->refreshAdvertising();
+    };
+    if (type == EventType::HOST_RESET) {
+      assert(bs::pushHostReset(r.core->queue()));
+    } else {
+      assert(bs::pushCentralConnect(r.core->queue()));
+    }
+    r.update();
+    g_hook = nullptr;
+    assert(refreshed && r.port.advOn && strcmp(r.port.advName, "trainer-da4eb580") == 0);
+    assert(r.port.advDataSets == 2 && r.core->stats().advertisingEnforced == 0);
+    // HOST_RESET re-applies before the event, so the refresh stops it once.
+    assert(r.port.advStops == (type == EventType::HOST_RESET ? 1 : 0));
+    assert(r.port.advStarts == 3 - (type == EventType::HOST_RESET ? 0 : 1));
+    r.update();
+    assert(r.port.advOn && r.port.advDataSets == 2);
+  }
+}
+
+// CONNECT_FAIL with link loss in SUBSCRIBED ends the link like DISCONNECTED.
+static void testLinkLossClearsMeasurement() {
+  const uint8_t hr[] = {0x00, 72};
+  uint16_t v = 0;
+  uint32_t age = 0;
+  Rig r;
+  r.toSubscribed();
+  assert(notifyEv(r, hr, sizeof(hr)));
+  r.update();
+  assert(r.core->lastHeartRate(v, age, r.now));
+  r.port.connected = false;
+  r.failEv(r.gen(), 0x3E);
+  r.update();
+  assert(r.state() != SlotState::SUBSCRIBED && !r.core->lastHeartRate(v, age, r.now));
+
+  Rig s;
+  cscToSubscribed(s);
+  assert(notifyEv(s, kCscFirst, sizeof(kCscFirst), kCsc));
+  assert(notifyEv(s, kCsc60, sizeof(kCsc60), kCsc));
+  s.update();
+  assert(s.csc().crank.crankValid && s.core->lastCadence(v, age, s.now));
+  s.port.linkUp[kCsc] = false;
+  s.failEv(s.cscGen(), 0x3E, kCsc);
+  s.update();
+  assert(s.cscState() != SlotState::SUBSCRIBED && !s.csc().crank.crankValid);
+  assert(s.csc().crank.prevCrankRev == 0 && !s.core->lastCadence(v, age, s.now));
 }
 
 // 2.x BBSIdentity::SetDeviceNamePrefix + GetBleDeviceNameLower, String ops
@@ -3285,7 +3484,11 @@ int main() {
   testHeartRateGetter();
   testCadenceGetter();
   testServerTypes();
+  testAdvertisingBudget();
   testServerName();
   testRefreshAdvertising();
+  testDataCallbackReentrancy();
+  testRefreshFromEventCallback();
+  testLinkLossClearsMeasurement();
   return 0;
 }
