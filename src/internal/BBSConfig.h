@@ -60,6 +60,7 @@
 #define BBS_COMPILED_SENSOR_COUNT (BBS_COMPILE_HEART_RATE + BBS_COMPILE_CSC + BBS_COMPILE_POWER)
 #endif
 static_assert(BBS_COMPILED_SENSOR_COUNT >= 1 && BBS_COMPILED_SENSOR_COUNT <= 3, "");
+static_assert(BBS_MAX_DISCOVERED >= 1 && BBS_MAX_DISCOVERED <= 255, "discoveredCount() is uint8_t");
 static_assert(BBS_NOTIFY_MAX_LEN >= 20 && BBS_NOTIFY_MAX_LEN <= 38, "Event must stay <= 48 B");
 #if BBS_SENSOR_SECURITY && !BBS_COMPILE_POWER
 #error "BBS_SENSOR_SECURITY is only used for Power sensors"

@@ -1,17 +1,22 @@
 #include "BBSCore.h"
 #include "BBSEventPush.h"
 
+#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <string>
+#include <thread>
 
+using BikeSensor::DiscoveredSensor;
 using BikeSensor::EventInfo;
 using BikeSensor::EventType;
+using BikeSensor::FinishReason;
 using BikeSensor::Mode;
 using BikeSensor::SensorType;
 using BikeSensor::SlotState;
@@ -59,6 +64,8 @@ struct FakePort final : BlePort {
   int relays[bs::kSlotCount] = {};
   uint8_t relayData[BBS_NOTIFY_MAX_LEN] = {};
   uint8_t relayLen = 0xFF;
+  const Core* core = nullptr;                          // set by Rig
+  uint16_t activeAtStart = 0;                          // activeDiscEpoch() seen by discStart()
 
   FakePort() {
     expect[kHr] = kMac;
@@ -71,6 +78,7 @@ struct FakePort final : BlePort {
   int discStart(uint16_t epoch, uint32_t durationMs) override {
     discStarts++;
     lastEpoch = epoch;
+    if (core != nullptr) activeAtStart = core->scan().activeDiscEpoch();
     lastDurationMs = durationMs;
     if (discOn) return bs::kHsEAlready;
     if (discStartRc == 0) discOn = true;
@@ -86,6 +94,7 @@ struct FakePort final : BlePort {
     slotConnects[slot]++;
     assert(memcmp(mac, expect[slot], 6) == 0);
     assert(!discOn && !connOn);       // §5.2 connect invariant
+    assert(core == nullptr || !core->scan().discoveryOwner());   // §5.2: none while pending/open
     lastAddrType = addrType;
     lastConnectSlot = slot;
     if (connectOk) connOn = true;
@@ -146,16 +155,20 @@ struct Recorded {
   int reason;
   SlotState state;                                     // its slot's state when the callback ran
   uint8_t count;
+  uint32_t generation;
+  bool discovering;                                    // discovering() when the callback ran
+  uint8_t tableCount;                                  // discoveredCount() when the callback ran
 };
 static Recorded g_events[32];
 static int g_eventCount = 0;
-static const Core* g_core = nullptr;
+static Core* g_core = nullptr;
 
 static void onEvent(const EventInfo& info) {
   assert(g_eventCount < 32);
-  const int slot = bs::slotIndex(info.sensorType);     // HOST_RESET, CENTRAL_*: HR slot
+  const int slot = bs::slotIndex(info.sensorType);     // HOST_RESET, CENTRAL_*, DISCOVERY_DONE: HR slot
   const SlotState state = g_core->slot(slot >= 0 ? static_cast<uint8_t>(slot) : kHr).state;
-  g_events[g_eventCount++] = {info.type, info.sensorType, info.reason, state, info.count};
+  g_events[g_eventCount++] = {info.type, info.sensorType, info.reason, state, info.count,
+                              info.generation, g_core->discovering(), g_core->discoveredCount()};
 }
 
 static int countEvents(EventType type) {
@@ -180,6 +193,7 @@ struct Rig {
       : core(new Core(port, mode, typeMask)) {
     core->setEventCallback(onEvent);
     g_core = core.get();
+    port.core = core.get();
     g_eventCount = 0;
   }
 
@@ -3578,6 +3592,636 @@ static void testRefreshAdvertising() {
   assert(r.port.advOn && r.port.advStarts == 7 && r.port.advStops == 2);
 }
 
+// ---- Discovery (§3.3, §5.3) ----
+
+static_assert(BBS_MAX_DISCOVERED >= 5, "the discovery tests store up to 5 sensors");
+
+struct Ad {                                            // one ADV or SCAN_RSP payload
+  uint8_t data[64] = {};
+  size_t len = 0;
+  Ad& uuids(std::initializer_list<uint16_t> list) {
+    data[len++] = static_cast<uint8_t>(1 + 2 * list.size());
+    data[len++] = 0x03;
+    for (uint16_t u : list) {
+      data[len++] = static_cast<uint8_t>(u & 0xFF);
+      data[len++] = static_cast<uint8_t>(u >> 8);
+    }
+    return *this;
+  }
+  Ad& name(const char* n, bool complete = true) {
+    const size_t l = strlen(n);
+    data[len++] = static_cast<uint8_t>(1 + l);
+    data[len++] = complete ? 0x09 : 0x08;
+    memcpy(data + len, n, l);
+    len += l;
+    return *this;
+  }
+  Ad& bytes(std::initializer_list<uint8_t> list) {
+    for (uint8_t b : list) data[len++] = b;
+    return *this;
+  }
+};
+
+// What gapScanCb does with one report; epoch 0 = the running discovery's.
+static void discReport(Rig& r, const uint8_t* mac, const Ad& ad, uint8_t addrType = 0,
+                       uint16_t epoch = 0) {
+  bs::AdFields fields;
+  bs::parseAd(ad.data, ad.len, fields);
+  r.core->discoveryReport(epoch != 0 ? epoch : r.core->scan().activeDiscEpoch(), mac, addrType,
+                          fields);
+}
+
+static void discover(Rig& r, uint8_t mask = 0x07, uint32_t ms = 15000) {
+  assert(r.core->startDiscovery(mask, ms, r.now));
+  r.update();
+  assert(r.core->scan().owner() == ScanOwner::DISCOVERY);
+}
+
+static void discEnd(Rig& r) {
+  r.port.discOn = false;
+  assert(bs::pushScanEnd(r.core->queue(), r.core->scan().epoch(), 0));
+}
+
+// DISCOVERY_DONE runs after the state change: closed, table already replaced.
+static void expectDone(int i, FinishReason reason, uint8_t count, uint32_t generation) {
+  assert(i < g_eventCount);
+  const Recorded& e = g_events[i];
+  assert(e.type == EventType::DISCOVERY_DONE && e.sensorType == SensorType{});
+  assert(e.reason == static_cast<int>(reason) && e.count == count);
+  assert(e.generation == generation && !e.discovering && e.tableCount == count);
+}
+
+static void testDiscoveryNatural() {
+  Rig r;
+  DiscoveredSensor d;
+  assert(!r.core->discovering() && r.core->discoveredCount() == 0 && !r.core->discovered(0, d));
+  r.core->stopDiscovery();                             // nothing open: no event
+  assert(r.core->startDiscovery(0x03, 15000, r.now));
+  assert(r.core->discovering() && r.core->scan().owner() == ScanOwner::DISCOVERY_PENDING);
+  assert(r.core->scan().activeDiscEpoch() == 0 && r.port.discStarts == 0);
+  assert(!r.core->startDiscovery(0x03, 15000, r.now));   // pending
+  r.update();
+  assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.port.discStarts == 1);
+  assert(r.port.lastDurationMs == 15000 && r.core->stats().scansStarted == 1);
+  const uint16_t e = r.core->scan().epoch();
+  assert(e != 0 && r.core->scan().activeDiscEpoch() == e);
+  assert(r.port.activeAtStart == e);                   // published before ble_gap_disc()
+  assert(!r.core->startDiscovery(0x03, 15000, r.now));   // open
+  assert(g_eventCount == 0);
+
+  discReport(r, kMac, Ad().uuids({0x180D}), 1);        // ADV: type only
+  discReport(r, kMac, Ad().name("Polar H10"), 0);      // SCAN_RSP: name merged, addrType kept
+  discReport(r, kOtherMac, Ad().uuids({0x1816}).name("CSC", false));
+  discReport(r, kOtherMac, Ad().name("Cadence"));      // complete replaces shortened
+  discReport(r, kOtherMac, Ad().name("Cad", false));   // never the reverse
+  discReport(r, kOtherMac, Ad().name("Other"));        // the first complete name stays
+  discReport(r, kCscMac, Ad().name("Phone"));          // no type: not stored
+  discReport(r, kCscMac, Ad().uuids({0x180F}));        // battery only: not stored
+  discReport(r, kCscMac, Ad().uuids({0x180D}), 0, static_cast<uint16_t>(e + 1));   // other epoch
+  assert(r.core->discoveredCount() == 0);              // the table changes on DISCOVERY_DONE
+  r.update();
+  assert(r.core->discovering() && g_eventCount == 0);
+
+  discEnd(r);
+  r.update();
+  assert(r.core->scan().owner() == ScanOwner::OFF && r.core->scan().activeDiscEpoch() == 0);
+  assert(g_eventCount == 1);
+  expectDone(0, FinishReason::NATURAL, 2, 1);
+  assert(r.core->discovered(0, d));                    // sorted by name
+  assert(strcmp(d.name, "Cadence") == 0 && memcmp(d.mac, kOtherMac, 6) == 0);
+  assert(d.typeMask == 0x02 && d.addrType == 0);
+  assert(r.core->discovered(1, d));
+  assert(strcmp(d.name, "Polar H10") == 0 && memcmp(d.mac, kMac, 6) == 0);
+  assert(d.typeMask == 0x01 && d.addrType == 1);
+  assert(!r.core->discovered(2, d) && !r.core->discovered(255, d));
+
+  assert(bs::pushScanEnd(r.core->queue(), e, 0));      // late SCAN_END: finished once
+  r.update();
+  r.core->stopDiscovery();
+  assert(g_eventCount == 1 && r.core->discoveredCount() == 2);
+  assert(r.port.discStarts == 1 && r.port.discCancels == 0);
+}
+
+static void testDiscoveryFields() {
+  const uint8_t a[6] = {0x10, 0, 0, 0, 0, 1}, b[6] = {0x10, 0, 0, 0, 0, 2},
+                c[6] = {0x10, 0, 0, 0, 0, 3}, d4[6] = {0x10, 0, 0, 0, 0, 4},
+                e5[6] = {0x10, 0, 0, 0, 0, 5}, f[6] = {0x10, 0, 0, 0, 0, 6},
+                g[6] = {0x10, 0, 0, 0, 0, 7};
+  const char long40[] = "0123456789012345678901234567890123456789";
+  {
+    Rig r;
+    discover(r, 0x03);
+    discReport(r, a, Ad().uuids({0x1816, 0x1818}).name("Meter"));   // CSC + CPS: only CSC
+    discReport(r, b, Ad().uuids({0x1818}).name("PowerOnly"));       // not requested
+    discReport(r, c, Ad().name("Sh", false).uuids({0x180D}).name("Complete HR"));
+    discReport(r, d4, Ad().uuids({0x180D}).name("Partial").bytes({0x05, 0xFF, 0x01}));  // cut TLV
+    discReport(r, e5, Ad().bytes({0x02, 0x03, 0x0D}).name("Odd"));   // odd UUID list first
+    discReport(r, f, Ad().uuids({0x180D}).bytes({0x00}).name("AfterPad"));
+    discReport(r, g, Ad().uuids({0x1816}).bytes({0x01, 0x09}));      // empty name: none
+    discReport(r, g, Ad().name(long40));
+    r.core->stopDiscovery();
+    expectDone(0, FinishReason::MANUAL, 5, 1);
+    DiscoveredSensor s;
+    assert(r.core->discovered(0, s) && memcmp(s.mac, g, 6) == 0);
+    assert(strlen(s.name) == 31 && strncmp(s.name, long40, 31) == 0 && s.typeMask == 0x02);
+    assert(r.core->discovered(1, s) && memcmp(s.mac, c, 6) == 0);
+    assert(strcmp(s.name, "Complete HR") == 0 && s.typeMask == 0x01);
+    assert(r.core->discovered(2, s) && memcmp(s.mac, a, 6) == 0);
+    assert(strcmp(s.name, "Meter") == 0 && s.typeMask == 0x02);
+    assert(r.core->discovered(3, s) && memcmp(s.mac, d4, 6) == 0);
+    assert(strcmp(s.name, "Partial") == 0 && s.typeMask == 0x01);
+    assert(r.core->discovered(4, s) && memcmp(s.mac, f, 6) == 0);
+    assert(s.name[0] == '\0' && s.typeMask == 0x01);   // unnamed last
+  }
+  {
+    Rig r;                                             // Power requested: only if compiled
+    discover(r, 0x07);
+    discReport(r, b, Ad().uuids({0x1818}).name("PowerOnly"));
+    discReport(r, a, Ad().uuids({0x1816, 0x1818}).name("Meter"));
+    r.core->stopDiscovery();
+    DiscoveredSensor s;
+#if BBS_COMPILE_POWER
+    expectDone(0, FinishReason::MANUAL, 2, 1);
+    assert(r.core->discovered(0, s) && strcmp(s.name, "Meter") == 0 && s.typeMask == 0x06);
+    assert(r.core->discovered(1, s) && strcmp(s.name, "PowerOnly") == 0 && s.typeMask == 0x04);
+#else
+    expectDone(0, FinishReason::MANUAL, 1, 1);
+    assert(r.core->discovered(0, s) && strcmp(s.name, "Meter") == 0 && s.typeMask == 0x02);
+#endif
+  }
+  {
+    Rig r;                                             // HR requested: CSC types dropped
+    discover(r, 0x01);
+    discReport(r, a, Ad().uuids({0x1816}).name("CscOnly"));
+    discReport(r, b, Ad().uuids({0x180D, 0x1816}).name("Sh", false));
+    discReport(r, b, Ad().bytes({0x01, 0x09}));        // an empty complete name keeps "Sh"
+    r.core->stopDiscovery();
+    expectDone(0, FinishReason::MANUAL, 1, 1);
+    DiscoveredSensor s;
+    assert(r.core->discovered(0, s) && memcmp(s.mac, b, 6) == 0);
+    assert(strcmp(s.name, "Sh") == 0 && s.typeMask == 0x01);
+  }
+  {
+    Rig r;                                             // full buffer: new addresses dropped
+    discover(r, 0x01);
+    uint8_t mac[6] = {0x20, 0, 0, 0, 0, 0};
+    for (uint16_t i = 0; i <= BBS_MAX_DISCOVERED; ++i) {
+      mac[4] = static_cast<uint8_t>(i >> 8);
+      mac[5] = static_cast<uint8_t>(i);
+      discReport(r, mac, Ad().uuids({0x180D}));
+    }
+    mac[4] = 0;
+    mac[5] = 0;
+    discReport(r, mac, Ad().name("First"));            // a stored address still merges
+    discReport(r, a, Ad().uuids({0x1816}).name("Csc"));   // not requested
+    r.core->stopDiscovery();
+    expectDone(0, FinishReason::MANUAL, BBS_MAX_DISCOVERED, 1);
+    DiscoveredSensor s;
+    assert(r.core->discovered(0, s) && strcmp(s.name, "First") == 0);
+    assert(s.mac[4] == 0 && s.mac[5] == 0);
+    for (uint8_t i = 1; i < BBS_MAX_DISCOVERED; ++i) {
+      assert(r.core->discovered(i, s) && s.name[0] == '\0');
+      assert(s.mac[5] == i && s.mac[4] == 0);          // unnamed keep arrival order
+    }
+  }
+  {
+    Rig r;                                             // named by strcmp, stable; unnamed last
+    discover(r, 0x01);
+    discReport(r, a, Ad().uuids({0x180D}));
+    discReport(r, b, Ad().uuids({0x180D}).name("b"));
+    discReport(r, c, Ad().uuids({0x180D}));
+    discReport(r, d4, Ad().uuids({0x180D}).name("A"));
+    discReport(r, e5, Ad().uuids({0x180D}).name("b"));
+    discReport(r, f, Ad().uuids({0x180D}));
+    r.core->stopDiscovery();
+    expectDone(0, FinishReason::MANUAL, 6, 1);
+    const uint8_t* order[6] = {d4, b, e5, a, c, f};
+    const char* names[6] = {"A", "b", "b", "", "", ""};
+    DiscoveredSensor s;
+    for (uint8_t i = 0; i < 6; ++i) {
+      assert(r.core->discovered(i, s) && memcmp(s.mac, order[i], 6) == 0);
+      assert(strcmp(s.name, names[i]) == 0);
+    }
+  }
+}
+
+static void testDiscoveryDuration() {
+  Rig r;
+  const uint32_t limit = bs::kDiscoveryDurationLimitMs;
+  static_assert(bs::kDiscoveryDurationLimitMs == INT32_MAX - BBS_SCAN_END_GRACE_MS, "");
+  assert(!r.core->startDiscovery(0x01, 0, r.now));     // NimBLE would scan 10.24 s
+  assert(!r.core->startDiscovery(0x01, limit, r.now));
+  assert(!r.core->startDiscovery(0x01, UINT32_MAX, r.now));
+  r.update();
+  assert(!r.core->discovering() && r.core->scan().owner() == ScanOwner::OFF);
+  assert(r.port.discStarts == 0 && r.port.discCancels == 0 && g_eventCount == 0);
+  assert(r.core->startDiscovery(0x01, limit - 1, r.now));
+  r.update();
+  assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.port.lastDurationMs == limit - 1);
+  const uint32_t start = r.now;
+  r.at(start + (limit - 1) + BBS_SCAN_END_GRACE_MS - 1);
+  assert(r.core->scan().owner() == ScanOwner::DISCOVERY);
+  r.at(start + (limit - 1) + BBS_SCAN_END_GRACE_MS);
+  expectDone(0, FinishReason::TIMEOUT, 0, 1);          // rejected calls did not bump discGen
+}
+
+static void testDiscoveryCancelsWindows() {
+  {
+    Rig r;                                             // MAC: the SLEEP window is cancelled
+    r.add();
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW);
+    const uint16_t e1 = r.core->scan().epoch();
+    const uint32_t windowStart = r.now;
+    assert(bs::pushScanEnd(r.core->queue(), e1, 0));  // queued before the cancel
+    r.match(e1);
+    r.now += 100;
+    assert(r.core->startDiscovery(0x01, 15000, r.now));
+    assert(r.port.discCancels == 1 && !r.port.discOn);
+    r.update();                                        // the stale SCAN_END/SCAN_MATCH change nothing
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.core->scan().epoch() == e1 + 1);
+    assert(r.state() == SlotState::WAIT_SCAN && countEvents(EventType::SENSOR_FOUND) == 0);
+    r.match(r.core->scan().epoch());                   // discovery epoch: no SCAN_MATCH use
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && countEvents(EventType::SENSOR_FOUND) == 0);
+    discEnd(r);
+    r.update();
+    assert(countEvents(EventType::DISCOVERY_DONE) == 1);
+    assert(r.core->scan().owner() == ScanOwner::OFF);  // the sleep schedule still applies
+    r.at(windowStart + BBS_SLEEP_SCAN_DURATION_MS + BBS_SLEEP_SCAN_INTERVAL_MS - 1);
+    assert(r.port.discStarts == 2);
+    r.at(windowStart + BBS_SLEEP_SCAN_DURATION_MS + BBS_SLEEP_SCAN_INTERVAL_MS);
+    assert(r.port.discStarts == 3 && r.core->scan().owner() == ScanOwner::SLEEP_WINDOW);
+  }
+  {
+    Rig r(Mode::NAME);                                 // NAME: windows resume after the discovery
+    assert(r.core->addByName(SensorType::HEART_RATE, "HRM", r.now));
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::NAME_SCAN);
+    assert(r.core->startDiscovery(0x01, 15000, r.now));
+    assert(r.port.discCancels == 1);
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.port.discStarts == 2);
+    assert(r.report(kMac, "HRM"));                     // SCAN_MATCH with the discovery epoch
+    r.update();
+    assert(r.state() == SlotState::IDLE && countEvents(EventType::SENSOR_FOUND) == 0);
+    discEnd(r);
+    r.update();
+    assert(countEvents(EventType::DISCOVERY_DONE) == 1);
+    assert(r.core->scan().owner() == ScanOwner::NAME_SCAN && r.port.discStarts == 3);
+  }
+}
+
+static void testDiscoveryStop() {
+  {
+    Rig r;                                             // pending: no scan to cancel
+    r.toConnecting();
+    assert(r.core->startDiscovery(0x07, 15000, r.now));
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY_PENDING && r.port.discStarts == 1);
+    const int cancels = r.port.discCancels;
+    r.core->stopDiscovery();
+    assert(r.core->scan().owner() == ScanOwner::OFF && r.port.discCancels == cancels);
+    assert(countEvents(EventType::DISCOVERY_DONE) == 1);
+    expectDone(g_eventCount - 1, FinishReason::MANUAL, 0, 1);
+    r.core->stopDiscovery();                           // once
+    r.connectedEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::SUBSCRIBED && r.port.discStarts == 1);
+    assert(countEvents(EventType::DISCOVERY_DONE) == 1);
+  }
+  {
+    Rig r;                                             // running: cancelled, matches kept
+    discover(r);
+    const uint16_t e = r.core->scan().epoch();
+    discReport(r, kMac, Ad().uuids({0x180D}).name("HRM"));
+    r.core->stopDiscovery();
+    assert(r.port.discCancels == 1 && !r.port.discOn);
+    assert(r.core->scan().owner() == ScanOwner::OFF && r.core->scan().activeDiscEpoch() == 0);
+    expectDone(0, FinishReason::MANUAL, 1, 1);
+    assert(bs::pushScanEnd(r.core->queue(), e, 0));
+    r.update();
+    assert(g_eventCount == 1);
+  }
+}
+
+static void testDiscoveryTimeout() {
+  Rig r;
+  discover(r, 0x01, 5000);
+  const uint32_t start = r.now;
+  const uint16_t e = r.core->scan().epoch();
+  discReport(r, kMac, Ad().uuids({0x180D}).name("HRM"));
+  r.at(start + 5000 + BBS_SCAN_END_GRACE_MS - 1);
+  assert(r.core->scan().owner() == ScanOwner::DISCOVERY && g_eventCount == 0);
+  r.at(start + 5000 + BBS_SCAN_END_GRACE_MS);          // scan still active: cancelled
+  assert(r.port.discCancels == 1 && !r.port.discOn && r.core->stats().discoveryTimeouts == 1);
+  assert(r.core->scan().owner() == ScanOwner::OFF);
+  expectDone(0, FinishReason::TIMEOUT, 1, 1);
+  assert(bs::pushScanEnd(r.core->queue(), e, 0));
+  r.update();
+  assert(g_eventCount == 1 && r.core->stats().discoveryTimeouts == 1);
+}
+
+static void testDiscoveryHostReset() {
+  {
+    Rig r;                                             // the reset delivers SCAN_END first
+    discover(r);
+    discReport(r, kMac, Ad().uuids({0x180D}).name("HRM"));
+    assert(bs::pushScanEnd(r.core->queue(), r.core->scan().epoch(), 0));
+    assert(bs::pushHostReset(r.core->queue()));
+    r.port.discOn = false;
+    r.update();
+    assert(g_eventCount == 2);
+    expectDone(0, FinishReason::NATURAL, 1, 1);
+    expectEvent(1, EventType::HOST_RESET, SlotState::EMPTY, 0, SensorType{});
+  }
+  {
+    Rig r;                                             // HOST_RESET alone: matches kept
+    discover(r);
+    discReport(r, kMac, Ad().uuids({0x180D}).name("HRM"));
+    assert(bs::pushHostReset(r.core->queue()));
+    r.port.discOn = false;
+    r.update();
+    assert(g_eventCount == 2 && r.core->stats().hostResets == 1);
+    expectDone(0, FinishReason::HOST_RESET, 1, 1);
+    expectEvent(1, EventType::HOST_RESET, SlotState::EMPTY, 0, SensorType{});
+    assert(r.core->scan().owner() == ScanOwner::OFF && r.core->scan().activeDiscEpoch() == 0);
+  }
+  {
+    Rig r;                                             // pending: DONE after the slot reset
+    r.toConnecting();
+    assert(r.core->startDiscovery(0x07, 15000, r.now));
+    r.update();
+    g_eventCount = 0;
+    r.port.connOn = false;
+    assert(bs::pushHostReset(r.core->queue()));
+    r.update();
+    assert(g_eventCount == 2);
+    expectDone(0, FinishReason::HOST_RESET, 0, 1);
+    assert(g_events[0].state == SlotState::WAIT_SCAN);
+    expectEvent(1, EventType::HOST_RESET, SlotState::WAIT_SCAN, 0, SensorType{});
+  }
+}
+
+static void testDiscoveryResync() {
+  {
+    Rig r;                                             // scan still active: keeps running
+    discover(r);
+    discReport(r, kMac, Ad().uuids({0x180D}).name("HRM"));
+    fillQueueToResync(*r.core);
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY && g_eventCount == 0);
+    r.port.discOn = false;                             // scan gone without SCAN_END
+    fillQueueToResync(*r.core);
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::OFF);
+    expectDone(0, FinishReason::RESYNC, 1, 1);
+  }
+  {
+    Rig r;                                             // pending ends too (no scan is active)
+    r.toConnecting();
+    assert(r.core->startDiscovery(0x07, 15000, r.now));
+    r.update();
+    g_eventCount = 0;
+    fillQueueToResync(*r.core);
+    r.update();
+    assert(g_eventCount == 1 && r.state() == SlotState::CONNECTING);
+    expectDone(0, FinishReason::RESYNC, 0, 1);
+  }
+  {
+    Rig r;                                             // DONE precedes the slot repair's events
+    r.toSubscribed();
+    discover(r);
+    g_eventCount = 0;
+    r.port.connected = false;
+    r.port.discOn = false;
+    fillQueueToResync(*r.core);
+    r.update();
+    assert(g_eventCount == 2);
+    expectDone(0, FinishReason::RESYNC, 0, 1);
+    expectEvent(1, EventType::SENSOR_DISCONNECTED, SlotState::WAIT_SCAN, 0);
+  }
+}
+
+static void testDiscoveryStartFailed() {
+  {
+    Rig r;                                             // ble_gap_disc fails
+    discover(r);
+    discReport(r, kMac, Ad().uuids({0x180D}).name("HRM"));
+    r.core->stopDiscovery();
+    assert(r.core->discoveredCount() == 1);
+    r.port.discStartRc = 2;
+    assert(r.core->startDiscovery(0x07, 15000, r.now));
+    r.update();
+    assert(r.port.discStarts == 2 && r.core->stats().scanStartFails == 1);
+    assert(r.core->scan().owner() == ScanOwner::OFF && r.core->scan().activeDiscEpoch() == 0);
+    expectDone(1, FinishReason::START_FAILED, 0, 2);   // the table is replaced (empty)
+    r.port.discStartRc = 0;                            // the backoff holds the next window
+    r.add();
+    r.at(r.now + BBS_SCAN_START_BACKOFF_MS - 1);
+    assert(r.port.discStarts == 2);
+    r.at(r.now + 1);
+    assert(r.port.discStarts == 3 && r.core->scan().owner() == ScanOwner::SLEEP_WINDOW);
+  }
+  {
+    Rig r;                                             // not synced: retried after the backoff
+    r.port.synced = false;
+    assert(r.core->startDiscovery(0x07, 15000, r.now));
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY_PENDING && r.port.discStarts == 0);
+    r.port.synced = true;
+    r.at(r.now + BBS_SCAN_START_BACKOFF_MS - 1);
+    assert(r.port.discStarts == 0);
+    r.at(r.now + 1);
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.port.discStarts == 1);
+    assert(r.core->stats().scanStartFails == 0 && g_eventCount == 0);
+  }
+  {
+    Rig r;                                             // pending too long behind a connect
+    r.toConnecting();
+    const uint32_t t0 = r.now;
+    assert(r.core->startDiscovery(0x07, 15000, t0));
+    r.at(t0 + bs::kDiscoveryPendingMaxMs - 1);
+    assert(r.state() == SlotState::CANCELLING);       // connect watchdog
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY_PENDING);
+    r.at(t0 + bs::kDiscoveryPendingMaxMs);
+    assert(r.core->scan().owner() == ScanOwner::OFF && r.port.discStarts == 1);
+    assert(r.core->stats().scanStartFails == 0);
+    expectDone(g_eventCount - 1, FinishReason::START_FAILED, 0, 1);
+  }
+  {
+    Rig r;                                             // waits for NimBLE to stop scanning/connecting
+    r.add();
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW && r.port.discStarts == 1);
+    r.port.cancelLeavesDiscOn = true;                  // the cancel failed: the window runs on
+    assert(r.core->startDiscovery(0x07, 15000, r.now));
+    r.at(r.now + 1000);
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY_PENDING && r.port.discStarts == 1);
+    r.port.discOn = false;
+    r.port.connOn = true;
+    r.at(r.now + 1000);
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY_PENDING && r.port.discStarts == 1);
+    r.port.connOn = false;
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.port.discStarts == 2);
+    assert(r.core->stats().scanStartFails == 0 && g_eventCount == 0);
+  }
+  {
+    Rig r;                                             // ...but not beyond the pending limit
+    r.port.discOn = true;
+    const uint32_t t0 = r.now;
+    assert(r.core->startDiscovery(0x07, 15000, t0));
+    r.at(t0 + bs::kDiscoveryPendingMaxMs - 1);
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY_PENDING && g_eventCount == 0);
+    r.at(t0 + bs::kDiscoveryPendingMaxMs);
+    assert(r.core->scan().owner() == ScanOwner::OFF && r.port.discStarts == 0);
+    assert(r.core->stats().scanStartFails == 0);
+    expectDone(0, FinishReason::START_FAILED, 0, 1);
+  }
+}
+
+static void testDiscoveryBlocksConnects() {
+  {
+    Rig r;                                             // a held FOUND slot goes back to WAIT_SCAN
+    r.port.connectOk = false;
+    r.port.connectErr = bs::kHsEBusy;
+    r.add();
+    r.update();
+    r.match(r.core->scan().epoch());
+    r.update();
+    assert(r.state() == SlotState::FOUND && r.port.connects == 1);
+    r.port.connectOk = true;
+    assert(r.core->startDiscovery(0x07, 15000, r.now));
+    assert(r.state() == SlotState::WAIT_SCAN);
+    r.at(r.now + 500);
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.port.connects == 1);
+  }
+  {
+    Rig r;                                             // STOPPING_FOR_CONNECT goes back too
+    r.port.cancelLeavesDiscOn = true;
+    r.add();
+    r.update();
+    r.match(r.core->scan().epoch());
+    r.update();
+    assert(r.state() == SlotState::STOPPING_FOR_CONNECT);
+    assert(r.core->startDiscovery(0x07, 15000, r.now));
+    assert(r.state() == SlotState::WAIT_SCAN);
+    r.port.cancelLeavesDiscOn = false;
+    r.port.discOn = false;
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.port.connects == 0);
+  }
+  {
+    Rig r;                                             // FOUND during the discovery waits for DONE
+    r.add();
+    discover(r);
+    r.replace();
+    assert(r.state() == SlotState::FOUND);
+    r.at(r.now + 1000);
+    assert(r.state() == SlotState::FOUND && r.port.connects == 0);
+    discEnd(r);
+    r.update();
+    assert(countEvents(EventType::DISCOVERY_DONE) == 1);
+    assert(r.state() == SlotState::CONNECTING && r.port.connects == 1);
+  }
+  {
+    Rig r;                                             // a drop's direct attempt waits too
+    r.toSubscribed();
+    discover(r);
+    r.discEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::FOUND && r.port.connects == 1);
+    discEnd(r);
+    r.update();
+    assert(r.state() == SlotState::CONNECTING && r.port.connects == 2);
+  }
+  {
+    Rig r;                                             // pending waits for a connect + GATT pass
+    r.toConnecting();
+    assert(r.core->startDiscovery(0x07, 15000, r.now));
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY_PENDING && r.port.discStarts == 1);
+    r.connectedEv(r.gen());
+    r.update();                                        // SUBSCRIBED, then the start in one pass
+    assert(r.state() == SlotState::SUBSCRIBED && r.port.gattPasses == 1);
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.port.discStarts == 2);
+  }
+  {
+    Rig r;                                             // ...and for a CANCELLING outcome
+    r.toConnecting();
+    assert(r.core->startDiscovery(0x07, 15000, r.now));
+    r.remove();
+    r.update();
+    assert(r.state() == SlotState::CANCELLING);
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY_PENDING);
+    r.failEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::EMPTY && r.core->scan().owner() == ScanOwner::DISCOVERY);
+  }
+}
+
+static void testDiscoveryFromCallback() {
+  Rig r;                                               // DONE callback starts the next one
+  r.core->setEventCallback(onEventHook);
+  int dones = 0;
+  g_hook = [&r, &dones](const EventInfo& info) {
+    if (info.type != EventType::DISCOVERY_DONE) return;
+    r.core->stopDiscovery();                           // already closed: no second DONE
+    if (dones++ == 0) assert(r.core->startDiscovery(0x01, 15000, r.now));
+  };
+  discover(r, 0x01);
+  const uint16_t e = r.core->scan().epoch();
+  discReport(r, kMac, Ad().uuids({0x180D}).name("HRM"));
+  discEnd(r);
+  r.update();                                          // DONE, restart, started in the same pass
+  assert(dones == 1 && g_eventCount == 1);
+  expectDone(0, FinishReason::NATURAL, 1, 1);
+  assert(r.core->discovering() && r.core->scan().owner() == ScanOwner::DISCOVERY);
+  assert(r.core->scan().epoch() == e + 1 && r.port.discStarts == 2);
+  assert(r.core->discoveredCount() == 1);              // previous table until the next DONE
+  discReport(r, kOtherMac, Ad().uuids({0x180D}).name("Other"));
+  r.core->stopDiscovery();
+  g_hook = nullptr;
+  assert(dones == 2 && g_eventCount == 2);
+  expectDone(1, FinishReason::MANUAL, 1, 2);           // the buffer was cleared at the start
+  DiscoveredSensor d;
+  assert(r.core->discovered(0, d) && strcmp(d.name, "Other") == 0);
+}
+
+// gapScanCb (host task) upserts while update() starts, finishes and reads.
+static void testDiscoveryConcurrentReports() {
+  Rig r;
+  r.core->setEventCallback(nullptr);                   // 300 DONEs; g_events holds 32
+  std::atomic<bool> stop{false};
+  std::thread host([&r, &stop] {
+    uint8_t mac[6] = {0x30, 0, 0, 0, 0, 0};
+    for (uint32_t n = 0; !stop.load(); ++n) {
+      mac[5] = static_cast<uint8_t>(n % 40);
+      discReport(r, mac, Ad().uuids({0x180D}).name(n % 2 ? "A" : "B", n % 3 == 0));
+    }
+  });
+  DiscoveredSensor d;
+  for (int i = 0; i < 300; ++i) {
+    discover(r, 0x01);
+    for (int k = 0; k < 20; ++k) {
+      for (uint8_t j = 0; j < r.core->discoveredCount(); ++j) {
+        assert(r.core->discovered(j, d));
+        assert(d.typeMask == 0x01 && strlen(d.name) == 1 && d.mac[0] == 0x30);
+      }
+    }
+    if (i % 2) {
+      r.core->stopDiscovery();
+    } else {
+      discEnd(r);
+      r.update();
+    }
+    assert(!r.core->discovering() && r.core->discoveredCount() <= BBS_MAX_DISCOVERED);
+  }
+  stop.store(true);
+  host.join();
+}
+
 int main() {
   testAddByMac();
   testHappyPath();
@@ -3660,5 +4304,17 @@ int main() {
   testDataCallbackReentrancy();
   testRefreshFromEventCallback();
   testLinkLossClearsMeasurement();
+  testDiscoveryNatural();
+  testDiscoveryFields();
+  testDiscoveryDuration();
+  testDiscoveryCancelsWindows();
+  testDiscoveryStop();
+  testDiscoveryTimeout();
+  testDiscoveryHostReset();
+  testDiscoveryResync();
+  testDiscoveryStartFailed();
+  testDiscoveryBlocksConnects();
+  testDiscoveryFromCallback();
+  testDiscoveryConcurrentReports();
   return 0;
 }

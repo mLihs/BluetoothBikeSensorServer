@@ -21,6 +21,9 @@ enum class EventType : uint8_t {
   DATA = 4, DISCOVERY_DONE = 5, CENTRAL_CONNECTED = 6, CENTRAL_DISCONNECTED = 7,
   CENTRAL_SUBSCRIBED = 8, CENTRAL_UNSUBSCRIBED = 9, HOST_RESET = 10
 };
+enum class FinishReason : uint8_t {
+  NATURAL = 0, MANUAL = 1, TIMEOUT = 2, HOST_RESET = 3, RESYNC = 4, START_FAILED = 5, QUIESCED = 6
+};
 struct EventInfo {
   EventType type;
   SensorType sensorType;
@@ -29,6 +32,11 @@ struct EventInfo {
   uint32_t generation;        // DISCOVERY_DONE
 };
 typedef void (*EventCallback)(const EventInfo&);
+
+// §3.3: one discovered advertiser. name "" = none seen; typeMask = advertised
+// types ∩ the discovery's requested mask ∩ the compiled types.
+struct DiscoveredSensor { char name[32]; uint8_t mac[6]; uint8_t addrType; uint8_t typeMask; };
+static_assert(sizeof(DiscoveredSensor) == 40, "");
 
 struct Stats {
   uint32_t connects, connectFails, disconnects, notifies, notifiesTruncated, notifiesMalformed;

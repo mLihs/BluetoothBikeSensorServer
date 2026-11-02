@@ -15,10 +15,11 @@
 #include "BBSScanController.h"
 #include "BBSTypes.h"
 
-// One slot per compiled sensor type, one mode for all slots (§10 steps 3–5):
+// One slot per compiled sensor type, one mode for all slots (§10 steps 3–6):
 // slot machine (§5.2), event handling (§5.1), resync (§3.2), HOST_RESET, the
 // app lifecycle, DATA and central events (§4), HR/CSC data callbacks, relay,
-// server name and advertising desired state (§5.4), driven through BlePort. Arduino-free; the caller passes millis() as
+// server name and advertising desired state (§5.4), discovery (§3.3, §5.3),
+// driven through BlePort. Arduino-free; the caller passes millis() as
 // `now`. Everything except the members marked "any task" runs on the update()
 // task.
 
@@ -284,6 +285,92 @@ class Core {
     return lastValue(slotIndex(SensorType::SPEED_CADENCE), rpm, ageMs, now);
   }
 
+  // §5.3. False under quiesce, while a discovery is pending or open, or for a
+  // duration of 0 or >= kDiscoveryDurationLimitMs. Otherwise the new discovery waits as DISCOVERY_PENDING for a running
+  // connect/GATT pass; FOUND/STOPPING_FOR_CONNECT slots go back to their wait
+  // state, and no slot connects until DISCOVERY_DONE. Results replace the
+  // table on DISCOVERY_DONE.
+  bool startDiscovery(uint8_t typeMask, uint32_t durationMs, uint32_t now) {
+    if (quiesced_ || scan_.discoveryOwner() || durationMs == 0 ||
+        durationMs >= kDiscoveryDurationLimitMs) {
+      return false;
+    }
+    {
+      MuxGuard guard(tableMux_);
+      discCount_ = 0;
+      discMask_ = typeMask & kCompiledMask;
+      discGen_++;
+      discOpen_ = true;
+    }
+    scan_.beginDiscovery(port_, now, durationMs);
+    for (SensorSlot& s : slots_) {
+      if (s.state == SlotState::FOUND || s.state == SlotState::STOPPING_FOR_CONNECT) {
+        enter(s, waitState(), now);
+      }
+    }
+    return true;
+  }
+
+  // §5.3: finishes a pending or running discovery with MANUAL; collected
+  // matches are kept. No-op otherwise.
+  void stopDiscovery() {
+    if (!scan_.discoveryOwner()) return;
+    scan_.cancelDiscovery(port_);
+    tryFinish(FinishReason::MANUAL);
+  }
+
+  // Any task. True from startDiscovery() until DISCOVERY_DONE.
+  bool discovering() {
+    MuxGuard guard(tableMux_);
+    return discOpen_;
+  }
+
+  // Any task. The table of the last finished discovery, named entries first.
+  uint8_t discoveredCount() {
+    MuxGuard guard(tableMux_);
+    return discTableCount_;
+  }
+  bool discovered(uint8_t i, DiscoveredSensor& out) {
+    MuxGuard guard(tableMux_);
+    if (i >= discTableCount_) return false;
+    out = discTable_[i];
+    return true;
+  }
+
+  // Any task (gapScanCb): upserts one discovery report by address (§3.3).
+  // Only reports of the running discovery scan count. A new address needs an
+  // advertised type in the requested ∩ compiled mask, then later reports
+  // (SCAN_RSP) merge their types and name: a complete name replaces a
+  // shortened one, never the reverse. New addresses are dropped once
+  // BBS_MAX_DISCOVERED are stored.
+  void discoveryReport(uint16_t epoch, const uint8_t mac[6], uint8_t addrType,
+                       const AdFields& ad) {
+    MuxGuard guard(tableMux_);
+    // Under the lock: closeDiscovery() clears the epoch in the same section as
+    // the sort, so no report lands after it.
+    if (epoch == 0 || epoch != scan_.activeDiscEpoch()) return;
+    const uint8_t types = ad.typeMask & discMask_;
+    uint8_t i = 0;
+    while (i < discCount_ && memcmp(discBuf_[i].mac, mac, sizeof(discBuf_[i].mac)) != 0) ++i;
+    if (i == discCount_) {
+      if (types == 0 || discCount_ == BBS_MAX_DISCOVERED) return;
+      discBuf_[i] = DiscoveredSensor{};
+      memcpy(discBuf_[i].mac, mac, sizeof(discBuf_[i].mac));
+      discBuf_[i].addrType = addrType;
+      discNameComplete_[i] = false;
+      discCount_++;
+    }
+    DiscoveredSensor& d = discBuf_[i];
+    d.typeMask |= types;
+    if (ad.name != nullptr && ad.nameLen > 0 &&
+        (d.name[0] == '\0' || (ad.nameComplete && !discNameComplete_[i]))) {
+      const size_t len = ad.nameLen < sizeof(d.name) - 1 ? ad.nameLen : sizeof(d.name) - 1;
+      memcpy(d.name, ad.name, len);
+      d.name[len] = '\0';
+      discNameComplete_[i] = ad.nameComplete;
+    }
+  }
+
   void update(uint32_t now) {
     if (queue_.takeResync()) resync(now);
     Event ev;
@@ -292,7 +379,10 @@ class Core {
     gattStep(now);
     for (uint8_t i = 0; i < kSlotCount; ++i) advanceSlot(i, now);
     orphanSweep();
-    scan_.advance(port_, now, needScan(), scanBlocked(), stats_);
+    FinishReason finish;
+    if (scan_.advance(port_, now, needScan(), scanBlocked(), linkBusy(), stats_, finish)) {
+      tryFinish(finish);
+    }
   }
 
   void setEventCallback(EventCallback cb) { eventCb_ = cb; }
@@ -366,6 +456,18 @@ class Core {
   bool scanBlocked() const {
     for (const SensorSlot& s : slots_) {
       if (s.state == SlotState::FOUND || inFlight(s.state)) return true;
+    }
+    return false;
+  }
+
+  // §5.3 DISCOVERY_PENDING waits for these. A slot that becomes FOUND later
+  // (direct retry, MAC replace) does not block it; it waits for DISCOVERY_DONE.
+  bool linkBusy() const {
+    for (const SensorSlot& s : slots_) {
+      if (s.state == SlotState::CONNECTING || s.state == SlotState::CANCELLING ||
+          s.state == SlotState::DISCOVERING) {
+        return true;
+      }
     }
     return false;
   }
@@ -528,14 +630,60 @@ class Core {
     emit(EventType::SENSOR_FAILED, s.type);
   }
 
-  void emit(EventType type, SensorType sensorType, int reason = 0, uint8_t count = 0) {
+  void emit(EventType type, SensorType sensorType, int reason = 0, uint8_t count = 0,
+            uint32_t generation = 0) {
     if (eventCb_ == nullptr) return;
     EventInfo info{};
     info.type = type;
     info.sensorType = sensorType;
     info.reason = reason;
     info.count = count;
+    info.generation = generation;
     eventCb_(info);
+  }
+
+  struct DiscoveryDone {
+    uint32_t generation;
+    uint8_t count;
+    FinishReason reason;
+  };
+
+  // §5.3 tryFinish(), state part (caller checked discoveryOwner()): owner OFF,
+  // later reports stale, discBuf sorted into discTable.
+  DiscoveryDone closeDiscovery(FinishReason reason) {
+    MuxGuard guard(tableMux_);
+    scan_.finishDiscovery();
+    sortDiscovered();
+    discOpen_ = false;
+    return {discGen_, discTableCount_, reason};
+  }
+
+  void emitDone(const DiscoveryDone& done) {
+    emit(EventType::DISCOVERY_DONE, SensorType{}, static_cast<int>(done.reason), done.count,
+         done.generation);
+  }
+
+  // Wins once per discovery: afterwards the owner is OFF.
+  void tryFinish(FinishReason reason) {
+    if (scan_.discoveryOwner()) emitDone(closeDiscovery(reason));
+  }
+
+  // Caller holds tableMux_. Stable insertion sort: named entries by strcmp,
+  // then unnamed ones in arrival order.
+  void sortDiscovered() {
+    uint8_t n = 0;
+    for (uint8_t k = 0; k < discCount_; ++k) {
+      const char* name = discBuf_[k].name;
+      uint8_t j = n;
+      while (j > 0 && name[0] != '\0' &&
+             (discTable_[j - 1].name[0] == '\0' || strcmp(discTable_[j - 1].name, name) > 0)) {
+        discTable_[j] = discTable_[j - 1];
+        --j;
+      }
+      discTable_[j] = discBuf_[k];
+      ++n;
+    }
+    discTableCount_ = n;
   }
 
   void handle(const Event& ev, uint32_t now) {
@@ -544,7 +692,7 @@ class Core {
         if (scan_.isCurrent(ev.gen)) onScanMatch(ev, now);
         break;
       case Ev::SCAN_END:
-        scan_.onScanEnd(ev.gen);
+        if (scan_.onScanEnd(ev.gen)) tryFinish(FinishReason::NATURAL);
         break;
       case Ev::HOST_RESET:
         onHostReset(now);
@@ -776,8 +924,16 @@ class Core {
     }
   }
 
+  // A pending or open discovery finishes with HOST_RESET (matches kept);
+  // DISCOVERY_DONE follows the state changes and precedes HOST_RESET.
   void onHostReset(uint32_t now) {
-    scan_.forceOff();
+    const bool discovery = scan_.discoveryOwner();
+    DiscoveryDone done{};
+    if (discovery) {
+      done = closeDiscovery(FinishReason::HOST_RESET);
+    } else {
+      scan_.forceOff();
+    }
     for (uint8_t i = 0; i < kSlotCount; ++i) {
       const SlotState state = slots_[i].state;
       if (state == SlotState::CONNECTING || state == SlotState::CANCELLING ||
@@ -788,12 +944,21 @@ class Core {
     advHeld_ = false;
     enforceAdvertising(now);
     stats_.hostResets++;
+    if (discovery) emitDone(done);
     emit(EventType::HOST_RESET, SensorType{});
   }
 
   // §3.2 resync.
   void resync(uint32_t now) {
-    if (!port_.discActive()) scan_.forceOff();   // step 4 first: the slot repair may emit()
+    // Step 4 first: the slot repair may emit(). DISCOVERY_DONE goes out before
+    // it, so a discovery started from a later callback cannot precede it.
+    if (!port_.discActive()) {
+      if (scan_.discoveryOwner()) {
+        tryFinish(FinishReason::RESYNC);
+      } else {
+        scan_.forceOff();
+      }
+    }
     for (uint8_t i = 0; i < kSlotCount; ++i) resyncSlot(i, now);
     refreshCentralCount();
     advHeld_ = false;
@@ -850,7 +1015,8 @@ class Core {
     SensorSlot& s = slots_[i];
     switch (s.state) {
       case SlotState::FOUND: {
-        if (now - s.holdFromMs < s.holdMs || anyInFlight()) return;
+        // §5.2: no connect while a discovery is pending or open.
+        if (now - s.holdFromMs < s.holdMs || anyInFlight() || scan_.discoveryOwner()) return;
         const int rc = scan_.stopForConnect(port_, now);
         if (rc != 0 && rc != kHsEAlready) {
           stoppingSafetyExit(s, now);
@@ -933,8 +1099,18 @@ class Core {
   EventQueue queue_;
   GattWatchdog watchdog_;
   ScanController scan_;
-  Mux tableMux_;                        // slot identity read by gapScanCb, last measurements, central count, name prefix (§3.4)
+  Mux tableMux_;                        // slot identity read by gapScanCb, last measurements, central count, name prefix, discovery (§3.4)
   SensorSlot slots_[kSlotCount];
+  // Discovery (§3.3), under tableMux_: discBuf_ is written by gapScanCb while
+  // the discovery scan runs, discTable_ is the sorted copy the getters read.
+  DiscoveredSensor discBuf_[BBS_MAX_DISCOVERED];
+  bool discNameComplete_[BBS_MAX_DISCOVERED];   // per discBuf_ entry: name from AD 0x09
+  uint8_t discCount_ = 0;
+  DiscoveredSensor discTable_[BBS_MAX_DISCOVERED];
+  uint8_t discTableCount_ = 0;
+  uint8_t discMask_ = 0;                // requested ∩ compiled
+  uint32_t discGen_ = 0;                // one per accepted startDiscovery()
+  bool discOpen_ = false;               // startDiscovery() until DISCOVERY_DONE
   Stats stats_{};
   EventCallback eventCb_ = nullptr;
   void (*heartRateCb_)(uint16_t) = nullptr;

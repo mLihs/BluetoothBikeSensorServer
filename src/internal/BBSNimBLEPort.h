@@ -252,6 +252,14 @@ class NimBLEPort final : public BlePort {
       const ble_gap_disc_desc& desc = event->disc;
       uint8_t mac[6];
       for (uint8_t i = 0; i < 6; ++i) mac[i] = desc.addr.val[5 - i];
+      if (epoch == core.scan().activeDiscEpoch()) {
+        // Discovery: upsert under tableMux, no event (§2 copy exception).
+        // Fields before a malformed element are whole elements; they count.
+        AdFields fields;
+        parseAd(desc.data, desc.length_data, fields);
+        core.discoveryReport(epoch, mac, desc.addr.type, fields);
+        return 0;
+      }
       if (core.mode() == Mode::MAC) {
         if (!core.scanFilterMatch(mac)) return 0;   // any slot's MAC; update() picks the slot
         AdFields fields;
