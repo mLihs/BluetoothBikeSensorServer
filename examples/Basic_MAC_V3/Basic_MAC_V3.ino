@@ -50,6 +50,8 @@ void addSensor() {
 }
 
 void printStatus() {
+  static_assert(bs::internal::slotIndex(bs::SensorType::HEART_RATE) >= 0,
+                "Basic_MAC_V3 needs BBS_COMPILE_HEART_RATE");
   const bs::internal::SensorSlot& slot =
       core.slot(bs::internal::slotIndex(bs::SensorType::HEART_RATE));
   const bs::Stats& s = core.stats();

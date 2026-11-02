@@ -53,7 +53,9 @@ struct SensorSlot {
   uint32_t   holdFromMs;                // FOUND connects not before holdFromMs + holdMs
   uint32_t   holdMs;
   bool       removing;                  // remove() in a link state: EMPTY on the outcome
-  // Per-attempt flags, cleared only by Core::leaveAttempt().
+  // Per-attempt flags. Set only during an attempt or link; leaveAttempt()
+  // resets all three when it ends. clearSlot() also clears them; retarget()
+  // clears failPending.
   bool       gattDone;                  // DISCOVERING: no pass (failed, or skipped by a replace)
   bool       directRetry;               // leaveAttempt → FOUND (one direct attempt), not WAIT_SCAN
   bool       failPending;               // watchdog cancel / failed GATT pass: outcome is a hard fail

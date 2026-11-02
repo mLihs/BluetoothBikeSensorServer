@@ -571,7 +571,7 @@ static void testConnectWatchdogAndCancelling() {
     assert(r.state() == SlotState::WAIT_SCAN && r.hr().failCount == 0);
     assert(countEvents(EventType::SENSOR_FAILED) == 0);
 
-    r.at(r.now + BBS_SCAN_START_BACKOFF_MS + 40000);   // flag cleared on the next attempt
+    r.at(r.now + BBS_SCAN_START_BACKOFF_MS + 40000);   // next attempt: no failPending left over
     r.match(r.core->scan().epoch());
     r.update();
     assert(r.state() == SlotState::CONNECTING);
@@ -1901,6 +1901,123 @@ static void testCallbackTouchesOtherSlot() {
   g_removeType = SensorType::HEART_RATE;
 }
 
+static std::function<void(const EventInfo&)> g_hook;
+
+static void onEventHook(const EventInfo& info) {
+  onEvent(info);
+  if (g_hook) g_hook(info);
+}
+
+static void testCallbackReplacesOtherSlot() {
+  Rig r;                                               // HR fails inside advanceSlot → app replaces CSC
+  r.core->setEventCallback(onEventHook);
+  r.add();
+  r.addCsc();
+  r.update();
+  r.port.connectOk = false;
+  r.port.connectErr = 6;                               // BLE_HS_ENOMEM: hard fail in tryConnect
+  g_hook = [&r](const EventInfo& info) {
+    if (info.type != EventType::SENSOR_FAILED) return;
+    r.port.connectOk = true;
+    r.port.expect[kCsc] = kOtherMac;
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kOtherMacStr, 1, "CSC2", r.now));
+    assert(r.cscState() == SlotState::FOUND);
+    r.checkAtMostOneInFlight();
+  };
+  r.match(r.core->scan().epoch(), kMac);
+  r.update();                                          // CSC's direct attempt in the same pass
+  g_hook = nullptr;
+  assert(r.state() == SlotState::WAIT_SCAN && r.hr().failCount == 1);
+  assert(r.cscState() == SlotState::CONNECTING && r.port.lastConnectSlot == kCsc);
+  assert(r.port.connects == 2 && r.port.lastAddrType == 1);
+  assert(r.core->scan().owner() == ScanOwner::OFF && r.port.discStarts == 1);
+  r.failEv(r.cscGen(), 13, kCsc);
+  r.update();                                          // CSC hard fail; the scan resumes for both
+  assert(r.cscState() == SlotState::WAIT_SCAN && r.csc().failCount == 1);
+  assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW && r.port.discStarts == 2);
+}
+
+static void testBothSubscribedDropOnePass() {
+  Rig r;
+  r.add();
+  r.addCsc();
+  r.update();
+  r.match(r.core->scan().epoch(), kMac);
+  r.match(r.core->scan().epoch(), kCscMac);
+  r.update();
+  r.connectedEv(r.gen());
+  r.update();
+  r.connectedEv(r.cscGen(), kCsc);
+  r.update();
+  assert(r.state() == SlotState::SUBSCRIBED && r.cscState() == SlotState::SUBSCRIBED);
+  const int starts = r.port.discStarts;
+  g_eventCount = 0;
+  r.discEv(r.cscGen(), 0x08, kCsc);                    // CSC's event first: the slot order decides
+  r.discEv(r.gen(), 0x08);
+  r.update();
+  assert(r.state() == SlotState::CONNECTING && r.port.lastConnectSlot == kHr);
+  assert(r.cscState() == SlotState::FOUND && r.port.connects == 3);
+  assert(r.core->scan().owner() == ScanOwner::OFF && r.port.discStarts == starts);
+  assert(g_eventCount == 2);
+  expectEvent(0, EventType::SENSOR_DISCONNECTED, SlotState::FOUND, 0x08,
+              SensorType::SPEED_CADENCE);
+  expectEvent(1, EventType::SENSOR_DISCONNECTED, SlotState::FOUND, 0x08);
+  r.at(r.now + 100);
+  assert(r.cscState() == SlotState::FOUND && r.port.discStarts == starts);
+
+  r.connectedEv(r.gen());
+  r.update();                                          // HR subscribes; CSC's direct attempt
+  assert(r.state() == SlotState::SUBSCRIBED && r.cscState() == SlotState::CONNECTING);
+  assert(r.port.lastConnectSlot == kCsc && r.port.connects == 4);
+  r.connectedEv(r.cscGen(), kCsc);
+  r.update();
+  assert(r.cscState() == SlotState::SUBSCRIBED && r.port.discStarts == starts);
+}
+
+#if BBS_COMPILE_POWER
+static const char kPowerMacStr[] = "aa:bb:cc:dd:ee:04";
+static const uint8_t kPowerMac[6] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x04};
+
+// Two FOUND slots wait while a third is in flight; they connect in slot order.
+static void testThreeSlotsOrdering() {
+  const uint8_t kPower = static_cast<uint8_t>(bs::slotIndex(SensorType::POWER));
+  Rig r;
+  r.port.expect[kPower] = kPowerMac;
+  r.add();
+  r.addCsc();
+  assert(r.core->addByMac(SensorType::POWER, kPowerMacStr, 0, "PWR", r.now));
+  r.update();
+  const uint16_t e = r.core->scan().epoch();
+  r.match(e, kPowerMac);                               // reverse slot order
+  r.match(e, kCscMac);
+  r.match(e, kMac);
+  r.update();
+  assert(r.state() == SlotState::CONNECTING && r.port.lastConnectSlot == kHr);
+  assert(r.cscState() == SlotState::FOUND && r.core->slot(kPower).state == SlotState::FOUND);
+  expectEvent(0, EventType::SENSOR_FOUND, SlotState::FOUND, 0, SensorType::POWER);
+  expectEvent(1, EventType::SENSOR_FOUND, SlotState::FOUND, 0, SensorType::SPEED_CADENCE);
+  expectEvent(2, EventType::SENSOR_FOUND, SlotState::FOUND);
+
+  r.at(r.now + BBS_CONNECT_TIMEOUT_MS + 2000);         // HR watchdog cancel: both still wait
+  assert(r.state() == SlotState::CANCELLING && r.port.connects == 1);
+  assert(r.cscState() == SlotState::FOUND && r.core->slot(kPower).state == SlotState::FOUND);
+  r.failEv(r.gen());
+  r.update();                                          // HR hard fail; CSC (lower index) next
+  assert(r.state() == SlotState::WAIT_SCAN && r.cscState() == SlotState::CONNECTING);
+  assert(r.core->slot(kPower).state == SlotState::FOUND);
+  assert(r.port.lastConnectSlot == kCsc && r.port.connects == 2);
+  r.connectedEv(r.cscGen(), kCsc);
+  r.update();                                          // CSC subscribes; Power connects, same pass
+  assert(r.cscState() == SlotState::SUBSCRIBED);
+  assert(r.core->slot(kPower).state == SlotState::CONNECTING);
+  assert(r.port.lastConnectSlot == kPower && r.port.connects == 3);
+  r.connectedEv(r.core->attemptGen(kPower), kPower);
+  r.update();
+  assert(r.core->slot(kPower).state == SlotState::SUBSCRIBED && r.port.lastGattSlot == kPower);
+  assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW && r.port.discStarts == 2);
+}
+#endif
+
 // ---- NAME mode (§4 rev 25, §5.3) ----
 
 static void testCrossModeAdd() {
@@ -2249,6 +2366,173 @@ static void testNameSafetyHostResetOrphan() {
   }
 }
 
+static void testNameCallbackAddsOtherSlot() {
+  Rig r(Mode::NAME);                                   // HR drops → app adds CSC
+  r.core->setEventCallback(onEventHook);
+  r.nameToSubscribed();
+  const int starts = r.port.discStarts;
+  g_hook = [&r](const EventInfo& info) {
+    if (info.type != EventType::SENSOR_DISCONNECTED) return;
+    assert(!r.core->addByName(SensorType::SPEED_CADENCE, "HRM", r.now));   // HR's name
+    assert(r.core->addByName(SensorType::SPEED_CADENCE, "CSC", r.now));
+    assert(r.cscState() == SlotState::IDLE);
+  };
+  r.discEv(r.gen(), 0x208);
+  r.update();                                          // both IDLE: one window for both
+  g_hook = nullptr;
+  assert(r.state() == SlotState::IDLE && r.cscState() == SlotState::IDLE);
+  assert(r.core->scan().owner() == ScanOwner::NAME_SCAN && r.port.discStarts == starts + 1);
+  assert(r.report(kCscMac, "CSC"));
+  assert(r.report(kMac, "HRM"));
+  r.update();
+  assert(r.state() == SlotState::CONNECTING && r.cscState() == SlotState::FOUND);
+  r.connectedEv(r.gen());
+  r.update();
+  assert(r.state() == SlotState::SUBSCRIBED && r.cscState() == SlotState::CONNECTING);
+}
+
+static void testNameResync() {
+  {
+    Rig r(Mode::NAME);                                 // lost SUBSCRIBED link: IDLE, no direct attempt
+    r.nameToSubscribed();
+    g_eventCount = 0;
+    const int connects = r.port.connects;
+    r.port.connected = false;
+    fillQueueToResync(*r.core);
+    r.update();
+    assert(r.state() == SlotState::IDLE && r.port.connects == connects);
+    assert(r.core->stats().disconnects == 1 && r.hr().failCount == 0 && r.hr().holdMs == 0);
+    assert(g_eventCount == 1);
+    expectEvent(0, EventType::SENSOR_DISCONNECTED, SlotState::IDLE, 0);
+    assert(r.core->scan().owner() == ScanOwner::NAME_SCAN);
+  }
+  {
+    Rig r(Mode::NAME);                                 // DISCOVERING after a failed pass: hard fail
+    r.port.gattOk = false;
+    assert(r.core->addByName(SensorType::HEART_RATE, "HRM", r.now));
+    r.update();
+    assert(r.report(kMac, "HRM"));
+    r.update();
+    r.connectedEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::DISCOVERING && r.port.disconnects == 1);
+    g_eventCount = 0;
+    r.port.connected = false;
+    fillQueueToResync(*r.core);
+    r.update();
+    assert(r.state() == SlotState::IDLE && r.hr().failCount == 1 && r.hr().holdMs == 1000);
+    assert(r.core->stats().disconnects == 1 && r.core->stats().connectFails == 0);
+    assert(g_eventCount == 1 && r.port.connects == 1);
+    expectEvent(0, EventType::SENSOR_FAILED, SlotState::IDLE);
+  }
+}
+
+static void testNameRemoveFromLinkStates() {
+  {
+    Rig r(Mode::NAME);                                 // SUBSCRIBED → disconnect → EMPTY
+    r.nameToSubscribed();
+    g_eventCount = 0;
+    r.remove();
+    assert(r.state() == SlotState::SUBSCRIBED && r.port.slotDisconnects[kHr] == 1);
+    r.discEv(r.gen(), 0x16);
+    r.update();
+    assert(r.state() == SlotState::EMPTY && !r.hr().hasAddr);
+    assert(r.core->scanNameMatch("HRM", 3) == -1);
+    assert(g_eventCount == 1);
+    expectEvent(0, EventType::SENSOR_DISCONNECTED, SlotState::EMPTY, 0x16);
+    r.at(r.now + 60000);
+    assert(g_eventCount == 1 && r.port.connects == 1 && r.port.discStarts == 1);
+  }
+  {
+    Rig r(Mode::NAME);                                 // CONNECTING → CANCELLING → EMPTY
+    assert(r.core->addByName(SensorType::HEART_RATE, "HRM", r.now));
+    r.update();
+    assert(r.report(kMac, "HRM"));
+    r.update();
+    assert(r.state() == SlotState::CONNECTING);
+    g_eventCount = 0;
+    r.remove();
+    assert(r.state() == SlotState::CANCELLING && r.port.cancelConnects == 1);
+    r.failEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::EMPTY && r.hr().failCount == 0);
+    assert(g_eventCount == 0 && r.core->stats().connectFails == 0);
+    r.at(r.now + 60000);
+    assert(g_eventCount == 0 && r.port.connects == 1);
+  }
+}
+
+// §5.3: a slot held in FOUND blocks new windows, so another waiting slot is not
+// scanned for until the hold ends. The hold is at most kBackoffMaxMs.
+static void testFoundHoldBlocksScanBound() {
+  Rig r(Mode::NAME);
+  r.port.connectOk = false;
+  r.port.connectErr = 6;                               // BLE_HS_ENOMEM: every attempt hard-fails
+  assert(r.core->addByName(SensorType::HEART_RATE, "HRM", r.now));
+  assert(r.core->addByName(SensorType::SPEED_CADENCE, "CSC", r.now));   // never found
+  r.update();
+  assert(r.report(kMac, "HRM"));
+  r.update();
+  for (uint8_t fails = 1; fails <= 7; ++fails) {
+    const uint32_t backoff = bs::kBackoffMinMs << (fails - 1);
+    const uint32_t hold = backoff < bs::kBackoffMaxMs ? backoff : bs::kBackoffMaxMs;
+    const uint32_t failedAt = r.now;
+    const int starts = r.port.discStarts;
+    assert(r.state() == SlotState::IDLE && r.hr().failCount == fails && r.hr().holdMs == hold);
+    assert(r.core->scan().owner() == ScanOwner::NAME_SCAN);   // started at failedAt
+    assert(r.report(kMac, "HRM"));
+    r.update();
+    assert(r.state() == SlotState::FOUND);             // held; the running window goes on
+    assert(r.core->scan().owner() == ScanOwner::NAME_SCAN);
+    if (hold > BBS_NAME_SCAN_WINDOW_MS) {
+      r.port.discOn = false;
+      assert(bs::pushScanEnd(r.core->queue(), r.core->scan().epoch(), 0));
+      r.at(failedAt + BBS_NAME_SCAN_WINDOW_MS);
+      assert(r.core->scan().owner() == ScanOwner::OFF);   // CSC IDLE, but no next window
+    }
+    r.at(failedAt + hold - 1);
+    assert(r.state() == SlotState::FOUND && r.cscState() == SlotState::IDLE);
+    assert(r.port.discStarts == starts);
+    r.at(failedAt + hold);                             // hold over: attempt, fail, next window
+    assert(r.port.discStarts == starts + 1);
+  }
+  assert(r.hr().failCount == 8 && r.hr().holdMs == bs::kBackoffMaxMs);
+}
+
+static void testNameSecondDeviceSameName() {
+  Rig r(Mode::NAME);
+  assert(r.core->addByName(SensorType::HEART_RATE, "HRM", r.now));
+  assert(r.core->addByName(SensorType::SPEED_CADENCE, "CSC", r.now));
+  r.update();
+  assert(r.report(kMac, "HRM"));
+  assert(r.report(kOtherMac, "HRM"));                  // same window: HR is FOUND by then
+  r.update();
+  assert(r.state() == SlotState::CONNECTING && memcmp(r.hr().mac, kMac, 6) == 0);
+  assert(countEvents(EventType::SENSOR_FOUND) == 1);
+  r.connectedEv(r.gen());
+  r.update();
+  assert(r.state() == SlotState::SUBSCRIBED);
+  assert(r.core->scan().owner() == ScanOwner::NAME_SCAN);   // CSC still IDLE
+  assert(r.report(kOtherMac, "HRM"));                  // while SUBSCRIBED
+  r.update();
+  assert(r.state() == SlotState::SUBSCRIBED && memcmp(r.hr().mac, kMac, 6) == 0);
+  assert(countEvents(EventType::SENSOR_FOUND) == 1 && r.port.connects == 1);
+}
+
+static void testNameMatchBadSlot() {
+  Rig r(Mode::NAME);
+  assert(r.core->addByName(SensorType::HEART_RATE, "HRM", r.now));
+  r.update();
+  const uint16_t e = r.core->scan().epoch();
+  assert(bs::pushScanMatch(r.core->queue(), e, kMac, 0, "HRM", 3, bs::kSlotCount));
+  assert(bs::pushScanMatch(r.core->queue(), e, kMac, 0, "HRM", 3, 0xFF));
+  r.update();
+  assert(r.state() == SlotState::IDLE && !r.hr().hasAddr && g_eventCount == 0);
+  assert(bs::pushScanMatch(r.core->queue(), e, kMac, 0, "HRM", 3, kHr));
+  r.update();
+  assert(r.state() == SlotState::CONNECTING);
+}
+
 int main() {
   testAddByMac();
   testHappyPath();
@@ -2285,6 +2569,11 @@ int main() {
   testNeedScanAcrossSlots();
   testHostResetAndResyncAcrossSlots();
   testCallbackTouchesOtherSlot();
+  testCallbackReplacesOtherSlot();
+  testBothSubscribedDropOnePass();
+#if BBS_COMPILE_POWER
+  testThreeSlotsOrdering();
+#endif
   testCrossModeAdd();
   testAddByNameAndDuplicates();
   testNameWindows();
@@ -2295,5 +2584,11 @@ int main() {
   testNameReplace();
   testNameTwoMatchesOneWindow();
   testNameSafetyHostResetOrphan();
+  testNameCallbackAddsOtherSlot();
+  testNameResync();
+  testNameRemoveFromLinkStates();
+  testFoundHoldBlocksScanBound();
+  testNameSecondDeviceSameName();
+  testNameMatchBadSlot();
   return 0;
 }
