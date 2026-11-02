@@ -25,18 +25,29 @@ class NimBLEPort final : public BlePort {
  public:
   static constexpr uint8_t kSlots = kSlotCount;
 
-  // After NimBLEDevice::init(). False if a client or the GATT timer cannot be
-  // created. One instance per program; gapScanCb finds it through self_.
-  bool begin(Core& core) {
+  // Before the first Core call. One instance per program; gapScanCb finds it
+  // through self_.
+  void attach(Core& core) {
     core_ = &core;
     self_ = this;
+  }
+
+  bool stackReady() override { return NimBLEDevice::isInitialized(); }
+  bool stackInit(const char* gapName) override { return NimBLEDevice::init(gapName); }
+
+  // After NimBLEDevice::init(). False if a client, the reset detector or the
+  // GATT timer cannot be created; a retry keeps what exists.
+  bool open() override {
     for (uint8_t i = 0; i < kSlots; ++i) {
-      clients_[i] = NimBLEDevice::createClient();
+      if (clients_[i] == nullptr) clients_[i] = NimBLEDevice::createClient();
       if (clients_[i] == nullptr) return false;
       clientCb_[i].slot = i;
       clients_[i]->setClientCallbacks(&clientCb_[i], false);
     }
-    NimBLEDevice::getScan()->setScanCallbacks(&resetDetector_, false);
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    if (scan == nullptr) return false;
+    scan->setScanCallbacks(&resetDetector_, false);
+    if (gattTimer_ != nullptr) return true;
     esp_timer_create_args_t args{};
     args.callback = gattTimerCb;
     args.arg = this;
@@ -44,6 +55,25 @@ class NimBLEPort final : public BlePort {
     args.name = "bbs_gatt";
     return esp_timer_create(&args, &gattTimer_) == ESP_OK;
   }
+
+  // deinit(true) deletes the server, advertising, scan and clients (all
+  // DISCONNECTED by then; NimBLEDevice.cpp deinit → deleteClient); forget them.
+  bool close() override {
+    if (gattTimer_ != nullptr) {
+      if (esp_timer_delete(gattTimer_) != ESP_OK) return false;
+      gattTimer_ = nullptr;
+    }
+    if (!NimBLEDevice::deinit(true)) return false;
+    for (uint8_t i = 0; i < kSlots; ++i) {
+      clients_[i] = nullptr;
+      localChr_[i] = nullptr;
+    }
+    server_ = nullptr;
+    return true;
+  }
+
+  uint32_t nowMs() override { return millis(); }
+  void waitTick() override { vTaskDelay(1); }
 
   bool hsSynced() override { return ble_hs_synced() != 0; }
   bool discActive() override { return ble_gap_disc_active() != 0; }

@@ -10,7 +10,7 @@
 // Raw-GAP scan owner (§5.3): NAME_SCAN windows (NAME mode), SLEEP windows
 // (MAC mode) and the discovery (DISCOVERY_PENDING → DISCOVERY). A discovery
 // ends only through Core::tryFinish(); advance() reports why it must end.
-// update() task only, except activeDiscEpoch().
+// update() task only, except activeDiscEpoch() and owner().
 
 namespace BikeSensor {
 namespace internal {
@@ -26,7 +26,7 @@ class ScanController {
  public:
   explicit ScanController(Mode mode) : mode_(mode) {}
 
-  ScanOwner owner() const { return owner_; }
+  ScanOwner owner() const { return owner_.load(std::memory_order_relaxed); }
   uint16_t epoch() const { return epoch_; }
   bool discoveryOwner() const {
     return owner_ == ScanOwner::DISCOVERY_PENDING || owner_ == ScanOwner::DISCOVERY;
@@ -50,6 +50,21 @@ class ScanController {
   // HOST_RESET, resync and safety exits: ends a NAME/SLEEP window.
   void forceOff() {
     if (windowOwner()) owner_ = ScanOwner::OFF;
+  }
+
+  // quiesce() step 4: cancels a running NAME/SLEEP window.
+  void stopWindow(BlePort& port) {
+    if (!windowOwner()) return;
+    port.discCancel();
+    owner_ = ScanOwner::OFF;
+  }
+
+  // Core::begin(): no window, hold or remainder; the epoch keeps counting.
+  void reset(Mode mode) {
+    mode_ = mode;
+    owner_ = ScanOwner::OFF;
+    hold(0, 0);
+    remainderMs_ = 0;
   }
 
   // Drop a remembered sleep-window remainder once a connect succeeds. Otherwise
@@ -202,8 +217,8 @@ class ScanController {
     holdMs_ = ms;
   }
 
-  const Mode mode_;
-  ScanOwner owner_ = ScanOwner::OFF;
+  Mode mode_;
+  std::atomic<ScanOwner> owner_{ScanOwner::OFF};   // read by scanning() (§3.4 owner snapshot)
   uint16_t epoch_ = 0;                  // never 0 once a scan started
   std::atomic<uint16_t> activeDiscEpoch_{0};   // non-zero only for the discovery scan
   uint32_t holdFromMs_ = 0;             // next NAME/SLEEP start not before holdFromMs_ + holdMs_

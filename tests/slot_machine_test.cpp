@@ -147,6 +147,36 @@ struct FakePort final : BlePort {
     relayLen = len;
     if (len > 0) memcpy(relayData, data, len);
   }
+  // Lifecycle.
+  bool stackUp = false, stackInitOk = true, openOk = true, closeOk = true;
+  int stackInits = 0, opens = 0, closes = 0, ticks = 0;
+  char gapName[64] = {};
+  uint32_t clock = 0;
+  std::function<void()> onTick;                        // the host task between update() passes
+  bool stackReady() override { return stackUp; }
+  bool stackInit(const char* name) override {
+    stackInits++;
+    assert(strlen(name) < sizeof(gapName));
+    strcpy(gapName, name);
+    stackUp = stackInitOk;
+    return stackInitOk;
+  }
+  bool open() override {
+    assert(stackUp);
+    opens++;
+    return openOk;
+  }
+  bool close() override {
+    closes++;
+    if (closeOk) stackUp = false;
+    return closeOk;
+  }
+  uint32_t nowMs() override { return clock; }
+  void waitTick() override {
+    ticks++;
+    clock += 10;
+    if (onTick) onTick();
+  }
 };
 
 struct Recorded {
@@ -4242,6 +4272,385 @@ static void testDiscoveryConcurrentReports() {
   host.join();
 }
 
+// ---- §10 step 7: pause/quiesce, end()/begin(), Stats ----
+
+// §5.5: advertising only, stopped at once; NimBLE's own restarts are enforced off.
+static void testPauseResume() {
+  Rig r;
+  assert(r.core->startServer());
+  r.update();
+  assert(r.port.advOn && r.port.advStarts == 1);
+  r.core->pause();
+  assert(!r.port.advOn && r.port.advStops == 1);
+  r.core->pause();
+  r.update();
+  assert(r.port.advStops == 1 && r.port.advStarts == 1);
+  assert(r.core->stats().advertisingEnforced == 0);
+  r.port.advOn = true;                                 // NimBLE restarted it (§0.9)
+  r.update();
+  assert(!r.port.advOn && r.core->stats().advertisingEnforced == 1);
+  r.toSubscribed();                                    // scans and connects go on
+  assert(r.core->startDiscovery(0x01, 15000, r.now));  // so does discovery
+  r.update();
+  assert(r.core->scan().owner() == ScanOwner::DISCOVERY);
+  r.core->stopDiscovery();
+  assert(r.core->refreshAdvertising(r.now) && !r.port.advOn);
+  r.core->resume();
+  assert(!r.port.advOn);                               // follows on the next update()
+  r.update();
+  assert(r.port.advOn && r.port.advStarts == 2);
+}
+
+// Rev 28: the start hold never delays a stop (pause, quiesce, enforcement).
+static void testStopNeverHeld() {
+  for (int quiesce = 0; quiesce < 2; ++quiesce) {
+    Rig r;
+    assert(r.core->startServer());
+    r.port.advStartOk = false;
+    r.update();
+    assert(r.port.advStarts == 1 && !r.port.advOn);    // failed: the next start is held
+    r.port.advStartOk = true;
+    r.port.advOn = true;                               // NimBLE restarted it during the hold
+    if (quiesce) {
+      r.core->quiesce(r.now);
+    } else {
+      r.core->pause();
+    }
+    assert(!r.port.advOn && r.port.advStops == 1);
+    r.now += 1;                                        // still inside the hold
+    r.port.advOn = true;
+    r.update();
+    assert(!r.port.advOn && r.port.advStops == 2 && r.core->stats().advertisingEnforced == 1);
+    assert(r.port.advStarts == 1);
+  }
+}
+
+// §4 quiesce() step 3: a pending or running discovery ends with QUIESCED,
+// DISCOVERY_DONE after all five steps.
+static void testQuiesceFinishesDiscovery() {
+  {
+    Rig r;                                             // running
+    r.core->setEventCallback(onEventHook);
+    assert(r.core->startServer());
+    r.update();
+    discover(r);
+    const uint16_t e = r.core->scan().epoch();
+    discReport(r, kMac, Ad().uuids({0x180D}).name("HRM"));
+    const int cancels = r.port.discCancels;
+    bool seen = false;
+    g_hook = [&r, &seen](const EventInfo& info) {
+      if (info.type != EventType::DISCOVERY_DONE) return;
+      seen = true;
+      assert(!r.port.advOn && !r.port.discOn);
+      assert(r.core->scan().owner() == ScanOwner::OFF && r.core->scan().activeDiscEpoch() == 0);
+      assert(!r.core->startDiscovery(0x01, 15000, r.now));   // the latch is already set
+    };
+    r.core->quiesce(r.now);
+    g_hook = nullptr;
+    assert(seen && r.port.discCancels == cancels + 1 && g_eventCount == 1);
+    expectDone(0, FinishReason::QUIESCED, 1, 1);
+    r.core->quiesce(r.now);                            // idempotent
+    assert(bs::pushScanEnd(r.core->queue(), e, 0));
+    r.update();
+    assert(g_eventCount == 1 && r.port.discCancels == cancels + 1 && r.core->quiesced());
+  }
+  {
+    Rig r;                                             // pending behind a connect
+    r.toConnecting();
+    assert(r.core->startDiscovery(0x07, 15000, r.now));
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::DISCOVERY_PENDING);
+    g_eventCount = 0;
+    const int cancels = r.port.discCancels;
+    r.core->quiesce(r.now);
+    assert(g_eventCount == 1);
+    expectDone(0, FinishReason::QUIESCED, 0, 1);
+    assert(g_events[0].state == SlotState::CANCELLING);   // step 5 ran before the event
+    assert(r.port.discCancels == cancels && r.port.cancelConnects == 1);
+    assert(!r.core->quiesced());
+    r.failEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.core->quiesced());
+    assert(r.port.discStarts == 1 && g_eventCount == 1);
+  }
+}
+
+// §4 quiesce() steps 4 and 5, the latch rejections and update() under quiesce.
+static void testQuiesceSlotsAndScans() {
+  {
+    Rig r;                                             // CONNECTING → CANCELLING, FOUND → WAIT_SCAN
+    assert(r.core->startServer());
+    r.toConnecting();
+    r.addCsc();
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 0, "CSC", r.now));
+    assert(r.cscState() == SlotState::FOUND);
+    g_eventCount = 0;
+    r.core->quiesce(r.now);
+    assert(r.state() == SlotState::CANCELLING && r.port.cancelConnects == 1);
+    assert(r.cscState() == SlotState::WAIT_SCAN && !r.core->quiesced());
+    assert(!r.core->addByMac(SensorType::HEART_RATE, kOtherMacStr, 0, nullptr, r.now));
+    assert(!r.core->startDiscovery(0x01, 15000, r.now));
+    assert(!r.core->refreshAdvertising(r.now));
+    const int scans = r.port.discStarts, connects = r.port.connects;
+    r.at(r.now + 60000);                               // no scan, no connect
+    assert(r.port.discStarts == scans && r.port.connects == connects);
+    r.failEv(r.gen());                                 // neutral cancel outcome
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.hr().failCount == 0);
+    assert(r.core->stats().connectFails == 0 && g_eventCount == 0 && r.core->quiesced());
+    r.port.advOn = true;                               // NimBLE restart: not quiesced until stopped
+    assert(!r.core->quiesced());
+    r.update();
+    assert(!r.port.advOn && r.core->quiesced());
+    r.core->remove(SensorType::SPEED_CADENCE, r.now);  // allowed (Homewind REMOVING)
+    assert(r.cscState() == SlotState::EMPTY);
+  }
+  {
+    Rig r;                                             // a drop under quiesce: no direct attempt
+    r.toSubscribed();
+    r.core->quiesce(r.now);
+    assert(r.state() == SlotState::SUBSCRIBED && r.core->quiesced());   // links may remain
+    g_eventCount = 0;
+    r.discEv(r.gen(), 0x13);
+    r.at(r.now + 60000);
+    assert(r.state() == SlotState::FOUND && r.port.connects == 1 && r.port.discStarts == 1);
+    expectEvent(0, EventType::SENSOR_DISCONNECTED, SlotState::FOUND, 0x13);
+    assert(g_eventCount == 1 && r.core->quiesced());
+  }
+  {
+    Rig r;                                             // SLEEP window cancelled; a failed cancel
+    r.add();                                           // keeps quiesced() false
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW);
+    const uint16_t e = r.core->scan().epoch();
+    r.port.cancelLeavesDiscOn = true;
+    r.core->quiesce(r.now);
+    assert(r.core->scan().owner() == ScanOwner::OFF && r.port.discCancels == 1);
+    r.match(e);                                        // late report of the window
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && !r.core->quiesced());
+    r.port.discOn = false;
+    assert(r.core->quiesced() && r.port.discStarts == 1);
+  }
+  {
+    Rig r;                                             // STOPPING_FOR_CONNECT → WAIT_SCAN
+    r.port.cancelLeavesDiscOn = true;
+    r.add();
+    r.update();
+    r.match(r.core->scan().epoch());
+    r.update();
+    assert(r.state() == SlotState::STOPPING_FOR_CONNECT);
+    r.core->quiesce(r.now);
+    assert(r.state() == SlotState::WAIT_SCAN);
+    r.port.discOn = false;
+    r.update();
+    assert(r.port.connects == 0 && r.core->quiesced());
+  }
+  {
+    Rig r(Mode::NAME);                                 // NAME: window cancelled, addByName rejected
+    assert(r.core->addByName(SensorType::HEART_RATE, "HRM", r.now));
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::NAME_SCAN);
+    r.core->quiesce(r.now);
+    assert(r.core->scan().owner() == ScanOwner::OFF && r.core->quiesced());
+    assert(!r.core->addByName(SensorType::SPEED_CADENCE, "CSC", r.now));
+    assert(!r.core->addByName(SensorType::HEART_RATE, "HRM2", r.now));
+    assert(strcmp(r.hr().name, "HRM") == 0);
+  }
+}
+
+// A DISCOVERING slot whose pass has not run when quiesce() arrives (from a
+// callback in the same drain): no pass, resync repairs it neutrally.
+static void testQuiesceResyncDiscovering() {
+  for (int lost = 0; lost < 2; ++lost) {
+    Rig r;
+    r.core->setEventCallback(onEventHook);
+    r.toConnecting();
+    g_eventCount = 0;
+    g_hook = [&r](const EventInfo& info) {
+      if (info.type == EventType::CENTRAL_CONNECTED) r.core->quiesce(r.now);
+    };
+    r.connectedEv(r.gen());
+    assert(bs::pushCentralConnect(r.core->queue()));
+    r.update();
+    g_hook = nullptr;
+    assert(r.state() == SlotState::DISCOVERING && r.port.slotDisconnects[kHr] == 1);
+    assert(r.port.gattPasses == 0 && !r.core->quiesced());
+    r.core->quiesce(r.now);                            // idempotent: no second disconnect
+    assert(r.port.slotDisconnects[kHr] == 1);
+    r.update();
+    assert(r.state() == SlotState::DISCOVERING && r.port.gattPasses == 0);
+    r.port.connected = lost == 0;
+    fillQueueToResync(*r.core);
+    r.update();
+    if (lost) {
+      assert(r.state() == SlotState::WAIT_SCAN && r.core->stats().disconnects == 1);
+    } else {
+      assert(r.state() == SlotState::DISCOVERING && r.port.slotDisconnects[kHr] == 1);
+      r.discEv(r.gen());
+      r.update();
+      assert(r.state() == SlotState::WAIT_SCAN);       // no direct attempt under quiesce
+    }
+    assert(r.hr().failCount == 0 && r.core->stats().connectFails == 0 && r.core->quiesced());
+    assert(r.port.gattPasses == 0 && r.port.timerStarts == 0);
+    assert(g_eventCount == 1 && countEvents(EventType::CENTRAL_CONNECTED) == 1);
+    r.at(r.now + 60000);
+    assert(r.port.connects == 1 && r.port.discStarts == 1);
+  }
+}
+
+static void testScanning() {
+  {
+    Rig r;
+    assert(!r.core->scanning());
+    r.add();
+    r.update();
+    assert(r.core->scanning());
+    r.port.cancelLeavesDiscOn = true;
+    r.core->quiesce(r.now);
+    assert(r.core->scan().owner() == ScanOwner::OFF && r.core->scanning());   // NimBLE still scans
+    r.port.discOn = false;
+    assert(!r.core->scanning());
+  }
+  {
+    Rig r;                                             // a pending discovery is scanning too
+    r.toConnecting();
+    assert(r.core->startDiscovery(0x01, 15000, r.now));
+    assert(!r.port.discOn && r.core->scanning());
+  }
+}
+
+// §3.2 drop counters live in the queue; stats() merges them.
+static void testStatsDropCounters() {
+  Rig r;
+  assert(r.core->stats().notifiesDropped == 0 && r.core->stats().eventsDropped == 0);
+  const uint8_t data[2] = {0x00, 70};
+  for (uint8_t i = 0; i < BBS_EVENT_QUEUE_DEPTH; ++i) {
+    assert(bs::pushNotify(r.core->queue(), kHr, r.gen(), data, sizeof(data)));
+  }
+  assert(!bs::pushNotify(r.core->queue(), kHr, r.gen(), data, sizeof(data)));
+  assert(!bs::pushScanMatch(r.core->queue(), 1, kMac, 0, "HRM", 3));
+  fillQueueToResync(*r.core);                          // evicts every NOTIFY, then drops one
+  const bs::QueueCounters q = r.core->queue().counters();
+  BikeSensor::Stats s = r.core->stats();
+  assert(s.notifiesDropped == 1u + BBS_EVENT_QUEUE_DEPTH && s.matchesDropped == 1);
+  assert(s.eventsDropped == 1 && q.eventsDropped == 1);
+  r.update();
+  s = r.core->stats();
+  assert(s.notifiesDropped == 1u + BBS_EVENT_QUEUE_DEPTH && s.matchesDropped == 1);
+  assert(s.eventsDropped == 1);
+}
+
+// §4 end() steps 1–6 and begin() after end().
+static void testBeginEnd() {
+  {
+    Rig r;                                             // begin(): stack, clients, server
+    assert(r.core->begin("Bike X", 0x07, Mode::MAC));
+    assert(strcmp(r.port.gapName, "bike-x-da4eb580") == 0);
+    assert(r.port.stackInits == 1 && r.port.opens == 1 && r.port.serverStarts == 1);
+    assert(!r.core->begin("Bike X", 0x07, Mode::MAC) && r.port.opens == 1);
+    r.update();
+    assert(r.port.advOn);
+  }
+  {
+    Rig r;                                             // initStack() first: begin() keeps its name
+    assert(r.core->initStack("first") && r.core->initStack("second"));
+    assert(r.port.stackInits == 1 && strcmp(r.port.gapName, "first-da4eb580") == 0);
+    r.port.openOk = false;
+    assert(!r.core->begin("other", 0x07, Mode::MAC));
+    r.port.openOk = true;
+    assert(r.core->begin("other", 0x07, Mode::MAC));   // a retry
+    assert(r.port.stackInits == 1 && r.port.opens == 2 && strcmp(r.port.advName, "first-da4eb580") == 0);
+  }
+  {
+    Rig r;                                             // happy path, then begin() again
+    assert(r.core->begin("homewind", 0x07, Mode::MAC));
+    r.update();
+    r.toSubscribed();
+    r.port.clock = r.now;
+    r.port.onTick = [&r] {                             // the link's DISCONNECTED arrives
+      if (r.port.slotDisconnects[kHr] > 0 && r.port.connected) r.discEv(r.gen());
+    };
+    g_eventCount = 0;
+    r.core->pause();
+    r.core->quiesce(r.now);
+    r.core->resume();                                  // rejected: the pause latch stays
+    assert(r.core->end());
+    assert(r.port.closes == 1 && r.port.slotDisconnects[kHr] == 1 && !r.port.advOn);
+    expectEvent(0, EventType::SENSOR_DISCONNECTED, SlotState::FOUND, 0x208);
+    assert(r.core->end() && r.port.closes == 1);       // already down
+    r.port.advOn = true;
+    r.update();                                        // nothing touches the stack
+    assert(r.port.advOn && r.port.advStops == 1 && r.port.connects == 1);
+    r.port.advOn = false;
+    assert(!r.core->addByMac(SensorType::HEART_RATE, kMacStr, 0, nullptr, r.now));
+    assert(!r.core->startServer() && r.port.serverStarts == 1);
+    assert(r.core->begin("homewind", 0x01, Mode::NAME));   // latch cleared, fresh session
+    assert(r.port.stackInits == 2 && r.port.opens == 2 && r.port.serverStarts == 2);
+    assert(r.state() == SlotState::EMPTY && r.core->mode() == Mode::NAME && !r.core->quiesced());
+    assert(!r.core->addByName(SensorType::SPEED_CADENCE, "CSC", r.now));   // new mask
+    assert(r.core->addByName(SensorType::HEART_RATE, "HRM", r.now));
+    r.update();
+    assert(!r.port.advOn && r.core->scan().owner() == ScanOwner::NAME_SCAN);   // still paused
+    r.core->resume();
+    r.update();
+    assert(r.port.advOn);
+  }
+  {
+    Rig r;                                             // step 2 timeout: no teardown, latch stays
+    assert(r.core->begin("homewind", 0x07, Mode::MAC));
+    r.toConnecting();
+    r.port.clock = 5000;
+    assert(!r.core->end());
+    assert(r.port.clock - 5000 >= bs::kConnectWatchdogMs && r.port.closes == 0);
+    assert(r.state() == SlotState::CANCELLING);
+    assert(!r.core->begin("homewind", 0x07, Mode::MAC) && r.port.opens == 1);
+    assert(!r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 0, nullptr, r.now));
+    r.failEv(r.gen());
+    r.update();
+    assert(r.core->quiesced());
+  }
+  {
+    Rig r;                                             // step 4 timeout: DISCONNECTED never comes
+    assert(r.core->begin("homewind", 0x07, Mode::MAC));
+    r.toSubscribed();
+    r.port.clock = 5000;
+    assert(!r.core->end());
+    assert(r.port.clock - 5000 >= bs::kEndDisconnectMs && r.port.closes == 0);
+    assert(r.state() == SlotState::SUBSCRIBED && r.port.slotDisconnects[kHr] == 1);
+    assert(!r.core->begin("homewind", 0x07, Mode::MAC));
+  }
+  {
+    Rig r;                                             // pending remove: isConnected() already
+    assert(r.core->begin("homewind", 0x07, Mode::MAC));   // false, still waited for
+    r.toSubscribed();
+    r.remove();
+    r.port.connected = false;                          // DISCONNECTING
+    bool delivered = false;
+    r.port.onTick = [&r, &delivered] {
+      if (r.port.ticks == 5) {
+        delivered = true;
+        r.discEv(r.gen());
+      }
+    };
+    assert(r.core->end() && delivered && r.port.closes == 1 && r.state() == SlotState::EMPTY);
+  }
+  {
+    Rig r;                                             // failed deinit: not down
+    assert(r.core->begin("homewind", 0x07, Mode::MAC));
+    r.port.closeOk = false;
+    assert(!r.core->end() && r.port.closes == 1);
+    assert(!r.core->begin("homewind", 0x07, Mode::MAC));
+    r.port.closeOk = true;
+    assert(r.core->end() && r.port.closes == 2);
+  }
+  {
+    Rig r;                                             // quiesce() without end(): one-way
+    r.core->quiesce(r.now);
+    assert(!r.core->begin("homewind", 0x07, Mode::MAC) && r.port.stackInits == 0);
+  }
+}
+
 int main() {
   testAddByMac();
   testHappyPath();
@@ -4337,5 +4746,13 @@ int main() {
   testDiscoveryStaleEpochWhilePending();
   testDiscoveryFromCallback();
   testDiscoveryConcurrentReports();
+  testPauseResume();
+  testStopNeverHeld();
+  testQuiesceFinishesDiscovery();
+  testQuiesceSlotsAndScans();
+  testQuiesceResyncDiscovering();
+  testScanning();
+  testStatsDropCounters();
+  testBeginEnd();
   return 0;
 }

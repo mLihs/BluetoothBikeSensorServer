@@ -54,7 +54,7 @@ void printStatus() {
                 "Basic_MAC_V3 needs BBS_COMPILE_HEART_RATE");
   const bs::internal::SensorSlot& slot =
       core.slot(bs::internal::slotIndex(bs::SensorType::HEART_RATE));
-  const bs::Stats& s = core.stats();
+  const bs::Stats s = core.stats();
   Serial.printf("state=%u battery=%u failCount=%u lastReason=0x%x heap=%lu\n",
                 static_cast<unsigned>(slot.state), slot.battery, slot.failCount,
                 slot.lastDisconnectReason, static_cast<unsigned long>(ESP.getFreeHeap()));
@@ -69,9 +69,9 @@ void setup() {
   delay(1000);
   Serial.println("\nBasic_MAC_V3 (experimental V3 internals)");
 
-  NimBLEDevice::init("");
-  if (!port.begin(core)) {
-    Serial.println("NimBLEPort::begin failed");
+  port.attach(core);
+  if (!core.begin("homewind", bs::typeBit(bs::SensorType::HEART_RATE), bs::Mode::MAC)) {
+    Serial.println("Core::begin failed");
     return;
   }
   core.setEventCallback(onEvent);

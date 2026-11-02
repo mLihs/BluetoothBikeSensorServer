@@ -6,7 +6,7 @@
 
 // The NimBLE calls the state machine needs, behind an Arduino-free interface.
 // Device: NimBLEPort (BBSNimBLEPort.h). Host tests: a fake. All methods run on
-// the update() task.
+// the update() task, except discActive() (any task, for scanning()).
 
 namespace BikeSensor {
 namespace internal {
@@ -57,6 +57,17 @@ class BlePort {
   // setValue() + notify() on the local measurement characteristic of the
   // slot's type; no-op if there is none.
   virtual void relay(uint8_t slot, const uint8_t* data, uint8_t len) = 0;
+
+  // Lifecycle (§4 initStack()/begin()/end()).
+  virtual bool stackReady() = 0;                     // NimBLEDevice::isInitialized()
+  virtual bool stackInit(const char* gapName) = 0;   // NimBLEDevice::init()
+  // Per-slot clients, reset detector, GATT timer; existing ones are kept.
+  virtual bool open() = 0;
+  // end() steps 5 and 6: delete the GATT timer, NimBLEDevice::deinit(true).
+  virtual bool close() = 0;
+  // end() drives update() itself: the clock and a one-tick wait between passes.
+  virtual uint32_t nowMs() = 0;
+  virtual void waitTick() = 0;
 
  protected:
   ~BlePort() = default;

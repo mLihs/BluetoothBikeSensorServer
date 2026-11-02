@@ -15,11 +15,11 @@
 #include "BBSScanController.h"
 #include "BBSTypes.h"
 
-// One slot per compiled sensor type, one mode for all slots (§10 steps 3–6):
+// One slot per compiled sensor type, one mode for all slots (§10 steps 3–7):
 // slot machine (§5.2), event handling (§5.1), resync (§3.2), HOST_RESET, the
 // app lifecycle, DATA and central events (§4), HR/CSC data callbacks, relay,
 // server name and advertising desired state (§5.4), discovery (§3.3, §5.3),
-// driven through BlePort. Arduino-free; the caller passes millis() as
+// pause/quiesce and begin()/end() (§4), driven through BlePort. Arduino-free; the caller passes millis() as
 // `now`. Everything except the members marked "any task" runs on the update()
 // task.
 
@@ -79,6 +79,7 @@ inline bool advertisingFits(size_t nameLen, uint8_t typeMask) {
 }
 
 constexpr uint32_t kConnectWatchdogMs = BBS_CONNECT_TIMEOUT_MS + 2000;
+constexpr uint32_t kEndDisconnectMs = 3000;   // §4 end() step 4
 constexpr uint32_t kTransientRetryMs = 500;
 constexpr uint32_t kBackoffMinMs = 1000;
 constexpr uint32_t kBackoffMaxMs = 30000;
@@ -114,8 +115,8 @@ struct SensorSlot {
 
 class Core {
  public:
-  // mode and typeMask: the begin() arguments, fixed for the lifetime of the
-  // Core (§4 rev 25). Types outside the compiled ones are ignored.
+  // mode and typeMask: the begin() arguments (§4 rev 25); begin() sets them
+  // again. Types outside the compiled ones are ignored.
   Core(BlePort& port, Mode mode, uint8_t typeMask)
       : port_(port), mode_(mode), enabled_(typeMask & kCompiledMask), scan_(mode) {
     const SensorType types[] = {SensorType::HEART_RATE, SensorType::SPEED_CADENCE,
@@ -131,13 +132,13 @@ class Core {
 
   // MAC mode only. addrType: 0 public, 1 random, -1 auto-detect from the MAC
   // (2.x rule: top two bits 11 → random). The same type on a non-EMPTY slot
-  // replaces the identity (§4); a MAC held by another slot or a type outside
-  // the begin() mask returns false.
+  // replaces the identity (§4); a MAC held by another slot, a type outside
+  // the begin() mask or quiesce returns false.
   bool addByMac(SensorType type, const char* mac, int8_t addrType, const char* name,
                 uint32_t now) {
     const int i = enabledSlot(type);
     uint8_t bytes[6];
-    if (i < 0 || mode_ != Mode::MAC) return false;
+    if (i < 0 || quiesced_ || mode_ != Mode::MAC) return false;
     if (!parseMac(mac, bytes) || addrType < -1 || addrType > 1) return false;
     if (heldByOtherSlot(bytes, static_cast<uint8_t>(i))) return false;
     SensorSlot& s = slots_[i];
@@ -159,12 +160,14 @@ class Core {
   }
 
   // NAME mode only. The name is matched exactly and case-sensitively, stored
-  // truncated to 31 bytes; a name another slot holds or a type outside the
-  // begin() mask returns false. The same type on a non-EMPTY slot replaces the
-  // identity and goes to IDLE (§4).
+  // truncated to 31 bytes; a name another slot holds, a type outside the
+  // begin() mask or quiesce returns false. The same type on a non-EMPTY slot
+  // replaces the identity and goes to IDLE (§4).
   bool addByName(SensorType type, const char* name, uint32_t now) {
     const int i = enabledSlot(type);
-    if (i < 0 || mode_ != Mode::NAME || name == nullptr || name[0] == '\0') return false;
+    if (i < 0 || quiesced_ || mode_ != Mode::NAME || name == nullptr || name[0] == '\0') {
+      return false;
+    }
     char stored[sizeof(SensorSlot::name)];
     copyName(stored, name);
     if (nameHeldByOtherSlot(stored, static_cast<uint8_t>(i))) return false;
@@ -216,12 +219,12 @@ class Core {
   // the enabled types. Advertising follows the desired state from the next
   // update() on. False if the name and UUIDs do not fit (nothing is created
   // then), the stack is not idle before the first server start (rev 28 guard;
-  // NimBLE asserts otherwise), or the server or the advertising data cannot be
-  // set up.
+  // NimBLE asserts otherwise), the server or the advertising data cannot be
+  // set up, or end() has torn the stack down.
   bool startServer() {
     char name[kServerNameSize];
     serverName(name, sizeof(name));
-    if (!advertisingFits(strlen(name), localTypes())) return false;
+    if (down_ || !advertisingFits(strlen(name), localTypes())) return false;
     if (!gattStarted_ && !stackIdle()) return false;
     if (!port_.serverStart(localTypes())) return false;
     gattStarted_ = true;
@@ -232,11 +235,12 @@ class Core {
 
   // §5.4: rebuilds the advertising data (name + UUIDs) and restarts
   // advertising under the same rules as the enforcement (desired state, start
-  // hold). True if the new data was applied; false if the server is not
-  // started, the data does not fit (previous data and advertising stay
-  // untouched) or NimBLE refused a field. A failed restart is not a failure.
+  // hold). True if the new data was applied; false under quiesce, if the
+  // server is not started, the data does not fit (previous data and
+  // advertising stay untouched) or NimBLE refused a field. A failed restart
+  // is not a failure.
   bool refreshAdvertising(uint32_t now) {
-    if (!serverStarted_) return false;
+    if (!serverStarted_ || quiesced_) return false;
     char name[kServerNameSize];
     serverName(name, sizeof(name));
     if (!advertisingFits(strlen(name), localTypes())) return false;
@@ -371,14 +375,142 @@ class Core {
     }
   }
 
+  // §4 initStack(): NimBLE init with the GAP name "<prefix>-%08lx", prefix
+  // from deviceName. Skipped, prefix unchanged, if the stack is up.
+  bool initStack(const char* deviceName) {
+    if (port_.stackReady()) return true;
+    setNamePrefix(deviceName);
+    char name[kServerNameSize];
+    serverName(name, sizeof(name));
+    return port_.stackInit(name);
+  }
+
+  // §4 begin(): stack init if needed, clients and GATT timer, server. A fresh
+  // session: every slot EMPTY, no queued events, the given mode and types.
+  // False while begun and while quiesced without a successful end(), so the
+  // latch is cleared only after end() returned true.
+  bool begin(const char* deviceName, uint8_t typeMask, Mode mode) {
+    if (begun_ || (quiesced_ && !down_) || !initStack(deviceName) || !port_.open()) {
+      return false;
+    }
+    mode_ = mode;
+    enabled_ = typeMask & kCompiledMask;
+    scan_.reset(mode);
+    for (SensorSlot& s : slots_) clearSlot(s);
+    Event ev;
+    while (queue_.pop(ev)) {}
+    queue_.takeResync();
+    {
+      MuxGuard guard(tableMux_);
+      quiesced_ = false;
+      centralCount_ = 0;
+    }
+    down_ = false;
+    advHeld_ = false;
+    begun_ = startServer();
+    return begun_;
+  }
+
+  // §4 end(), update() task only, never the NimBLE host task. False (not torn
+  // down, reboot) after a timeout in step 2 or 4 or a failed teardown; the
+  // quiesce latch stays either way.
+  bool end() {
+    if (down_) return true;
+    quiesce(port_.nowMs());
+    if (!driveUntil(kConnectWatchdogMs, [this] { return quiesced(); })) return false;
+    // isConnected() is false while DISCONNECTING; a SUBSCRIBED slot still
+    // waits for its DISCONNECTED.
+    awaitDisc_ = 0;
+    for (uint8_t i = 0; i < kSlotCount; ++i) {
+      if (!port_.isConnected(i) && slots_[i].state != SlotState::SUBSCRIBED) continue;
+      port_.disconnect(i);
+      awaitDisc_ |= static_cast<uint8_t>(1u << i);
+    }
+    if (!driveUntil(kEndDisconnectMs, [this] { return awaitDisc_ == 0; }) || !port_.close()) {
+      return false;
+    }
+    serverStarted_ = gattStarted_ = begun_ = false;
+    down_ = true;
+    return true;
+  }
+
+  // §5.5, 2.x semantics: advertising only; scans, connects and discovery go on.
+  void pause() {
+    {
+      MuxGuard guard(tableMux_);
+      paused_ = true;
+    }
+    if (port_.advActive()) port_.advStop();
+  }
+
+  // Advertising follows the desired state from the next update(). No-op under quiesce.
+  void resume() {
+    MuxGuard guard(tableMux_);
+    if (!quiesced_) paused_ = false;
+  }
+
+  // §4 quiesce(): one-way until end() + begin(), idempotent. DISCOVERY_DONE
+  // (QUIESCED) follows all five steps. A DISCOVERING slot stays there until
+  // its DISCONNECTED, without a GATT pass.
+  void quiesce(uint32_t now) {
+    if (quiesced_) return;
+    {
+      MuxGuard guard(tableMux_);
+      quiesced_ = true;
+    }
+    if (port_.advActive()) port_.advStop();
+    const bool discovery = scan_.discoveryOwner();
+    DiscoveryDone done{};
+    if (discovery) {
+      scan_.cancelDiscovery(port_);
+      done = closeDiscovery(FinishReason::QUIESCED);
+    }
+    scan_.stopWindow(port_);
+    for (uint8_t i = 0; i < kSlotCount; ++i) {
+      SensorSlot& s = slots_[i];
+      if (s.state == SlotState::FOUND || s.state == SlotState::STOPPING_FOR_CONNECT) {
+        enter(s, waitState(), now);
+      } else if (s.state == SlotState::CONNECTING) {
+        port_.cancelConnect(i);
+        enter(s, SlotState::CANCELLING, now);
+      } else if (s.state == SlotState::DISCOVERING) {
+        port_.disconnect(i);
+      }
+    }
+    if (discovery) emitDone(done);
+  }
+
+  // §4 quiesced(). update() task: reads the slot states.
+  bool quiesced() {
+    return quiesced_ && scan_.owner() == ScanOwner::OFF && !port_.discActive() &&
+           !port_.advActive() && !linkBusy();
+  }
+
+  // Any task.
+  bool scanning() { return scan_.owner() != ScanOwner::OFF || port_.discActive(); }
+
+  // A copy, with the event queue's drop counters (§3.2). update() task.
+  Stats stats() {
+    Stats out = stats_;
+    const QueueCounters q = queue_.counters();
+    out.eventsDropped = q.eventsDropped;
+    out.notifiesDropped = q.notifiesDropped;
+    out.matchesDropped = q.matchesDropped;
+    return out;
+  }
+
+  // Under quiesce: drain, advertising off, cancellations and disconnects; no
+  // GATT pass, connect or scan. Nothing after a successful end().
   void update(uint32_t now) {
+    if (down_) return;
     if (queue_.takeResync()) resync(now);
     Event ev;
     for (uint8_t i = 0; i < BBS_EVENT_QUEUE_DEPTH && queue_.pop(ev); ++i) handle(ev, now);
     enforceAdvertising(now);
-    gattStep(now);
+    if (!quiesced_) gattStep(now);
     for (uint8_t i = 0; i < kSlotCount; ++i) advanceSlot(i, now);
     orphanSweep();
+    if (quiesced_) return;
     FinishReason finish;
     if (scan_.advance(port_, now, needScan(), scanBlocked(), linkBusy(), stats_, finish)) {
       tryFinish(finish);
@@ -424,7 +556,6 @@ class Core {
   GattWatchdog& watchdog() { return watchdog_; }
   const SensorSlot& slot(uint8_t i) const { return slots_[i]; }
   const ScanController& scan() const { return scan_; }
-  const Stats& stats() const { return stats_; }
 
  private:
   enum class Outcome : uint8_t { NEUTRAL, CONNECT_FAIL, LINK_FAIL };
@@ -702,6 +833,7 @@ class Core {
       case Ev::DISCONNECTED:
         if (ev.slot < kSlotCount &&
             ev.gen == slots_[ev.slot].attemptGen.load(std::memory_order_relaxed)) {
+          if (ev.kind != Ev::CONNECTED) awaitDisc_ &= static_cast<uint8_t>(~(1u << ev.slot));
           onClientEvent(ev.slot, ev, now);
         }
         break;
@@ -1015,8 +1147,11 @@ class Core {
     SensorSlot& s = slots_[i];
     switch (s.state) {
       case SlotState::FOUND: {
-        // §5.2: no connect while a discovery is pending or open.
-        if (now - s.holdFromMs < s.holdMs || anyInFlight() || scan_.discoveryOwner()) return;
+        // §5.2: no connect while a discovery is pending or open, or under quiesce.
+        if (quiesced_ || now - s.holdFromMs < s.holdMs || anyInFlight() ||
+            scan_.discoveryOwner()) {
+          return;
+        }
         const int rc = scan_.stopForConnect(port_, now);
         if (rc != 0 && rc != kHsEAlready) {
           stoppingSafetyExit(s, now);
@@ -1081,6 +1216,19 @@ class Core {
     }
   }
 
+  // end(): update() passes until done() or ms elapsed, one tick apart.
+  template <typename Done>
+  bool driveUntil(uint32_t ms, Done done) {
+    const uint32_t start = port_.nowMs();
+    for (;;) {
+      const uint32_t now = port_.nowMs();
+      update(now);
+      if (done()) return true;
+      if (now - start >= ms) return false;
+      port_.waitTick();
+    }
+  }
+
   // §5.1 step 6. Never in CONNECTING (NimBLE reports connected before onConnect).
   void orphanSweep() {
     for (uint8_t i = 0; i < kSlotCount; ++i) {
@@ -1094,8 +1242,8 @@ class Core {
   }
 
   BlePort& port_;
-  const Mode mode_;
-  const uint8_t enabled_;               // begin() typeMask ∩ compiled
+  Mode mode_;
+  uint8_t enabled_;                     // begin() typeMask ∩ compiled
   EventQueue queue_;
   GattWatchdog watchdog_;
   ScanController scan_;
@@ -1121,8 +1269,11 @@ class Core {
   bool gattStarted_ = false;            // port_.serverStart() succeeded once
   bool advHeld_ = false;                // last advStart() failed (rev 28 hold)
   uint32_t advHeldSinceMs_ = 0;
-  bool paused_ = false;                 // pause latch (§5.5)
-  bool quiesced_ = false;               // quiesce latch (§4)
+  bool paused_ = false;                 // pause latch (§5.5), written under tableMux_
+  bool quiesced_ = false;               // quiesce latch (§4), written under tableMux_
+  bool begun_ = false;                  // begin() succeeded, no successful end() since
+  bool down_ = false;                   // end() tore the stack down; begin() not yet
+  uint8_t awaitDisc_ = 0;               // end() step 4: slots still owing a DISCONNECTED
 };
 
 }  // namespace internal
