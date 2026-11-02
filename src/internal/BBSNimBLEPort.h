@@ -136,8 +136,10 @@ class NimBLEPort final : public BlePort {
       }
       server_ = server;
     }
-    // Must run before the first scan or connect: ble_gatts_start() fails with
-    // BLE_HS_EBUSY while any advertising, scan or connection exists.
+    // The first start must happen while the stack is idle (no advertising,
+    // scan, connect or connection); otherwise NimBLE asserts (ble_svc_gap_init).
+    // Retry only after an unexpected error, never in a loop: each failed first
+    // start re-runs ble_gatts_count_cfg and inflates NimBLE's pool sizes.
     return server_->start();
   }
 

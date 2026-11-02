@@ -214,12 +214,16 @@ class Core {
   // §4 startServer(), device part: local services and advertising data for
   // the enabled types. Advertising follows the desired state from the next
   // update() on. False if the name and UUIDs do not fit (nothing is created
-  // then), or the server or the advertising data cannot be set up.
+  // then), the stack is not idle before the first server start (rev 28 guard;
+  // NimBLE asserts otherwise), or the server or the advertising data cannot be
+  // set up.
   bool startServer() {
     char name[kServerNameSize];
     serverName(name, sizeof(name));
     if (!advertisingFits(strlen(name), localTypes())) return false;
+    if (!gattStarted_ && !stackIdle()) return false;
     if (!port_.serverStart(localTypes())) return false;
+    gattStarted_ = true;
     if (!port_.advSetData(name, localTypes())) return false;
     serverStarted_ = true;
     return true;
@@ -239,6 +243,8 @@ class Core {
       advHeld_ = false;                 // a start has succeeded since the failure
       port_.advStop();
     }
+    // Unreachable after the budget check in NimBLE 2.5.2 (setName truncates
+    // only past 29 bytes); if it happens, advertising restarts with partial data.
     const bool dataOk = port_.advSetData(name, localTypes());
     enforceAdvertising(now);
     return dataOk;
@@ -653,6 +659,16 @@ class Core {
   // resync. Also stops NimBLE's own restarts (§0.9).
   bool advertisingDesired() const { return serverStarted_ && !paused_ && !quiesced_; }
 
+  // ble_gatts_mutable(): no advertising, discovery or connect procedure and no
+  // established connection.
+  bool stackIdle() {
+    if (port_.advActive() || port_.discActive() || port_.connActive()) return false;
+    for (uint8_t i = 0; i < kSlotCount; ++i) {
+      if (port_.isConnected(i)) return false;
+    }
+    return true;
+  }
+
   // Slot of a type in the begin() mask (rev 28), or -1.
   int enabledSlot(SensorType type) const {
     return (enabled_ & typeBit(type)) != 0 ? slotIndex(type) : -1;
@@ -926,6 +942,7 @@ class Core {
   char prefix_[kNamePrefixMax + 1] = "homewind";   // under tableMux_
   uint8_t centralCount_ = 0;            // under tableMux_
   bool serverStarted_ = false;
+  bool gattStarted_ = false;            // port_.serverStart() succeeded once
   bool advHeld_ = false;                // last advStart() failed (rev 28 hold)
   uint32_t advHeldSinceMs_ = 0;
   bool paused_ = false;                 // pause latch (§5.5)

@@ -2843,13 +2843,12 @@ static void testAdvertisingHoldReleases() {
   };
   for (const Release& rel : releases) {
     Rig r;
-    r.toSubscribed();
-    assert(r.core->startServer());
+    assert(r.core->startServer());                     // idle: before any link (rev 28 guard)
     r.port.advStartOk = false;
+    r.toSubscribed();
+    assert(r.port.advStarts == 1);                     // failed once, held through the connect
     r.update();
     assert(r.port.advStarts == 1);
-    r.update();
-    assert(r.port.advStarts == 1);                     // held
     r.port.advStartOk = true;
     rel.apply(r);
     r.update();
@@ -2857,10 +2856,9 @@ static void testAdvertisingHoldReleases() {
   }
   {
     Rig r;                                             // stale DISCONNECTED and a plain
-    r.toConnecting();                                  // CONNECT_FAIL keep the hold
-    assert(r.core->startServer());
+    assert(r.core->startServer());                     // CONNECT_FAIL keep the hold
     r.port.advStartOk = false;
-    r.update();
+    r.toConnecting();
     assert(r.port.advStarts == 1);
     r.port.advStartOk = true;
     r.discEv(static_cast<uint16_t>(r.gen() - 1), 0x08);
@@ -2872,6 +2870,86 @@ static void testAdvertisingHoldReleases() {
     assert(bs::pushCentralConnect(r.core->queue()));
     r.update();
     assert(r.port.advStarts == 1);
+  }
+  {
+    Rig r;                                             // CONNECT_FAIL in CANCELLING keeps it
+    assert(r.core->startServer());
+    r.port.advStartOk = false;
+    r.toConnecting();
+    assert(r.port.advStarts == 1);
+    r.port.advStartOk = true;
+    r.remove();
+    assert(r.state() == SlotState::CANCELLING);
+    r.failEv(r.gen(), 13);
+    r.update();
+    assert(r.state() == SlotState::EMPTY && r.port.advStarts == 1);
+  }
+  {
+    Rig r;                                             // gen-current DISCONNECTED in CONNECTING
+    assert(r.core->startServer());                     // (link lost before onConnect) ends it
+    r.port.advStartOk = false;
+    r.toConnecting();
+    assert(r.port.advStarts == 1);
+    r.port.advStartOk = true;
+    r.discEv(r.gen(), 0x08);
+    r.update();
+    assert(r.state() != SlotState::CONNECTING && r.port.advStarts == 2 && r.port.advOn);
+  }
+  {
+    Rig r;                                             // expiry across the millis() wrap
+    r.now = UINT32_MAX - 100;
+    assert(r.core->startServer());
+    r.port.advStartOk = false;
+    const uint32_t failedAt = r.now;
+    r.update();
+    assert(r.port.advStarts == 1);
+    r.port.advStartOk = true;
+    r.at(failedAt + BBS_SCAN_START_BACKOFF_MS - 1);    // wrapped past 0
+    assert(r.now < failedAt && r.port.advStarts == 1);
+    r.at(failedAt + BBS_SCAN_START_BACKOFF_MS);
+    assert(r.port.advStarts == 2 && r.port.advOn);
+  }
+}
+
+// Rev 28 guard: the first server start only while the stack is idle
+// (ble_gatts_mutable()); NimBLE asserts otherwise.
+static void testStartServerIdleGuard() {
+  struct Busy { const char* what; void (*apply)(FakePort&, bool); };
+  const Busy busy[] = {
+      {"advertising", [](FakePort& p, bool on) { p.advOn = on; }},
+      {"discovery", [](FakePort& p, bool on) { p.discOn = on; }},
+      {"connect", [](FakePort& p, bool on) { p.connOn = on; }},
+      {"HR client", [](FakePort& p, bool on) { p.linkUp[kHr] = on; }},
+      {"CSC client", [](FakePort& p, bool on) { p.linkUp[kCsc] = on; }},
+      {"last slot client", [](FakePort& p, bool on) { p.linkUp[bs::kSlotCount - 1] = on; }},
+  };
+  for (const Busy& b : busy) {
+    Rig r;
+    b.apply(r.port, true);
+    assert(!r.core->startServer());
+    assert(r.port.serverStarts == 0 && r.port.advDataSets == 0);
+    r.update();
+    assert(r.port.advStarts == 0);
+    b.apply(r.port, false);
+    assert(r.core->startServer() && r.port.serverStarts == 1 && r.port.advDataSets == 1);
+  }
+  {
+    Rig r;                                             // started once: no guard any more
+    r.port.advDataOk = false;
+    assert(!r.core->startServer() && r.port.serverStarts == 1);
+    r.port.advDataOk = true;
+    r.port.discOn = true;
+    r.port.linkUp[kHr] = true;
+    assert(r.core->startServer() && r.port.serverStarts == 2);
+    assert(r.core->startServer() && r.port.serverStarts == 3);
+  }
+  {
+    Rig r;                                             // a failed first start keeps the guard
+    r.port.serverOk = false;
+    assert(!r.core->startServer() && r.port.serverStarts == 1);
+    r.port.serverOk = true;
+    r.port.connOn = true;
+    assert(!r.core->startServer() && r.port.serverStarts == 1);
   }
 }
 
@@ -3569,6 +3647,7 @@ int main() {
   testAdvertisingDesiredState();
   testAdvertisingAfterHostResetAndResync();
   testAdvertisingHoldReleases();
+  testStartServerIdleGuard();
   testAddOutsideMask();
   testHeartRateData();
   testCadenceData();
