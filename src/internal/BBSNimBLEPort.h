@@ -167,11 +167,11 @@ class NimBLEPort final : public BlePort {
   void gattTimerStop() override { esp_timer_stop(gattTimer_); }
 
   // One local service per type in typeMask (the Core passes begin() mask ∩
-  // compiled; rev 31: no runtime service changes), §5.4: measurement (NOTIFY); CSC also Feature 0x2A5C, CP also
-  // Feature 0x2A65 and Sensor Location 0x2A5D (READ, defaults until a GATT
-  // pass). Each measurement value is pre-sized to BBS_NOTIFY_MAX_LEN, so
-  // setValue() in relay() never reallocates (NimBLEAttValue grows only past
-  // its capacity).
+  // compiled; rev 31: no runtime service changes), §5.4: measurement
+  // (NOTIFY); CSC also Feature 0x2A5C, CP also Feature 0x2A65 and Sensor
+  // Location 0x2A5D (READ, defaults until a GATT pass). Each measurement value
+  // is pre-sized to BBS_NOTIFY_MAX_LEN, so setValue() in relay() never
+  // reallocates (NimBLEAttValue grows only past its capacity).
   bool serverStart(uint8_t typeMask) override {
     if (server_ == nullptr) {
       NimBLEServer* server = NimBLEDevice::createServer();

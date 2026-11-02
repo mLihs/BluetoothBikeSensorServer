@@ -228,7 +228,8 @@ class Core {
         return;
       default:  // IDLE, WAIT_SCAN, FOUND, STOPPING_FOR_CONNECT (its stop already set the scan OFF)
         clearSlot(s);
-        refreshCadenceSource();         // remove(CSC) hands back to Power at once
+        refreshCadenceSource();         // remove(CSC) hands back to Power here at once;
+                                        // from a link state when the slot reaches EMPTY
         return;
     }
   }
@@ -745,7 +746,8 @@ class Core {
   // The single exit of an attempt or link. Resets the per-attempt flags, the
   // crank state and the last measurement (§3.1), then: removing → EMPTY; hard
   // fail → backoff + SENSOR_FAILED; otherwise the wait state, or FOUND for a
-  // pending direct attempt (MAC only).
+  // pending direct attempt (MAC only). The §6b source is current before the
+  // caller's emit (SENSOR_FAILED: never from SUBSCRIBED, never to EMPTY).
   void leaveAttempt(uint8_t i, uint32_t now, Outcome outcome) {
     SensorSlot& s = slots_[i];
     const bool direct = s.directRetry;
@@ -767,6 +769,7 @@ class Core {
     } else {
       enter(s, waitState(), now);
     }
+    refreshCadenceSource();
   }
 
   // Outcome of a cancel or of a link that ends before SENSOR_CONNECTED: hard
@@ -1281,6 +1284,7 @@ class Core {
         copyFeature(s.type, result);
         s.failCount = 0;
         enter(s, SlotState::SUBSCRIBED, now);
+        refreshCadenceSource();
         emit(EventType::SENSOR_CONNECTED, s.type);
         return;
       }

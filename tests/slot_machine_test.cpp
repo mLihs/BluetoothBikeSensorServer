@@ -210,6 +210,7 @@ struct Recorded {
   uint32_t generation;
   bool discovering;                                    // discovering() when the callback ran
   uint8_t tableCount;                                  // discoveredCount() when the callback ran
+  bool providesCadence;                                // providesCadence() when the callback ran
 };
 static Recorded g_events[32];
 static int g_eventCount = 0;
@@ -220,7 +221,8 @@ static void onEvent(const EventInfo& info) {
   const int slot = bs::slotIndex(info.sensorType);     // HOST_RESET, CENTRAL_*, DISCOVERY_DONE: HR slot
   const SlotState state = g_core->slot(slot >= 0 ? static_cast<uint8_t>(slot) : kHr).state;
   g_events[g_eventCount++] = {info.type, info.sensorType, info.reason, state, info.count,
-                              info.generation, g_core->discovering(), g_core->discoveredCount()};
+                              info.generation, g_core->discovering(), g_core->discoveredCount(),
+                              g_core->providesCadence()};
 }
 
 static int countEvents(EventType type) {
@@ -3583,6 +3585,16 @@ static bool crankEv(Rig& r, uint16_t revs, uint16_t t) {
   return notifyEv(r, p, sizeof(p), kPowerSlot);
 }
 
+// providesCadence() inside the last recorded event of that type and sensor; -1: none.
+static int providesAt(EventType type, SensorType sensorType) {
+  for (int i = g_eventCount - 1; i >= 0; --i) {
+    if (g_events[i].type == type && g_events[i].sensorType == sensorType) {
+      return g_events[i].providesCadence ? 1 : 0;
+    }
+  }
+  return -1;
+}
+
 static BikeSensor::PowerSample g_powerSamples[8];
 static int g_powerCalls = 0, g_cadAtPower = -1;
 static void onPower(const BikeSensor::PowerSample& s) {
@@ -3813,6 +3825,23 @@ static void testCadenceSource() {
     r.core->queue().requestResync();
     r.update();
     assert(!r.core->providesCadence());
+    assert(providesAt(EventType::SENSOR_DISCONNECTED, SensorType::POWER) == 0);
+  }
+  {
+    Rig r;                                             // the source is current inside the events
+    powerToSubscribed(r);
+    assert(providesAt(EventType::SENSOR_CONNECTED, SensorType::POWER) == 1);
+    r.now += BBS_SLEEP_SCAN_DURATION_MS + BBS_SLEEP_SCAN_INTERVAL_MS;
+    cscToSubscribed(r);
+    r.core->remove(SensorType::SPEED_CADENCE, r.now);  // from SUBSCRIBED: CSC until EMPTY
+    assert(!r.core->providesCadence());
+    r.discEv(r.cscGen(), 0x16, kCsc);
+    r.update();
+    assert(r.cscState() == SlotState::EMPTY);
+    assert(providesAt(EventType::SENSOR_DISCONNECTED, SensorType::SPEED_CADENCE) == 1);
+    r.discEv(r.core->attemptGen(kPowerSlot), 0x08, kPowerSlot);
+    r.update();
+    assert(providesAt(EventType::SENSOR_DISCONNECTED, SensorType::POWER) == 0);
   }
 }
 
