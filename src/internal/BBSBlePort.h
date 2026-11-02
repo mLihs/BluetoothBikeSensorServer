@@ -41,6 +41,23 @@ class BlePort {
   virtual void gattTimerStart(uint32_t ms) = 0;      // one-shot esp_timer
   virtual void gattTimerStop() = 0;
 
+  // Local GATT server (§5.4). serverStart() creates the server, the local
+  // measurement characteristics of the typeBit()s in typeMask and their
+  // callbacks; true if already done.
+  virtual bool serverStart(uint8_t typeMask) = 0;
+  // Replaces the advertising data with name + the service UUIDs of typeMask.
+  // Takes effect at the next advStart(). False if a field did not fit.
+  virtual bool advSetData(const char* name, uint8_t typeMask) = 0;
+  // Lower 32 bits of the eFuse MAC (2.x BBSIdentity suffix). Any task.
+  virtual uint32_t chipId() = 0;
+  virtual uint8_t centralCount() = 0;                // NimBLEServer::getConnectedCount()
+  virtual bool advActive() = 0;                      // ble_gap_adv_active()
+  virtual bool advStart() = 0;                       // NimBLEAdvertising::start()
+  virtual bool advStop() = 0;                        // NimBLEAdvertising::stop()
+  // setValue() + notify() on the local measurement characteristic of the
+  // slot's type; no-op if there is none.
+  virtual void relay(uint8_t slot, const uint8_t* data, uint8_t len) = 0;
+
  protected:
   ~BlePort() = default;
 };

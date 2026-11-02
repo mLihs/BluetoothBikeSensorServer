@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <esp_timer.h>
 
@@ -7,8 +8,9 @@
 #include "BBSEventPush.h"
 
 // Device side of BlePort (§2): raw-GAP scan with a static callback, one
-// reused client per slot with static callbacks, the reset detector and the
-// GATT esp_timer. NimBLE callbacks only push events (§2 callback rule).
+// reused client per slot with static callbacks, the reset detector, the
+// GATT esp_timer and the local relay server. NimBLE callbacks only push
+// events (§2 callback rule).
 // Header-only until the public BikeSensor.cpp exists, so the 2.x build does
 // not compile or link it.
 
@@ -108,6 +110,67 @@ class NimBLEPort final : public BlePort {
   }
   void gattTimerStop() override { esp_timer_stop(gattTimer_); }
 
+  // HR and CSC measurement characteristics for the types in typeMask (the
+  // Core passes enabled ∩ compiled). Each value is pre-sized to
+  // BBS_NOTIFY_MAX_LEN, so setValue() in relay() never reallocates
+  // (NimBLEAttValue grows only past its capacity).
+  bool serverStart(uint8_t typeMask) override {
+    if (server_ != nullptr) return true;
+    NimBLEServer* server = NimBLEDevice::createServer();
+    if (server == nullptr) return false;
+    server->setCallbacks(&serverCb_, false);
+    server->advertiseOnDisconnect(false);
+    static const uint8_t kZeros[BBS_NOTIFY_MAX_LEN] = {};
+    const SensorType types[] = {SensorType::HEART_RATE, SensorType::SPEED_CADENCE};
+    for (SensorType type : types) {
+      const int slot = slotIndex(type);
+      if (slot < 0 || (typeMask & typeBit(type)) == 0) continue;
+      NimBLEService* service = server->createService(NimBLEUUID(serviceUuid(type)));
+      NimBLECharacteristic* chr = service->createCharacteristic(
+          NimBLEUUID(measurementUuid(type)), NIMBLE_PROPERTY::NOTIFY);
+      chr->setValue(kZeros, sizeof(kZeros));
+      chrCb_[slot].slot = static_cast<uint8_t>(slot);
+      chr->setCallbacks(&chrCb_[slot]);
+      service->start();
+      localChr_[slot] = chr;
+    }
+    server_ = server;
+    return true;
+  }
+
+  // Edits NimBLE's own advertising data (no HCI); start() applies it, also
+  // the restart after a host reset (NimBLEAdvertising::onHostSync).
+  bool advSetData(const char* name, uint8_t typeMask) override {
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    adv->clearData();
+    bool ok = adv->setName(name);
+    const SensorType types[] = {SensorType::HEART_RATE, SensorType::SPEED_CADENCE};
+    for (SensorType type : types) {
+      if ((typeMask & typeBit(type)) != 0) {
+        ok = adv->addServiceUUID(NimBLEUUID(serviceUuid(type))) && ok;
+      }
+    }
+    return ok;
+  }
+
+  uint32_t chipId() override { return static_cast<uint32_t>(ESP.getEfuseMac()); }
+
+  uint8_t centralCount() override {
+    return server_ != nullptr ? server_->getConnectedCount() : 0;
+  }
+  bool advActive() override { return ble_gap_adv_active() != 0; }
+  bool advStart() override { return NimBLEDevice::getAdvertising()->start(); }
+  bool advStop() override { return NimBLEDevice::getAdvertising()->stop(); }
+
+  // notify() without a value: ble_gatts_chr_updated() sends the stored value
+  // to subscribed centrals only; no std::vector, no heap.
+  void relay(uint8_t slot, const uint8_t* data, uint8_t len) override {
+    NimBLECharacteristic* chr = localChr_[slot];
+    if (chr == nullptr) return;
+    chr->setValue(data, len);
+    chr->notify();
+  }
+
  private:
   class ClientCallbacks : public NimBLEClientCallbacks {
    public:
@@ -123,6 +186,25 @@ class NimBLEPort final : public BlePort {
     void onDisconnect(NimBLEClient*, int reason) override {
       pushDisconnected(self_->core_->queue(), slot, self_->core_->attemptGen(slot),
                        clampReason(reason));
+    }
+  };
+
+  class ServerCallbacks : public NimBLEServerCallbacks {
+   public:
+    void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
+      pushCentralConnect(self_->core_->queue());
+    }
+    void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
+      pushCentralDisconnect(self_->core_->queue(), clampReason(reason));
+    }
+  };
+
+  class CharacteristicCallbacks : public NimBLECharacteristicCallbacks {
+   public:
+    uint8_t slot = 0;
+
+    void onSubscribe(NimBLECharacteristic*, NimBLEConnInfo&, uint16_t subValue) override {
+      pushSubscribe(self_->core_->queue(), subValue, slot);
     }
   };
 
@@ -198,6 +280,10 @@ class NimBLEPort final : public BlePort {
   ClientCallbacks clientCb_[kSlots];
   ResetDetector resetDetector_;
   esp_timer_handle_t gattTimer_ = nullptr;
+  NimBLEServer* server_ = nullptr;
+  ServerCallbacks serverCb_;
+  CharacteristicCallbacks chrCb_[kSlots];
+  NimBLECharacteristic* localChr_[kSlots] = {};
 };
 
 }  // namespace internal

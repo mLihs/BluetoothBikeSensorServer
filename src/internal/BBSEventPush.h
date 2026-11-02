@@ -79,8 +79,9 @@ inline bool pushCentralDisconnect(EventQueue& q, int16_t reason) {
   return q.push(makeEvent(Ev::CENTRAL_DISCONNECT, 0, reason, 0));
 }
 
-inline bool pushSubscribe(EventQueue& q, uint16_t subValue) {
-  Event ev = makeEvent(Ev::SUBSCRIBE, 0, 0, 0);
+// slot: the slot whose type owns the local characteristic.
+inline bool pushSubscribe(EventQueue& q, uint16_t subValue, uint8_t slot = 0) {
+  Event ev = makeEvent(Ev::SUBSCRIBE, slot, 0, 0);
   ev.sub.subValue = subValue;
   return q.push(ev);
 }

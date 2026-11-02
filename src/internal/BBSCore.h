@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <cinttypes>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 #include "BBSBlePort.h"
@@ -13,11 +15,12 @@
 #include "BBSScanController.h"
 #include "BBSTypes.h"
 
-// One slot per compiled sensor type, one mode for all slots (§10 steps 3–4):
-// slot machine (§5.2), event handling (§5.1), resync (§3.2), HOST_RESET and
-// the app lifecycle events (§4), driven through BlePort. Arduino-free; the
-// caller passes millis() as `now`. Everything except the members marked
-// "any task" runs on the update() task.
+// One slot per compiled sensor type, one mode for all slots (§10 steps 3–5):
+// slot machine (§5.2), event handling (§5.1), resync (§3.2), HOST_RESET, the
+// app lifecycle, DATA and central events (§4), HR/CSC data callbacks, relay,
+// server name and advertising desired state (§5.4), driven through BlePort. Arduino-free; the caller passes millis() as
+// `now`. Everything except the members marked "any task" runs on the update()
+// task.
 
 namespace BikeSensor {
 namespace internal {
@@ -31,6 +34,38 @@ constexpr int slotIndex(SensorType type) {
          : type == SensorType::POWER
              ? (BBS_COMPILE_POWER ? BBS_COMPILE_HEART_RATE + BBS_COMPILE_CSC : -1)
              : -1;
+}
+
+constexpr uint8_t kCompiledMask =
+    (BBS_COMPILE_HEART_RATE ? typeBit(SensorType::HEART_RATE) : 0) |
+    (BBS_COMPILE_CSC ? typeBit(SensorType::SPEED_CADENCE) : 0) |
+    (BBS_COMPILE_POWER ? typeBit(SensorType::POWER) : 0);
+
+constexpr size_t kServerNameSize = 48;                  // 2.x BBSIdentity buffer
+constexpr size_t kNamePrefixMax = kServerNameSize - 1;  // more cannot reach the name
+
+// 2.x BBSIdentity prefix rule: lowercase, every byte outside [a-z0-9-] → '-',
+// runs of '-' collapsed, leading and trailing '-' trimmed, empty → "homewind".
+// Keeps the first kNamePrefixMax bytes of that result.
+inline void sanitizeNamePrefix(const char* in, char (&out)[kNamePrefixMax + 1]) {
+  size_t n = 0;
+  bool dash = false;                    // a '-' run, written only before [a-z0-9]
+  for (const char* p = in; p != nullptr && *p != '\0'; ++p) {
+    char c = *p;
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) {
+      dash = n > 0;
+      continue;
+    }
+    if (dash && n < kNamePrefixMax) out[n++] = '-';
+    dash = false;
+    if (n < kNamePrefixMax) out[n++] = c;
+  }
+  if (n == 0) {
+    memcpy(out, "homewind", sizeof("homewind"));
+    return;
+  }
+  out[n] = '\0';
 }
 
 constexpr uint32_t kConnectWatchdogMs = BBS_CONNECT_TIMEOUT_MS + 2000;
@@ -52,6 +87,12 @@ struct SensorSlot {
   uint32_t   stateSinceMs;
   uint32_t   holdFromMs;                // FOUND connects not before holdFromMs + holdMs
   uint32_t   holdMs;
+  CrankState crank;                     // CSC; reset whenever an attempt or link ends
+  // Last measurement (HR bpm, CSC cadence), under tableMux. Set only in
+  // SUBSCRIBED and cleared whenever an attempt or link ends.
+  bool       hasValue;
+  uint16_t   value;
+  uint32_t   valueMs;                   // `now` of the packet that produced it
   bool       removing;                  // remove() in a link state: EMPTY on the outcome
   // Per-attempt flags. Set only during an attempt or link; leaveAttempt()
   // resets all three when it ends. clearSlot() also clears them; retarget()
@@ -63,8 +104,10 @@ struct SensorSlot {
 
 class Core {
  public:
-  // mode: the begin() mode, fixed for the lifetime of the Core (§4 rev 25).
-  Core(BlePort& port, Mode mode) : port_(port), mode_(mode), scan_(mode) {
+  // mode and typeMask: the begin() arguments, fixed for the lifetime of the
+  // Core (§4 rev 25). Types outside the compiled ones are ignored.
+  Core(BlePort& port, Mode mode, uint8_t typeMask)
+      : port_(port), mode_(mode), enabled_(typeMask & kCompiledMask), scan_(mode) {
     const SensorType types[] = {SensorType::HEART_RATE, SensorType::SPEED_CADENCE,
                                 SensorType::POWER};
     for (SensorType type : types) {
@@ -157,10 +200,66 @@ class Core {
     }
   }
 
+  // §4 startServer(), device part: local services and advertising data for
+  // the enabled types. Advertising follows the desired state from the next
+  // update() on.
+  bool startServer() {
+    if (!port_.serverStart(localTypes())) return false;
+    setAdvertisingData();
+    serverStarted_ = true;
+    return true;
+  }
+
+  // §5.4: rebuilds the advertising data (name + UUIDs) and restarts
+  // advertising if the desired state allows it. False if the server is not
+  // started, a field did not fit, or the restart failed.
+  bool refreshAdvertising() {
+    if (!serverStarted_) return false;
+    if (port_.advActive()) port_.advStop();
+    const bool dataOk = setAdvertisingData();
+    const bool started = !advertisingDesired() || port_.advStart();
+    return dataOk && started;
+  }
+
+  // Takes effect through refreshAdvertising().
+  void setNamePrefix(const char* prefix) {
+    char clean[kNamePrefixMax + 1];
+    sanitizeNamePrefix(prefix, clean);
+    MuxGuard guard(tableMux_);
+    memcpy(prefix_, clean, sizeof(clean));
+  }
+
+  // Any task. "<prefix>-%08lx" with the chip ID (2.x BBSIdentity); truncated
+  // to len - 1 bytes with a NUL.
+  void serverName(char* out, size_t len) {
+    if (out == nullptr || len == 0) return;
+    char prefix[kNamePrefixMax + 1];
+    {
+      MuxGuard guard(tableMux_);
+      memcpy(prefix, prefix_, sizeof(prefix));
+    }
+    snprintf(out, len, "%s-%08" PRIx32, prefix, port_.chipId());
+  }
+
+  void setHeartRateCallback(void (*cb)(uint16_t bpm)) { heartRateCb_ = cb; }
+  void setCadenceCallback(void (*cb)(uint16_t rpm)) { cadenceCb_ = cb; }
+
+  // Any task; now: the caller's millis(). False while the source slot is not
+  // SUBSCRIBED or has not delivered since entering it (§4 rev 27); the outputs
+  // are then unchanged. ageMs: since the packet that produced the value.
+  bool lastHeartRate(uint16_t& bpm, uint32_t& ageMs, uint32_t now) {
+    return lastValue(slotIndex(SensorType::HEART_RATE), bpm, ageMs, now);
+  }
+  bool lastCadence(uint16_t& rpm, uint32_t& ageMs, uint32_t now) {
+    if (!cadenceFromCsc()) return false;  // source none (§6b)
+    return lastValue(slotIndex(SensorType::SPEED_CADENCE), rpm, ageMs, now);
+  }
+
   void update(uint32_t now) {
     if (queue_.takeResync()) resync(now);
     Event ev;
     for (uint8_t i = 0; i < BBS_EVENT_QUEUE_DEPTH && queue_.pop(ev); ++i) handle(ev, now);
+    enforceAdvertising();
     gattStep(now);
     for (uint8_t i = 0; i < kSlotCount; ++i) advanceSlot(i, now);
     orphanSweep();
@@ -190,6 +289,12 @@ class Core {
   }
 
   Mode mode() const { return mode_; }
+
+  // Any task.
+  uint8_t centralCount() {
+    MuxGuard guard(tableMux_);
+    return centralCount_;
+  }
 
   // Any task (client callbacks): the attempt an event belongs to.
   uint16_t attemptGen(uint8_t slot) const {
@@ -283,6 +388,7 @@ class Core {
       s.hasAddr = false;
       memset(s.name, 0, sizeof(s.name));
       memset(s.mac, 0, sizeof(s.mac));
+      clearValue(s);
     }
     s.state = SlotState::EMPTY;
     s.addrType = 0;
@@ -292,6 +398,7 @@ class Core {
     s.stateSinceMs = 0;
     s.holdFromMs = 0;
     s.holdMs = 0;
+    resetCrank(s.crank);
     s.removing = false;
     s.gattDone = false;
     s.directRetry = false;
@@ -305,12 +412,25 @@ class Core {
                        std::memory_order_release);
   }
 
-  // The single exit of an attempt or link. Resets the per-attempt flags, then:
-  // removing → EMPTY; hard fail → backoff + SENSOR_FAILED; otherwise the wait
-  // state, or FOUND for a pending direct attempt (MAC only).
+  // Caller holds tableMux_.
+  static void clearValue(SensorSlot& s) {
+    s.hasValue = false;
+    s.value = 0;
+    s.valueMs = 0;
+  }
+
+  // The single exit of an attempt or link. Resets the per-attempt flags, the
+  // crank state and the last measurement (§3.1), then: removing → EMPTY; hard
+  // fail → backoff + SENSOR_FAILED; otherwise the wait state, or FOUND for a
+  // pending direct attempt (MAC only).
   void leaveAttempt(uint8_t i, uint32_t now, Outcome outcome) {
     SensorSlot& s = slots_[i];
     const bool direct = s.directRetry;
+    resetCrank(s.crank);
+    {
+      MuxGuard guard(tableMux_);
+      clearValue(s);
+    }
     s.gattDone = false;
     s.directRetry = false;
     s.failPending = false;
@@ -379,12 +499,13 @@ class Core {
     emit(EventType::SENSOR_FAILED, s.type);
   }
 
-  void emit(EventType type, SensorType sensorType, int reason = 0) {
+  void emit(EventType type, SensorType sensorType, int reason = 0, uint8_t count = 0) {
     if (eventCb_ == nullptr) return;
     EventInfo info{};
     info.type = type;
     info.sensorType = sensorType;
     info.reason = reason;
+    info.count = count;
     eventCb_(info);
   }
 
@@ -407,8 +528,126 @@ class Core {
           onClientEvent(ev.slot, ev, now);
         }
         break;
-      default:  // NOTIFY, CENTRAL_*, SUBSCRIBE: not handled before §10 step 5
+      case Ev::NOTIFY:
+        if (ev.slot < kSlotCount && slots_[ev.slot].state == SlotState::SUBSCRIBED) {
+          onNotify(ev.slot, ev, now);
+        }
         break;
+      case Ev::CENTRAL_CONNECT:
+        emit(EventType::CENTRAL_CONNECTED, SensorType{}, 0, refreshCentralCount());
+        break;
+      case Ev::CENTRAL_DISCONNECT:
+        emit(EventType::CENTRAL_DISCONNECTED, SensorType{}, ev.reason, refreshCentralCount());
+        break;
+      case Ev::SUBSCRIBE:
+        if (ev.slot < kSlotCount) {
+          emit(ev.sub.subValue != 0 ? EventType::CENTRAL_SUBSCRIBED
+                                    : EventType::CENTRAL_UNSUBSCRIBED,
+               slots_[ev.slot].type);
+        }
+        break;
+    }
+  }
+
+  // §5.1 NOTIFY on a SUBSCRIBED slot. A cut packet contradicts its own flags:
+  // neither parsed nor relayed. A malformed one is still relayed raw, without
+  // data callbacks or DATA. Power notifies are wired with the local CPS
+  // (§10 step 8).
+  void onNotify(uint8_t i, const Event& ev, uint32_t now) {
+    SensorSlot& s = slots_[i];
+    if (s.type == SensorType::POWER) return;
+    stats_.notifies++;
+    if (ev.reason > ev.notify.len) {
+      stats_.notifiesTruncated++;
+      return;
+    }
+    uint16_t value = 0;
+    bool hasValue = false;
+    const bool ok = parseMeasurement(s, ev.notify.data, ev.notify.len, now, value, hasValue);
+    if (!ok) stats_.notifiesMalformed++;
+    port_.relay(i, ev.notify.data, ev.notify.len);
+    if (!ok) return;
+    if (hasValue) {
+      MuxGuard guard(tableMux_);
+      s.hasValue = true;
+      s.value = value;
+      s.valueMs = now;
+    }
+    const SensorType type = s.type;
+    if (type == SensorType::HEART_RATE) {
+      if (heartRateCb_ != nullptr) heartRateCb_(value);
+    } else if (hasValue && cadenceFromCsc() && cadenceCb_ != nullptr) {
+      cadenceCb_(value);
+    }
+    emit(EventType::DATA, type);
+  }
+
+  // HR: bpm. CSC: cadence, hasValue only when the packet reports one (§6:
+  // none without crank data or for the first crank packet after a reset).
+  static bool parseMeasurement(SensorSlot& s, const uint8_t* data, uint8_t len, uint32_t now,
+                               uint16_t& value, bool& hasValue) {
+    if (s.type == SensorType::HEART_RATE) {
+      hasValue = parseHeartRate(data, len, value);
+      return hasValue;
+    }
+    return parseCsc(data, len, now, s.crank, value, hasValue);
+  }
+
+  // hasValue is set only in SUBSCRIBED and cleared on every exit, so it alone
+  // answers "SUBSCRIBED and delivered" without reading the update-task state.
+  // A now read just before update() stored the value gives age 0, not a wrap.
+  bool lastValue(int i, uint16_t& value, uint32_t& ageMs, uint32_t now) {
+    if (i < 0) return false;
+    uint16_t v;
+    uint32_t at;
+    {
+      MuxGuard guard(tableMux_);
+      if (!slots_[i].hasValue) return false;
+      v = slots_[i].value;
+      at = slots_[i].valueMs;
+    }
+    const uint32_t age = now - at;
+    value = v;
+    ageMs = static_cast<int32_t>(age) < 0 ? 0 : age;
+    return true;
+  }
+
+  // §6b source rule until step 8: CSC in the begin() mask (its slot is
+  // SUBSCRIBED whenever it delivers).
+  bool cadenceFromCsc() const { return (enabled_ & typeBit(SensorType::SPEED_CADENCE)) != 0; }
+
+  // The server's count is authoritative: a +1/-1 per event would count twice
+  // the CENTRAL_* events still queued behind a resync that read it.
+  uint8_t refreshCentralCount() {
+    const uint8_t count = port_.centralCount();
+    MuxGuard guard(tableMux_);
+    centralCount_ = count;
+    return count;
+  }
+
+  // §5.4 desired state, enforced on every update(), after HOST_RESET and after
+  // resync. Also stops NimBLE's own restarts (§0.9).
+  bool advertisingDesired() const { return serverStarted_ && !paused_ && !quiesced_; }
+
+  // Enabled types with a local service; the local CPS is §10 step 8.
+  uint8_t localTypes() const {
+    return enabled_ & (typeBit(SensorType::HEART_RATE) | typeBit(SensorType::SPEED_CADENCE));
+  }
+
+  bool setAdvertisingData() {
+    char name[kServerNameSize];
+    serverName(name, sizeof(name));
+    return port_.advSetData(name, localTypes());
+  }
+
+  void enforceAdvertising() {
+    const bool desired = advertisingDesired();
+    const bool active = port_.advActive();
+    if (desired && !active) {
+      port_.advStart();
+    } else if (!desired && active) {
+      port_.advStop();
+      stats_.advertisingEnforced++;
     }
   }
 
@@ -496,14 +735,17 @@ class Core {
         leaveAttempt(i, now, Outcome::NEUTRAL);
       }
     }
+    enforceAdvertising();
     stats_.hostResets++;
     emit(EventType::HOST_RESET, SensorType{});
   }
 
-  // §3.2 steps 1, 2 and 4 (central count and advertising come with step 5).
+  // §3.2 resync.
   void resync(uint32_t now) {
-    if (!port_.discActive()) scan_.forceOff();   // first: the slot repair may emit()
+    if (!port_.discActive()) scan_.forceOff();   // step 4 first: the slot repair may emit()
     for (uint8_t i = 0; i < kSlotCount; ++i) resyncSlot(i, now);
+    refreshCentralCount();
+    enforceAdvertising();
   }
 
   void resyncSlot(uint8_t i, uint32_t now) {
@@ -635,13 +877,21 @@ class Core {
 
   BlePort& port_;
   const Mode mode_;
+  const uint8_t enabled_;               // begin() typeMask ∩ compiled
   EventQueue queue_;
   GattWatchdog watchdog_;
   ScanController scan_;
-  Mux tableMux_;                        // slot identity read by gapScanCb (§3.4)
+  Mux tableMux_;                        // slot identity read by gapScanCb, last measurements, central count, name prefix (§3.4)
   SensorSlot slots_[kSlotCount];
   Stats stats_{};
   EventCallback eventCb_ = nullptr;
+  void (*heartRateCb_)(uint16_t) = nullptr;
+  void (*cadenceCb_)(uint16_t) = nullptr;
+  char prefix_[kNamePrefixMax + 1] = "homewind";   // under tableMux_
+  uint8_t centralCount_ = 0;            // under tableMux_
+  bool serverStarted_ = false;
+  bool paused_ = false;                 // pause latch (§5.5)
+  bool quiesced_ = false;               // quiesce latch (§4)
 };
 
 }  // namespace internal

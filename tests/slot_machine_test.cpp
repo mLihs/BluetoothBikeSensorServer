@@ -2,10 +2,13 @@
 #include "BBSEventPush.h"
 
 #include <cassert>
+#include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <string>
 
 using BikeSensor::EventInfo;
 using BikeSensor::EventType;
@@ -45,6 +48,17 @@ struct FakePort final : BlePort {
   uint16_t lastEpoch = 0;
   uint32_t lastDurationMs = 0, timerMs = 0;
   uint8_t lastAddrType = 0xFF, lastConnectSlot = 0xFF, lastGattSlot = 0xFF;
+  // Local server.
+  bool serverOk = true, advOn = false, advStartOk = true, advDataOk = true;
+  uint8_t centrals = 0;
+  uint8_t serverMask = 0xFF, advMask = 0xFF;
+  uint32_t chip = 0xda4eb580;
+  char advName[64] = {};
+  int serverStarts = 0, advStarts = 0, advStops = 0, advDataSets = 0;
+  bool advOnAtDataSet = false;
+  int relays[bs::kSlotCount] = {};
+  uint8_t relayData[BBS_NOTIFY_MAX_LEN] = {};
+  uint8_t relayLen = 0xFF;
 
   FakePort() {
     expect[kHr] = kMac;
@@ -96,6 +110,34 @@ struct FakePort final : BlePort {
   }
   void gattTimerStart(uint32_t ms) override { timerStarts++; timerMs = ms; }
   void gattTimerStop() override { timerStops++; }
+  bool serverStart(uint8_t typeMask) override {
+    serverStarts++;
+    serverMask = typeMask;
+    return serverOk;
+  }
+  bool advSetData(const char* name, uint8_t typeMask) override {
+    advDataSets++;
+    assert(strlen(name) < sizeof(advName));
+    strcpy(advName, name);
+    advMask = typeMask;
+    advOnAtDataSet = advOn;
+    return advDataOk;
+  }
+  uint32_t chipId() override { return chip; }
+  uint8_t centralCount() override { return centrals; }
+  bool advActive() override { return advOn; }
+  bool advStart() override {
+    advStarts++;
+    if (advStartOk) advOn = true;
+    return advStartOk;
+  }
+  bool advStop() override { advStops++; advOn = false; return true; }
+  void relay(uint8_t slot, const uint8_t* data, uint8_t len) override {
+    assert(len <= BBS_NOTIFY_MAX_LEN);
+    relays[slot]++;
+    relayLen = len;
+    if (len > 0) memcpy(relayData, data, len);
+  }
 };
 
 struct Recorded {
@@ -103,6 +145,7 @@ struct Recorded {
   SensorType sensorType;
   int reason;
   SlotState state;                                     // its slot's state when the callback ran
+  uint8_t count;
 };
 static Recorded g_events[32];
 static int g_eventCount = 0;
@@ -110,9 +153,9 @@ static const Core* g_core = nullptr;
 
 static void onEvent(const EventInfo& info) {
   assert(g_eventCount < 32);
-  const int slot = bs::slotIndex(info.sensorType);     // HOST_RESET: HR slot
+  const int slot = bs::slotIndex(info.sensorType);     // HOST_RESET, CENTRAL_*: HR slot
   const SlotState state = g_core->slot(slot >= 0 ? static_cast<uint8_t>(slot) : kHr).state;
-  g_events[g_eventCount++] = {info.type, info.sensorType, info.reason, state};
+  g_events[g_eventCount++] = {info.type, info.sensorType, info.reason, state, info.count};
 }
 
 static int countEvents(EventType type) {
@@ -133,7 +176,8 @@ struct Rig {
   std::unique_ptr<Core> core;
   uint32_t now = 1000;
 
-  explicit Rig(Mode mode = Mode::MAC) : core(new Core(port, mode)) {
+  explicit Rig(Mode mode = Mode::MAC, uint8_t typeMask = 0x07)
+      : core(new Core(port, mode, typeMask)) {
     core->setEventCallback(onEvent);
     g_core = core.get();
     g_eventCount = 0;
@@ -973,9 +1017,10 @@ static void testHostReset() {
   }
 }
 
+// Protected events that change nothing: SCAN_END of epoch 0 is always stale.
 static void fillQueueToResync(Core& core) {
-  for (uint8_t i = 0; i < BBS_EVENT_QUEUE_DEPTH; ++i) bs::pushCentralConnect(core.queue());
-  assert(!bs::pushCentralConnect(core.queue()));
+  for (uint8_t i = 0; i < BBS_EVENT_QUEUE_DEPTH; ++i) bs::pushScanEnd(core.queue(), 0, 0);
+  assert(!bs::pushScanEnd(core.queue(), 0, 0));
 }
 
 static void testResync() {
@@ -1205,7 +1250,7 @@ static void testOrphanSweep() {
 static void testDrainBound() {
   Rig r;
   r.toConnecting();
-  for (uint8_t i = 0; i < BBS_EVENT_QUEUE_DEPTH - 1; ++i) bs::pushCentralConnect(r.core->queue());
+  for (uint8_t i = 0; i < BBS_EVENT_QUEUE_DEPTH - 1; ++i) bs::pushScanEnd(r.core->queue(), 0, 0);
   r.connectedEv(r.gen());
   assert(r.core->queue().size() == BBS_EVENT_QUEUE_DEPTH);
   r.update();
@@ -2533,6 +2578,640 @@ static void testNameMatchBadSlot() {
   assert(r.state() == SlotState::CONNECTING);
 }
 
+// ---- §10 step 5: relay, central events, advertising desired state ----
+
+static bool notifyEv(Rig& r, const uint8_t* data, size_t len, uint8_t slot = kHr) {
+  return bs::pushNotify(r.core->queue(), slot, r.core->attemptGen(slot), data, len);
+}
+
+static void cscToSubscribed(Rig& r) {
+  r.addCsc();
+  r.update();
+  r.match(r.core->scan().epoch(), kCscMac);
+  r.update();
+  assert(r.cscState() == SlotState::CONNECTING);
+  r.connectedEv(r.cscGen(), kCsc);
+  r.update();
+  assert(r.cscState() == SlotState::SUBSCRIBED);
+}
+
+static void testNotifyOnlyWhenSubscribed() {
+  const uint8_t hr[] = {0x00, 72};
+  Rig r;
+  r.port.gattOk = false;                               // keeps the slot in DISCOVERING
+  r.add();
+  assert(notifyEv(r, hr, sizeof(hr)));                 // WAIT_SCAN
+  r.update();
+  r.match(r.core->scan().epoch());
+  r.update();
+  assert(r.state() == SlotState::CONNECTING);
+  assert(notifyEv(r, hr, sizeof(hr)));
+  r.update();
+  r.connectedEv(r.gen());
+  r.update();
+  assert(r.state() == SlotState::DISCOVERING);
+  assert(notifyEv(r, hr, sizeof(hr)));
+  r.update();
+  assert(r.port.relays[kHr] == 0 && r.core->stats().notifies == 0);
+
+  Rig s;
+  s.toSubscribed();
+  assert(bs::pushNotify(s.core->queue(), bs::kSlotCount, 0, hr, sizeof(hr)));
+  assert(bs::pushNotify(s.core->queue(), 0xFF, 0, hr, sizeof(hr)));
+  s.update();
+  assert(s.port.relays[kHr] == 0 && s.core->stats().notifies == 0);
+  assert(notifyEv(s, hr, sizeof(hr)));
+  s.update();
+  assert(s.port.relays[kHr] == 1 && s.port.relayLen == 2);
+  assert(memcmp(s.port.relayData, hr, sizeof(hr)) == 0);
+  const BikeSensor::Stats& st = s.core->stats();
+  assert(st.notifies == 1 && st.notifiesTruncated == 0 && st.notifiesMalformed == 0);
+
+  cscToSubscribed(s);                                  // routed by slot
+  const uint8_t csc[] = {0x02, 10, 0, 0x00, 0x04};
+  assert(notifyEv(s, csc, sizeof(csc), kCsc));
+  s.update();
+  assert(s.port.relays[kCsc] == 1 && s.port.relays[kHr] == 1);
+  assert(s.port.relayLen == sizeof(csc) && memcmp(s.port.relayData, csc, sizeof(csc)) == 0);
+}
+
+static void testNotifyTruncated() {
+  Rig r;
+  r.toSubscribed();
+  uint8_t big[BBS_NOTIFY_MAX_LEN + 1] = {0x00, 72};    // valid HR prefix
+  assert(notifyEv(r, big, sizeof(big)));
+  r.update();
+  assert(r.port.relays[kHr] == 0);                     // neither parsed nor relayed
+  assert(r.core->stats().notifies == 1 && r.core->stats().notifiesTruncated == 1);
+  assert(r.core->stats().notifiesMalformed == 0);
+  assert(notifyEv(r, big, BBS_NOTIFY_MAX_LEN));        // exactly the limit: not cut
+  r.update();
+  assert(r.port.relays[kHr] == 1 && r.port.relayLen == BBS_NOTIFY_MAX_LEN);
+  assert(r.core->stats().notifiesTruncated == 1);
+
+  cscToSubscribed(r);                                  // a cut CSC packet leaves the crank alone
+  const uint8_t first[] = {0x02, 10, 0, 0x00, 0x04};
+  assert(notifyEv(r, first, sizeof(first), kCsc));
+  r.update();
+  assert(r.csc().crank.crankValid && r.csc().crank.prevCrankRev == 10);
+  uint8_t cut[BBS_NOTIFY_MAX_LEN + 1] = {0x02, 20, 0, 0x00, 0x08};
+  assert(notifyEv(r, cut, sizeof(cut), kCsc));
+  r.update();
+  assert(r.csc().crank.prevCrankRev == 10 && r.port.relays[kCsc] == 1);
+  assert(r.core->stats().notifiesTruncated == 2);
+}
+
+static void testNotifyMalformedStillRelayed() {
+  Rig r;
+  r.toSubscribed();
+  const uint8_t shortHr[] = {0x00};
+  const uint8_t wideHr[] = {0x01, 72};                 // uint16 flag, value cut
+  assert(notifyEv(r, shortHr, sizeof(shortHr)));
+  assert(notifyEv(r, wideHr, sizeof(wideHr)));
+  assert(notifyEv(r, nullptr, 0));
+  r.update();
+  assert(r.core->stats().notifiesMalformed == 3 && r.core->stats().notifies == 3);
+  assert(r.port.relays[kHr] == 3 && r.port.relayLen == 0);
+
+  cscToSubscribed(r);
+  const uint8_t badCsc[] = {0x02, 10, 0, 0x00};        // crank data needs 4 bytes
+  assert(notifyEv(r, badCsc, sizeof(badCsc), kCsc));
+  r.update();
+  assert(r.core->stats().notifiesMalformed == 4 && !r.csc().crank.crankValid);
+  assert(r.port.relays[kCsc] == 1 && r.port.relayLen == sizeof(badCsc));
+  assert(memcmp(r.port.relayData, badCsc, sizeof(badCsc)) == 0);
+  const uint8_t wheelOnly[] = {0x01, 1, 0, 0, 0, 0x00, 0x04};
+  assert(notifyEv(r, wheelOnly, sizeof(wheelOnly), kCsc));
+  r.update();
+  assert(r.core->stats().notifiesMalformed == 4 && r.port.relays[kCsc] == 2);
+}
+
+// §3.1: leaving SUBSCRIBED clears the crank state, so a reconnect does not
+// produce a cadence jump.
+static void testCrankResetOnLinkEnd() {
+  Rig r;
+  cscToSubscribed(r);
+  const uint8_t crank[] = {0x02, 10, 0, 0x00, 0x04};
+  assert(notifyEv(r, crank, sizeof(crank), kCsc));
+  r.update();
+  assert(r.csc().crank.crankValid);
+  r.discEv(r.cscGen(), 0x08, kCsc);
+  r.update();
+  assert(r.cscState() != SlotState::SUBSCRIBED && !r.csc().crank.crankValid);
+  assert(r.csc().crank.prevCrankRev == 0);
+
+  Rig s;                                               // missed DISCONNECTED, found by resync
+  cscToSubscribed(s);
+  assert(notifyEv(s, crank, sizeof(crank), kCsc));
+  s.update();
+  assert(s.csc().crank.crankValid);
+  s.port.linkUp[kCsc] = false;
+  s.core->queue().requestResync();
+  s.update();
+  assert(s.cscState() != SlotState::SUBSCRIBED && !s.csc().crank.crankValid);
+}
+
+#if BBS_COMPILE_POWER
+static void testPowerNotifyNotWiredYet() {
+  const uint8_t kPower = static_cast<uint8_t>(bs::slotIndex(SensorType::POWER));
+  Rig r;
+  r.port.expect[kPower] = kPowerMac;
+  assert(r.core->addByMac(SensorType::POWER, kPowerMacStr, 0, "PWR", r.now));
+  r.update();
+  r.match(r.core->scan().epoch(), kPowerMac);
+  r.update();
+  r.connectedEv(r.core->attemptGen(kPower), kPower);
+  r.update();
+  assert(r.core->slot(kPower).state == SlotState::SUBSCRIBED);
+  const uint8_t cps[] = {0x00, 0x00, 100, 0};
+  assert(notifyEv(r, cps, sizeof(cps), kPower));
+  r.update();
+  assert(r.port.relays[kPower] == 0 && r.core->stats().notifies == 0);
+}
+#endif
+
+static void testCentralEvents() {
+  Rig r;
+  r.port.centrals = 1;
+  assert(bs::pushCentralConnect(r.core->queue()));
+  r.update();
+  assert(r.core->centralCount() == 1 && g_eventCount == 1);
+  expectEvent(0, EventType::CENTRAL_CONNECTED, SlotState::EMPTY, 0, SensorType{});
+  assert(g_events[0].count == 1);
+  r.port.centrals = 2;                                 // the server's count wins
+  assert(bs::pushCentralConnect(r.core->queue()));
+  r.update();
+  assert(r.core->centralCount() == 2 && g_events[1].count == 2);
+  r.port.centrals = 1;
+  assert(bs::pushCentralDisconnect(r.core->queue(), 0x13));
+  r.update();
+  assert(r.core->centralCount() == 1 && g_eventCount == 3);
+  expectEvent(2, EventType::CENTRAL_DISCONNECTED, SlotState::EMPTY, 0x13, SensorType{});
+  assert(g_events[2].count == 1);
+
+  g_eventCount = 0;
+  assert(bs::pushSubscribe(r.core->queue(), 1, kHr));
+  assert(bs::pushSubscribe(r.core->queue(), 2, kCsc));         // indicate counts too
+  assert(bs::pushSubscribe(r.core->queue(), 0, kCsc));
+  assert(bs::pushSubscribe(r.core->queue(), 1, bs::kSlotCount));
+  assert(bs::pushSubscribe(r.core->queue(), 1, 0xFF));
+  r.update();
+  assert(g_eventCount == 3 && r.core->centralCount() == 1);
+  expectEvent(0, EventType::CENTRAL_SUBSCRIBED, SlotState::EMPTY, 0, SensorType::HEART_RATE);
+  expectEvent(1, EventType::CENTRAL_SUBSCRIBED, SlotState::EMPTY, 0, SensorType::SPEED_CADENCE);
+  expectEvent(2, EventType::CENTRAL_UNSUBSCRIBED, SlotState::EMPTY, 0,
+              SensorType::SPEED_CADENCE);
+  assert(r.port.advStarts == 0);                       // no server: nothing to restart
+}
+
+// §3.2 step 3: the central count comes from the server, also with CENTRAL_*
+// events still queued behind the resync.
+static void testCentralCountResync() {
+  Rig r;
+  r.port.centrals = 2;
+  r.core->queue().requestResync();
+  r.update();
+  assert(r.core->centralCount() == 2 && g_eventCount == 0);
+
+  r.port.centrals = 3;
+  assert(bs::pushCentralConnect(r.core->queue()));     // already in the server's count
+  for (uint8_t i = 1; i < BBS_EVENT_QUEUE_DEPTH; ++i) bs::pushScanEnd(r.core->queue(), 0, 0);
+  assert(!bs::pushScanEnd(r.core->queue(), 0, 0));
+  r.update();
+  assert(r.core->centralCount() == 3 && g_eventCount == 1 && g_events[0].count == 3);
+}
+
+static void testAdvertisingDesiredState() {
+  Rig r;
+  r.update();
+  assert(r.port.advStarts == 0 && r.port.advStops == 0);
+  r.port.advOn = true;                                 // NimBLE restarted it on its own (§0.9)
+  r.update();
+  assert(!r.port.advOn && r.port.advStops == 1 && r.core->stats().advertisingEnforced == 1);
+
+  r.port.serverOk = false;
+  assert(!r.core->startServer());
+  r.update();
+  assert(r.port.advStarts == 0);
+  r.port.serverOk = true;
+  assert(r.core->startServer() && r.port.serverStarts == 2);
+  assert(r.port.advStarts == 0);                       // follows on the next update()
+  r.update();
+  assert(r.port.advOn && r.port.advStarts == 1);
+  r.update();
+  assert(r.port.advStarts == 1);
+  r.port.advOn = false;                                // a central connected: advertising ended
+  r.port.centrals = 1;
+  assert(bs::pushCentralConnect(r.core->queue()));
+  r.update();
+  assert(r.port.advOn && r.port.advStarts == 2);
+  r.port.advOn = false;                                // start refused (e.g. no free connection)
+  r.port.advStartOk = false;
+  r.update();
+  r.update();
+  assert(!r.port.advOn && r.port.advStarts == 4);      // retried on every update()
+  assert(r.core->stats().advertisingEnforced == 1 && r.port.advStops == 1);
+}
+
+static void testAdvertisingAfterHostResetAndResync() {
+  {
+    Rig r;                                             // re-applied before the HOST_RESET event
+    r.core->setEventCallback(onEventHook);
+    assert(r.core->startServer());
+    r.update();
+    r.port.advOn = false;
+    bool seen = false;
+    g_hook = [&r, &seen](const EventInfo& info) {
+      if (info.type != EventType::HOST_RESET) return;
+      seen = true;
+      assert(r.port.advOn && r.port.advStarts == 2);
+    };
+    assert(bs::pushHostReset(r.core->queue()));
+    r.update();
+    g_hook = nullptr;
+    assert(seen && r.port.advStarts == 2);
+  }
+  {
+    Rig r;                                             // not wanted: stopped before the event
+    r.core->setEventCallback(onEventHook);
+    r.port.advOn = true;
+    bool seen = false;
+    g_hook = [&r, &seen](const EventInfo& info) {
+      if (info.type != EventType::HOST_RESET) return;
+      seen = true;
+      assert(!r.port.advOn && r.core->stats().advertisingEnforced == 1);
+    };
+    assert(bs::pushHostReset(r.core->queue()));
+    r.update();
+    g_hook = nullptr;
+    assert(seen);
+  }
+  {
+    Rig r;                                             // resync enforces before the drain
+    r.core->setEventCallback(onEventHook);
+    assert(r.core->startServer());
+    r.update();
+    r.port.advOn = false;
+    r.port.centrals = 1;
+    bool seen = false;
+    g_hook = [&r, &seen](const EventInfo& info) {
+      if (info.type != EventType::CENTRAL_CONNECTED) return;
+      seen = true;
+      assert(r.port.advOn && r.port.advStarts == 2);
+    };
+    assert(bs::pushCentralConnect(r.core->queue()));
+    fillQueueToResync(*r.core);
+    r.update();
+    g_hook = nullptr;
+    assert(seen && r.port.advStarts == 2);
+  }
+}
+
+// ---- §10 step 5 (rev 26): data path, server types, name, refreshAdvertising ----
+
+static const uint8_t kCscFirst[] = {0x02, 10, 0, 0x00, 0x04};     // revs 10 @ 1 s
+static const uint8_t kCsc60[] = {0x02, 11, 0, 0x00, 0x08};        // +1 rev in 1 s: 60 rpm
+static const uint8_t kCscWheel[] = {0x01, 1, 0, 0, 0, 0x00, 0x04};
+
+static uint16_t g_hrValues[8], g_cadValues[8];
+static int g_hrCalls = 0, g_cadCalls = 0;
+static int g_eventsAtCall = -1, g_relaysAtCall = -1;
+static const FakePort* g_port = nullptr;
+
+static void onHr(uint16_t bpm) {
+  assert(g_hrCalls < 8);
+  g_hrValues[g_hrCalls++] = bpm;
+  g_eventsAtCall = g_eventCount;
+  g_relaysAtCall = g_port->relays[kHr];
+}
+static void onCadence(uint16_t rpm) {
+  assert(g_cadCalls < 8);
+  g_cadValues[g_cadCalls++] = rpm;
+}
+static void resetValues(const Rig& r) {
+  g_hrCalls = g_cadCalls = 0;
+  g_eventsAtCall = g_relaysAtCall = -1;
+  g_port = &r.port;
+}
+
+static void testHeartRateData() {
+  Rig r;
+  r.core->setHeartRateCallback(onHr);
+  resetValues(r);
+  r.port.gattOk = false;                               // DISCOVERING: no data
+  r.add();
+  r.update();
+  r.match(r.core->scan().epoch());
+  r.update();
+  r.connectedEv(r.gen());
+  r.update();
+  assert(r.state() == SlotState::DISCOVERING);
+  const uint8_t hr8[] = {0x00, 72};
+  assert(notifyEv(r, hr8, sizeof(hr8)));
+  r.update();
+  assert(g_hrCalls == 0 && countEvents(EventType::DATA) == 0);
+
+  Rig s;
+  s.core->setHeartRateCallback(onHr);
+  resetValues(s);
+  s.toSubscribed();
+  g_eventCount = 0;
+  const uint8_t hr16[] = {0x01, 0x2C, 0x01};           // 300 bpm
+  const uint8_t bad[] = {0x01, 72};
+  uint8_t cut[BBS_NOTIFY_MAX_LEN + 1] = {0x00, 99};
+  assert(notifyEv(s, hr8, sizeof(hr8)));
+  assert(notifyEv(s, bad, sizeof(bad)));               // relayed, no value, no DATA
+  assert(notifyEv(s, cut, sizeof(cut)));               // nothing
+  assert(notifyEv(s, hr16, sizeof(hr16)));
+  s.update();
+  assert(g_hrCalls == 2 && g_hrValues[0] == 72 && g_hrValues[1] == 300);
+  assert(g_eventCount == 2);
+  expectEvent(0, EventType::DATA, SlotState::SUBSCRIBED);
+  expectEvent(1, EventType::DATA, SlotState::SUBSCRIBED);
+  assert(g_eventsAtCall == 1 && g_relaysAtCall == 3);  // relay → callback → DATA
+  s.core->setHeartRateCallback(nullptr);
+  assert(notifyEv(s, hr8, sizeof(hr8)));
+  s.update();
+  assert(g_hrCalls == 2 && countEvents(EventType::DATA) == 3);
+}
+
+static void testCadenceData() {
+  Rig r;
+  r.core->setCadenceCallback(onCadence);
+  r.core->setHeartRateCallback(onHr);
+  resetValues(r);
+  cscToSubscribed(r);
+  g_eventCount = 0;
+  assert(notifyEv(r, kCscFirst, sizeof(kCscFirst), kCsc));
+  r.update();
+  assert(g_cadCalls == 0 && countEvents(EventType::DATA) == 1);   // §6: no cadence yet
+  expectEvent(0, EventType::DATA, SlotState::SUBSCRIBED, 0, SensorType::SPEED_CADENCE);
+  assert(notifyEv(r, kCsc60, sizeof(kCsc60), kCsc));
+  assert(notifyEv(r, kCsc60, sizeof(kCsc60), kCsc));             // no new crank event
+  assert(notifyEv(r, kCscWheel, sizeof(kCscWheel), kCsc));       // no crank data
+  const uint8_t bad[] = {0x02, 12, 0, 0x00};
+  assert(notifyEv(r, bad, sizeof(bad), kCsc));
+  r.update();
+  assert(g_cadCalls == 2 && g_cadValues[0] == 60 && g_cadValues[1] == 0);
+  assert(countEvents(EventType::DATA) == 4 && g_hrCalls == 0);
+
+  r.discEv(r.cscGen(), 0x08, kCsc);                    // link end resets the crank
+  r.update();
+  assert(r.cscState() == SlotState::CONNECTING);
+  r.connectedEv(r.cscGen(), kCsc);
+  r.update();
+  assert(r.cscState() == SlotState::SUBSCRIBED);
+  const uint8_t next[] = {0x02, 12, 0, 0x00, 0x0C};
+  assert(notifyEv(r, next, sizeof(next), kCsc));
+  r.update();
+  assert(g_cadCalls == 2);
+
+  Rig s(Mode::MAC, 0x01 | 0x04);                       // CSC not enabled: no cadence source
+  s.core->setCadenceCallback(onCadence);
+  resetValues(s);
+  cscToSubscribed(s);
+  g_eventCount = 0;
+  assert(notifyEv(s, kCscFirst, sizeof(kCscFirst), kCsc));
+  assert(notifyEv(s, kCsc60, sizeof(kCsc60), kCsc));
+  s.update();
+  assert(g_cadCalls == 0 && countEvents(EventType::DATA) == 2);
+}
+
+static uint16_t g_getterValue = 0;
+static bool g_getterOk = false;
+static Core* g_getterCore = nullptr;
+static void onHrReadsGetter(uint16_t) {
+  uint32_t age = 0;
+  g_getterOk = g_getterCore->lastHeartRate(g_getterValue, age, 0);
+}
+
+static void testHeartRateGetter() {
+  Rig r;
+  uint16_t bpm = 1234;
+  uint32_t age = 5678;
+  assert(!r.core->lastHeartRate(bpm, age, r.now));     // EMPTY
+  r.toSubscribed();
+  assert(!r.core->lastHeartRate(bpm, age, r.now));     // SUBSCRIBED, nothing delivered
+  const uint8_t bad[] = {0x01, 72};
+  uint8_t cut[BBS_NOTIFY_MAX_LEN + 1] = {0x00, 99};
+  assert(notifyEv(r, bad, sizeof(bad)));
+  assert(notifyEv(r, cut, sizeof(cut)));
+  r.update();
+  assert(!r.core->lastHeartRate(bpm, age, r.now));
+  assert(bpm == 1234 && age == 5678);                  // untouched on false
+
+  const uint8_t hr72[] = {0x00, 72};
+  const uint32_t t72 = r.now;
+  assert(notifyEv(r, hr72, sizeof(hr72)));
+  r.update();
+  assert(r.core->lastHeartRate(bpm, age, t72 + 500) && bpm == 72 && age == 500);
+  r.now += 200;
+  assert(notifyEv(r, bad, sizeof(bad)));               // malformed: value and age kept
+  assert(notifyEv(r, cut, sizeof(cut)));               // truncated: same
+  r.update();
+  assert(r.core->lastHeartRate(bpm, age, t72 + 900) && bpm == 72 && age == 900);
+  assert(r.core->lastHeartRate(bpm, age, t72 - 3) && age == 0);   // now read before update()
+
+  g_getterCore = r.core.get();                         // stored before the callback runs
+  r.core->setHeartRateCallback(onHrReadsGetter);
+  const uint8_t hr300[] = {0x01, 0x2C, 0x01};
+  assert(notifyEv(r, hr300, sizeof(hr300)));
+  r.update();
+  assert(g_getterOk && g_getterValue == 300);
+  assert(r.core->lastHeartRate(bpm, age, r.now + 10) && bpm == 300 && age == 10);
+  r.core->setHeartRateCallback(nullptr);
+
+  r.discEv(r.gen(), 0x08);                             // link end clears
+  r.update();
+  assert(r.state() == SlotState::CONNECTING);
+  assert(!r.core->lastHeartRate(bpm, age, r.now));
+  r.connectedEv(r.gen());
+  r.update();
+  assert(r.state() == SlotState::SUBSCRIBED);
+  assert(!r.core->lastHeartRate(bpm, age, r.now));     // not delivered since re-entering
+  assert(notifyEv(r, hr72, sizeof(hr72)));
+  r.update();
+  assert(r.core->lastHeartRate(bpm, age, r.now) && bpm == 72);
+
+  r.port.connected = false;                            // missed DISCONNECTED, found by resync
+  r.core->queue().requestResync();
+  r.update();
+  assert(r.state() != SlotState::SUBSCRIBED && !r.core->lastHeartRate(bpm, age, r.now));
+
+  Rig s;                                               // remove() from SUBSCRIBED
+  s.toSubscribed();
+  assert(notifyEv(s, hr72, sizeof(hr72)));
+  s.update();
+  assert(s.core->lastHeartRate(bpm, age, s.now));
+  s.remove();
+  s.discEv(s.gen(), 0x16);
+  s.update();
+  assert(s.state() == SlotState::EMPTY && !s.core->lastHeartRate(bpm, age, s.now));
+}
+
+static void testCadenceGetter() {
+  Rig r;
+  uint16_t rpm = 1234;
+  uint32_t age = 5678;
+  cscToSubscribed(r);
+  assert(!r.core->lastCadence(rpm, age, r.now));
+  assert(notifyEv(r, kCscFirst, sizeof(kCscFirst), kCsc));
+  assert(notifyEv(r, kCscWheel, sizeof(kCscWheel), kCsc));
+  r.update();
+  assert(!r.core->lastCadence(rpm, age, r.now) && rpm == 1234 && age == 5678);
+
+  const uint32_t t60 = r.now;
+  assert(notifyEv(r, kCsc60, sizeof(kCsc60), kCsc));
+  r.update();
+  assert(r.core->lastCadence(rpm, age, t60 + 300) && rpm == 60 && age == 300);
+  r.now = t60 + 1000;                                  // no new crank event: the codec's 0
+  assert(notifyEv(r, kCsc60, sizeof(kCsc60), kCsc));
+  r.update();
+  assert(r.core->lastCadence(rpm, age, t60 + 1100) && rpm == 0 && age == 100);
+  r.now = t60 + 2000;                                  // no cadence: value and age kept
+  assert(notifyEv(r, kCscWheel, sizeof(kCscWheel), kCsc));
+  const uint8_t bad[] = {0x02, 12, 0, 0x00};
+  assert(notifyEv(r, bad, sizeof(bad), kCsc));
+  r.update();
+  assert(r.core->lastCadence(rpm, age, t60 + 2100) && rpm == 0 && age == 1100);
+  uint16_t bpm = 0;
+  assert(!r.core->lastHeartRate(bpm, age, r.now));     // per slot
+
+  r.discEv(r.cscGen(), 0x08, kCsc);
+  r.update();
+  assert(!r.core->lastCadence(rpm, age, r.now));
+
+  Rig s(Mode::MAC, 0x01 | 0x04);                       // CSC not in begin(): source none
+  cscToSubscribed(s);
+  assert(notifyEv(s, kCscFirst, sizeof(kCscFirst), kCsc));
+  assert(notifyEv(s, kCsc60, sizeof(kCsc60), kCsc));
+  s.update();
+  assert(!s.core->lastCadence(rpm, age, s.now));
+}
+
+static void testServerTypes() {
+  struct Case { uint8_t mask, local; };
+  const Case cases[] = {
+      {0x07, 0x03},                                    // Power: local CPS is step 8
+      {0x01, 0x01}, {0x02, 0x02}, {0x04, 0x00}, {0x00, 0x00},
+      {0xF9, 0x01},                                    // unknown bits ignored
+  };
+  for (const Case& c : cases) {
+    Rig r(Mode::MAC, c.mask);
+    assert(r.core->startServer());
+    assert(r.port.serverMask == c.local && r.port.advMask == c.local);
+    assert(r.port.advDataSets == 1 && r.port.advStarts == 0);
+    assert(strcmp(r.port.advName, "homewind-da4eb580") == 0);
+  }
+  Rig r;
+  r.port.serverOk = false;
+  assert(!r.core->startServer() && r.port.advDataSets == 0);
+  r.port.serverOk = true;
+  r.port.advDataOk = false;                            // name did not fit: still started
+  assert(r.core->startServer() && r.port.advDataSets == 1);
+  r.update();
+  assert(r.port.advOn);
+}
+
+// 2.x BBSIdentity::SetDeviceNamePrefix + GetBleDeviceNameLower, String ops
+// replaced one to one.
+static std::string legacyName(const char* prefix, uint32_t id32) {
+  std::string p;
+  if (prefix == nullptr || strlen(prefix) == 0) {
+    p = "homewind";
+  } else {
+    p = prefix;
+    for (char& c : p) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    for (char& c : p) {
+      if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) c = '-';
+    }
+    size_t pos;
+    while ((pos = p.find("--")) != std::string::npos) p.erase(pos, 1);
+    while (!p.empty() && p.front() == '-') p.erase(0, 1);
+    while (!p.empty() && p.back() == '-') p.pop_back();
+    if (p.empty()) p = "homewind";
+  }
+  char name[48];
+  snprintf(name, sizeof(name), "%s-%08lx", p.c_str(), static_cast<unsigned long>(id32));
+  return name;
+}
+
+static void testServerName() {
+  Rig r;
+  char buf[bs::kServerNameSize];
+  r.core->serverName(buf, sizeof(buf));
+  assert(strcmp(buf, "homewind-da4eb580") == 0);
+  r.port.chip = 0x1;
+  r.core->serverName(buf, sizeof(buf));
+  assert(strcmp(buf, "homewind-00000001") == 0);
+  char small[6];
+  memset(small, 'x', sizeof(small));
+  r.core->serverName(small, sizeof(small));
+  assert(strcmp(small, "homew") == 0);
+  char one = 'x';
+  r.core->serverName(&one, 0);
+  assert(one == 'x');
+  r.core->serverName(nullptr, 10);
+
+  const char* fixed[] = {nullptr, "", "-", "HomeWind", "My Bike!", "--a--b--", "a_b c",
+                         "x\x80y\xffz", "Zwift-Hub-01",
+                         "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop",
+                         "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij----x"};
+  for (const char* p : fixed) {
+    r.core->setNamePrefix(p);
+    r.core->serverName(buf, sizeof(buf));
+    assert(legacyName(p, r.port.chip) == buf);
+  }
+  const char alphabet[] = "aZ09-_ .\x80\xff";
+  uint32_t seed = 12345;
+  for (int i = 0; i < 20000; ++i) {
+    char p[64];
+    seed = seed * 1103515245u + 12345u;
+    const size_t len = (seed >> 16) % sizeof(p);
+    for (size_t k = 0; k < len; ++k) {
+      seed = seed * 1103515245u + 12345u;
+      p[k] = alphabet[(seed >> 16) % (sizeof(alphabet) - 1)];
+    }
+    p[len] = '\0';
+    r.port.chip = seed;
+    r.core->setNamePrefix(p);
+    r.core->serverName(buf, sizeof(buf));
+    assert(legacyName(p, r.port.chip) == buf);
+  }
+}
+
+static void testRefreshAdvertising() {
+  Rig r;
+  r.core->setNamePrefix("Bike");
+  assert(!r.core->refreshAdvertising());               // no server yet
+  assert(r.port.advDataSets == 0 && r.port.advStarts == 0);
+  assert(r.core->startServer());
+  assert(strcmp(r.port.advName, "bike-da4eb580") == 0);
+  r.update();
+  assert(r.port.advOn && r.port.advStarts == 1);
+
+  r.core->setNamePrefix("Trainer");                    // only through refreshAdvertising()
+  r.update();
+  assert(r.port.advDataSets == 1 && strcmp(r.port.advName, "bike-da4eb580") == 0);
+  assert(r.core->refreshAdvertising());
+  assert(r.port.advDataSets == 2 && strcmp(r.port.advName, "trainer-da4eb580") == 0);
+  assert(!r.port.advOnAtDataSet && r.port.advStops == 1);   // stopped before the rebuild
+  assert(r.port.advOn && r.port.advStarts == 2 && r.port.advMask == 0x03);
+  assert(r.core->stats().advertisingEnforced == 0);
+
+  r.port.advOn = false;                                // not advertising: no stop
+  assert(r.core->refreshAdvertising());
+  assert(r.port.advStops == 1 && r.port.advOn && r.port.advStarts == 3);
+
+  r.port.advStartOk = false;
+  r.port.advOn = false;
+  assert(!r.core->refreshAdvertising() && r.port.advDataSets == 4);
+  r.port.advStartOk = true;
+  r.port.advDataOk = false;                            // data did not fit: started anyway
+  assert(!r.core->refreshAdvertising());
+  assert(r.port.advOn && r.port.advStarts == 5);
+}
+
 int main() {
   testAddByMac();
   testHappyPath();
@@ -2590,5 +3269,23 @@ int main() {
   testFoundHoldBlocksScanBound();
   testNameSecondDeviceSameName();
   testNameMatchBadSlot();
+  testNotifyOnlyWhenSubscribed();
+  testNotifyTruncated();
+  testNotifyMalformedStillRelayed();
+  testCrankResetOnLinkEnd();
+#if BBS_COMPILE_POWER
+  testPowerNotifyNotWiredYet();
+#endif
+  testCentralEvents();
+  testCentralCountResync();
+  testAdvertisingDesiredState();
+  testAdvertisingAfterHostResetAndResync();
+  testHeartRateData();
+  testCadenceData();
+  testHeartRateGetter();
+  testCadenceGetter();
+  testServerTypes();
+  testServerName();
+  testRefreshAdvertising();
   return 0;
 }

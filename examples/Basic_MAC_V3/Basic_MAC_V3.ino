@@ -25,7 +25,7 @@ const char* HR_SENSOR_MAC = "f0:13:c3:ee:56:97";
 const int8_t HR_ADDR_TYPE = 0;
 
 bs::internal::NimBLEPort port;
-bs::internal::Core core(port, bs::Mode::MAC);
+bs::internal::Core core(port, bs::Mode::MAC, bs::typeBit(bs::SensorType::HEART_RATE));
 
 const char* eventName(bs::EventType type) {
   switch (type) {
