@@ -70,6 +70,7 @@ struct FakePort final : BlePort {
   FakePort() {
     expect[kHr] = kMac;
     expect[kCsc] = kCscMac;
+    for (int64_t& f : localFeature) f = -1;
   }
 
   bool hsSynced() override { return synced; }
@@ -115,13 +116,25 @@ struct FakePort final : BlePort {
     if (onConnHandle) onConnHandle(slot);
     return linkUp[slot] || disconnecting[slot] ? 7 : bs::kConnHandleNone;
   }
-  bool gattPass(uint8_t slot, SensorType type, uint8_t& battery) override {
+  bs::GattResult gattRead;                             // Feature/Location the sensor returns
+  bool gattPass(uint8_t slot, SensorType type, bs::GattResult& out) override {
     assert(bs::slotIndex(type) == slot);
     gattPasses++;
     lastGattSlot = slot;
     if (duringGatt) duringGatt();
-    battery = gattBattery;
+    out = gattRead;
+    out.battery = gattBattery;
     return gattOk;
+  }
+  // Local Feature/Location per slot; -1 = never written.
+  int64_t localFeature[bs::kSlotCount];
+  int localLocation = -1, featureSets = 0;
+  void setLocalFeature(SensorType type, uint32_t feature, uint8_t location) override {
+    const int slot = bs::slotIndex(type);
+    assert(slot >= 0 && type != SensorType::HEART_RATE);
+    featureSets++;
+    localFeature[slot] = feature;
+    if (type == SensorType::POWER) localLocation = location;
   }
   void gattTimerStart(uint32_t ms) override { timerStarts++; timerMs = ms; }
   void gattTimerStop() override { timerStops++; }
@@ -2765,25 +2778,6 @@ static void testCrankResetOnLinkEnd() {
   assert(s.cscState() != SlotState::SUBSCRIBED && !s.csc().crank.crankValid);
 }
 
-#if BBS_COMPILE_POWER
-static void testPowerNotifyNotWiredYet() {
-  const uint8_t kPower = static_cast<uint8_t>(bs::slotIndex(SensorType::POWER));
-  Rig r;
-  r.port.expect[kPower] = kPowerMac;
-  assert(r.core->addByMac(SensorType::POWER, kPowerMacStr, 0, "PWR", r.now));
-  r.update();
-  r.match(r.core->scan().epoch(), kPowerMac);
-  r.update();
-  r.connectedEv(r.core->attemptGen(kPower), kPower);
-  r.update();
-  assert(r.core->slot(kPower).state == SlotState::SUBSCRIBED);
-  const uint8_t cps[] = {0x00, 0x00, 100, 0};
-  assert(notifyEv(r, cps, sizeof(cps), kPower));
-  r.update();
-  assert(r.port.relays[kPower] == 0 && r.core->stats().notifies == 0);
-}
-#endif
-
 static void testCentralEvents() {
   Rig r;
   r.port.centrals = 1;
@@ -3298,9 +3292,10 @@ static void testAddOutsideMask() {
 
 static void testServerTypes() {
   struct Case { uint8_t mask, local; };
+  const uint8_t power = BBS_COMPILE_POWER ? 0x04 : 0x00;   // local CPS only if compiled
   const Case cases[] = {
-      {0x07, 0x03},                                    // Power: local CPS is step 8
-      {0x01, 0x01}, {0x02, 0x02}, {0x04, 0x00}, {0x00, 0x00},
+      {0x07, static_cast<uint8_t>(0x03 | power)},
+      {0x01, 0x01}, {0x02, 0x02}, {0x04, power}, {0x00, 0x00},
       {0xF9, 0x01},                                    // unknown bits ignored
   };
   for (const Case& c : cases) {
@@ -3332,6 +3327,10 @@ static void testAdvertisingBudget() {
       {0x03, "abcdefghijk", "abcdefghijkl"},                 // HR + CSC: 11 / 12
       {0x01, "abcdefghijklm", "abcdefghijklmn"},             // one UUID: 13 / 14
       {0x00, "abcdefghijklmnopq", "abcdefghijklmnopqr"},     // no UUID: 17 / 18
+#if BBS_COMPILE_POWER
+      {0x07, "abcdefghi", "abcdefghij"},                     // HR + CSC + CPS: 9 / 10
+      {0x04, "abcdefghijklm", "abcdefghijklmn"},             // CPS alone: 13 / 14
+#endif
   };
   for (const Case& c : cases) {
     Rig ok(Mode::MAC, c.mask);
@@ -3346,7 +3345,7 @@ static void testAdvertisingBudget() {
     assert(bad.port.advStarts == 0);
   }
 
-  Rig r;                                               // refresh keeps the old data on air
+  Rig r(Mode::MAC, 0x03);                              // refresh keeps the old data on air
   assert(r.core->startServer());
   r.update();
   assert(r.port.advOn && r.port.advStarts == 1);
@@ -3519,6 +3518,392 @@ static void testLinkLossClearsMeasurement() {
   assert(s.csc().crank.prevCrankRev == 0 && !s.core->lastCadence(v, age, s.now));
 }
 
+// ---- Power wiring, local Feature, cadence source (§10 step 8) ----
+
+// §5.4: local CSC Feature = sensor & 0x0003 after a successful pass; default
+// 0x0002 without a readable 0x2A5C and after remove(CSC).
+static void testCscFeatureCopy() {
+  Rig r;
+  r.port.gattRead.hasFeature = true;
+  r.port.gattRead.feature = 0x0007;                    // + multiple locations (bit 2)
+  r.toSubscribed();                                    // HR: nothing to copy
+  assert(r.port.featureSets == 0);
+  cscToSubscribed(r);
+  assert(r.port.localFeature[kCsc] == 0x0003 && r.port.featureSets == 1);
+  r.port.gattRead = bs::GattResult{};                  // reconnect: no readable 0x2A5C
+  r.discEv(r.cscGen(), 0x08, kCsc);
+  r.update();
+  r.connectedEv(r.cscGen(), kCsc);
+  r.update();
+  assert(r.cscState() == SlotState::SUBSCRIBED);
+  assert(r.port.localFeature[kCsc] == 0x0002 && r.port.featureSets == 2);
+  r.port.gattRead.hasFeature = true;                   // failed pass: nothing copied
+  r.port.gattRead.feature = 0x0001;
+  r.port.gattOk = false;
+  r.discEv(r.cscGen(), 0x08, kCsc);
+  r.update();
+  r.connectedEv(r.cscGen(), kCsc);
+  r.update();
+  assert(r.cscState() == SlotState::DISCOVERING && r.port.featureSets == 2);
+
+  Rig s;                                               // remove(CSC) restores the default at once
+  s.port.gattRead.hasFeature = true;
+  s.port.gattRead.feature = 0x0001;
+  cscToSubscribed(s);
+  assert(s.port.localFeature[kCsc] == 0x0001);
+  s.core->remove(SensorType::SPEED_CADENCE, s.now);
+  assert(s.port.localFeature[kCsc] == 0x0002 && s.port.featureSets == 2);
+  s.discEv(s.cscGen(), 0x16, kCsc);
+  s.update();
+  s.core->remove(SensorType::SPEED_CADENCE, s.now);    // EMPTY: no-op
+  assert(s.cscState() == SlotState::EMPTY && s.port.featureSets == 2);
+}
+
+#if BBS_COMPILE_POWER
+static const uint8_t kPowerSlot = static_cast<uint8_t>(bs::slotIndex(SensorType::POWER));
+static const uint8_t kCpsPlain[] = {0x00, 0x00, 200, 0};   // 200 W, no crank data
+
+static void powerToSubscribed(Rig& r) {
+  r.port.expect[kPowerSlot] = kPowerMac;
+  assert(r.core->addByMac(SensorType::POWER, kPowerMacStr, 0, "PWR", r.now));
+  r.update();
+  r.match(r.core->scan().epoch(), kPowerMac);
+  r.update();
+  assert(r.core->slot(kPowerSlot).state == SlotState::CONNECTING);
+  assert(!r.core->providesCadence());                  // not SUBSCRIBED yet
+  r.connectedEv(r.core->attemptGen(kPowerSlot), kPowerSlot);
+  r.update();
+  assert(r.core->slot(kPowerSlot).state == SlotState::SUBSCRIBED);
+}
+
+// Flags 0x0020 (crank data), 200 W, crank revs and event time (1/1024 s).
+static bool crankEv(Rig& r, uint16_t revs, uint16_t t) {
+  const uint8_t p[] = {0x20, 0x00, 200, 0, static_cast<uint8_t>(revs), static_cast<uint8_t>(revs >> 8),
+                       static_cast<uint8_t>(t), static_cast<uint8_t>(t >> 8)};
+  return notifyEv(r, p, sizeof(p), kPowerSlot);
+}
+
+static BikeSensor::PowerSample g_powerSamples[8];
+static int g_powerCalls = 0, g_cadAtPower = -1;
+static void onPower(const BikeSensor::PowerSample& s) {
+  assert(g_powerCalls < 8);
+  g_powerSamples[g_powerCalls++] = s;
+  g_eventsAtCall = g_eventCount;
+  g_relaysAtCall = g_port->relays[kPowerSlot];
+  g_cadAtPower = g_cadCalls;
+}
+
+// §5.1 NOTIFY for Power: counted, truncated → nothing, malformed → raw relay
+// only; otherwise relay → power callback → cadence callback → DATA.
+static void testPowerNotify() {
+  Rig r;
+  resetValues(r);
+  g_powerCalls = 0;
+  r.core->setPowerCallback(onPower);
+  r.core->setCadenceCallback(onCadence);
+  powerToSubscribed(r);
+  g_eventCount = 0;
+  uint8_t cut[BBS_NOTIFY_MAX_LEN + 1] = {0x00, 0x00, 100, 0};
+  const uint8_t bad[] = {0x20, 0x00, 100, 0, 10, 0, 0x00};   // crank field cut by one byte
+  assert(notifyEv(r, cut, sizeof(cut), kPowerSlot));
+  assert(notifyEv(r, bad, sizeof(bad), kPowerSlot));
+  r.update();
+  BikeSensor::Stats st = r.core->stats();
+  assert(st.notifies == 2 && st.notifiesTruncated == 1 && st.notifiesMalformed == 1);
+  assert(r.port.relays[kPowerSlot] == 1 && r.port.relayLen == sizeof(bad));
+  assert(memcmp(r.port.relayData, bad, sizeof(bad)) == 0);
+  assert(g_powerCalls == 0 && g_eventCount == 0 && !r.core->slot(kPowerSlot).crank.crankValid);
+  BikeSensor::PowerSample s{};
+  uint32_t age = 0;
+  assert(!r.core->lastPower(s, age, r.now));
+
+  // Balance (left reference), crank, energy: flags 0x0823, 300 W.
+  const uint8_t full[] = {0x23, 0x08, 0x2C, 0x01, 100, 10, 0, 0x00, 0x04, 0x34, 0x12};
+  const uint32_t t = r.now;
+  assert(notifyEv(r, full, sizeof(full), kPowerSlot));
+  r.update();
+  assert(g_powerCalls == 1 && g_cadCalls == 0);        // first crank packet: no cadence
+  const BikeSensor::PowerSample& p = g_powerSamples[0];
+  assert(p.watts == 300 && p.balance == 100 && p.balanceIsLeft && p.flags == 0x0823);
+  assert(p.hasEnergy && p.energyKJ == 0x1234 && !p.hasCadence && p.cadence == 0);
+  assert(g_relaysAtCall == 2 && g_eventsAtCall == 0 && g_eventCount == 1);
+  expectEvent(0, EventType::DATA, SlotState::SUBSCRIBED, 0, SensorType::POWER);
+  assert(r.core->lastPower(s, age, t + 40) && s.watts == 300 && s.balance == 100 && age == 40);
+  st = r.core->stats();
+  assert(st.notifies == 3 && st.notifiesMalformed == 1);
+  assert(r.port.relays[kCsc] == 0 && r.port.relays[kHr] == 0);
+
+  const uint8_t neg[] = {0x00, 0x00, 0xF6, 0xFF};      // -10 W, nothing else
+  const uint8_t crank60[] = {0x20, 0x00, 0x2C, 0x01, 11, 0, 0x00, 0x08};
+  assert(notifyEv(r, neg, sizeof(neg), kPowerSlot));
+  assert(notifyEv(r, crank60, sizeof(crank60), kPowerSlot));
+  r.update();
+  assert(g_powerCalls == 3 && g_cadCalls == 1 && g_cadValues[0] == 60);
+  assert(g_powerSamples[1].watts == -10 && g_powerSamples[1].balance == 0xFF);
+  assert(!g_powerSamples[1].hasEnergy && !g_powerSamples[1].balanceIsLeft);
+  assert(g_powerSamples[2].hasCadence && g_powerSamples[2].cadence == 60);
+  assert(g_cadAtPower == 0 && countEvents(EventType::DATA) == 3);   // power before cadence
+  r.core->setPowerCallback(nullptr);
+  assert(notifyEv(r, neg, sizeof(neg), kPowerSlot));
+  r.update();
+  assert(g_powerCalls == 3 && countEvents(EventType::DATA) == 4);
+}
+
+// §5.4: local CP Feature = meter & 0x000301FF, Location copied; defaults
+// 0 / 0x0D without a read and after remove(POWER).
+static void testPowerFeatureCopy() {
+  {
+    Rig r;
+    r.port.gattRead.hasFeature = true;
+    r.port.gattRead.feature = 0xFFFFFFFF;
+    r.port.gattRead.hasLocation = true;
+    r.port.gattRead.location = 5;                      // left crank
+    powerToSubscribed(r);
+    assert(r.port.localFeature[kPowerSlot] == 0x000301FF && r.port.localLocation == 5);
+    assert(r.port.featureSets == 1);
+    r.core->remove(SensorType::POWER, r.now);          // defaults at once
+    assert(r.port.localFeature[kPowerSlot] == 0 && r.port.localLocation == 0x0D);
+    r.discEv(r.core->attemptGen(kPowerSlot), 0x16, kPowerSlot);
+    r.update();
+    r.core->remove(SensorType::POWER, r.now);          // EMPTY: no-op
+    assert(r.core->slot(kPowerSlot).state == SlotState::EMPTY && r.port.featureSets == 2);
+  }
+  {
+    Rig r;                                             // Feature only: Location default
+    r.port.gattRead.hasFeature = true;
+    r.port.gattRead.feature = 0x0000000C;
+    r.port.gattRead.location = 5;
+    powerToSubscribed(r);
+    assert(r.port.localFeature[kPowerSlot] == 0x0C && r.port.localLocation == 0x0D);
+  }
+  {
+    Rig r;                                             // nothing readable: defaults
+    powerToSubscribed(r);
+    assert(r.port.localFeature[kPowerSlot] == 0 && r.port.localLocation == 0x0D);
+  }
+  {
+    Rig r;                                             // failed pass: nothing copied
+    r.port.gattRead.hasFeature = true;
+    r.port.gattRead.feature = 0x3;
+    r.port.gattOk = false;
+    r.port.expect[kPowerSlot] = kPowerMac;
+    assert(r.core->addByMac(SensorType::POWER, kPowerMacStr, 0, "PWR", r.now));
+    r.update();
+    r.match(r.core->scan().epoch(), kPowerMac);
+    r.update();
+    r.connectedEv(r.core->attemptGen(kPowerSlot), kPowerSlot);
+    r.update();
+    assert(r.core->slot(kPowerSlot).state == SlotState::DISCOVERING);
+    assert(r.port.gattPasses == 1 && r.port.featureSets == 0);
+  }
+}
+
+// §6b cadence callback with Power as the source: only for a new crank delta;
+// one 0 after BBS_POWER_STALE_MS and one when the source leaves Power.
+static void testPowerCadenceCallback() {
+  Rig r;                                               // CSC EMPTY
+  resetValues(r);
+  r.core->setCadenceCallback(onCadence);
+  powerToSubscribed(r);
+  assert(r.core->providesCadence());
+  assert(notifyEv(r, kCpsPlain, sizeof(kCpsPlain), kPowerSlot));   // no bit 5
+  assert(crankEv(r, 10, 1024));                        // first crank packet: no delta
+  r.update();
+  assert(g_cadCalls == 0 && r.core->slot(kPowerSlot).crank.crankValid);
+  const uint32_t t0 = r.now;
+  assert(crankEv(r, 11, 2048));                        // 60 rpm
+  assert(crankEv(r, 11, 2048));                        // no new crank event
+  assert(notifyEv(r, kCpsPlain, sizeof(kCpsPlain), kPowerSlot));
+  r.update();
+  assert(g_cadCalls == 1 && g_cadValues[0] == 60);
+  r.at(t0 + BBS_POWER_STALE_MS);                       // not stale yet
+  assert(g_cadCalls == 1);
+  r.at(t0 + BBS_POWER_STALE_MS + 1);                   // one 0, without a notify
+  assert(g_cadCalls == 2 && g_cadValues[1] == 0);
+  r.at(r.now + 1000);
+  assert(crankEv(r, 11, 2048));
+  r.update();
+  assert(g_cadCalls == 2);
+  assert(crankEv(r, 13, 3072));                        // +2 revs in 1 s: 120 rpm
+  r.update();
+  assert(g_cadCalls == 3 && g_cadValues[2] == 120);
+  assert(r.port.relays[kCsc] == 0 && r.port.relays[kPowerSlot] == 7);   // local CSC silent
+
+  r.discEv(r.core->attemptGen(kPowerSlot), 0x08, kPowerSlot);   // source leaves Power: one 0
+  r.update();
+  assert(g_cadCalls == 4 && g_cadValues[3] == 0 && !r.core->providesCadence());
+  r.at(r.now + BBS_POWER_STALE_MS + 1);
+  assert(g_cadCalls == 4);
+  assert(r.core->slot(kPowerSlot).state == SlotState::CONNECTING);   // direct attempt
+  r.connectedEv(r.core->attemptGen(kPowerSlot), kPowerSlot);
+  r.update();
+  assert(r.core->providesCadence());
+  assert(crankEv(r, 20, 5000));                        // crank reset: first packet, no cadence
+  r.update();
+  assert(g_cadCalls == 4);
+  assert(crankEv(r, 21, 6024));
+  r.update();
+  assert(g_cadCalls == 5 && g_cadValues[4] == 60);
+  r.at(r.now + BBS_POWER_STALE_MS + 1);
+  assert(g_cadCalls == 6 && g_cadValues[5] == 0);
+  assert(crankEv(r, 22, static_cast<uint16_t>(6024 + 62000)));   // 1 rev in > 60 s: 0 rpm
+  r.update();
+  assert(g_cadCalls == 7 && g_cadValues[6] == 0);
+  r.at(r.now + BBS_POWER_STALE_MS + 1);                // a reported 0 does not arm "once"
+  assert(g_cadCalls == 7);
+}
+
+// §6b source rule and switching.
+static void testCadenceSource() {
+  uint16_t rpm = 0;
+  uint32_t age = 0;
+  {
+    Rig r;                                             // CSC EMPTY → Power once SUBSCRIBED
+    resetValues(r);
+    r.core->setCadenceCallback(onCadence);
+    assert(!r.core->providesCadence() && !r.core->lastCadence(rpm, age, r.now));
+    powerToSubscribed(r);
+    assert(r.core->providesCadence() && !r.core->lastCadence(rpm, age, r.now));
+    assert(crankEv(r, 10, 1024));
+    assert(crankEv(r, 11, 2048));
+    r.update();
+    assert(g_cadCalls == 1 && r.core->lastCadence(rpm, age, r.now) && rpm == 60);
+    r.addCsc();                                        // a configured CSC wins at once
+    assert(!r.core->providesCadence() && !r.core->lastCadence(rpm, age, r.now));
+    assert(crankEv(r, 12, 3072));                      // Power data, no cadence callback
+    r.update();
+    assert(g_cadCalls == 2 && g_cadValues[1] == 0);    // the 0 for the source leaving Power
+    BikeSensor::PowerSample s{};
+    assert(r.core->lastPower(s, age, r.now) && s.hasCadence && s.cadence == 60);
+    assert(r.cscState() == SlotState::WAIT_SCAN && r.port.relays[kCsc] == 0);
+    r.core->remove(SensorType::SPEED_CADENCE, r.now);  // back to Power at once
+    assert(r.core->providesCadence() && r.core->lastCadence(rpm, age, r.now) && rpm == 60);
+    r.update();
+    assert(g_cadCalls == 2);                           // no 0: nothing armed
+
+    r.now += BBS_SLEEP_SCAN_DURATION_MS + BBS_SLEEP_SCAN_INTERVAL_MS;   // next sleep window
+    cscToSubscribed(r);                                // CSC and Power SUBSCRIBED: CSC
+    assert(!r.core->providesCadence());
+    assert(crankEv(r, 13, 4096));
+    assert(notifyEv(r, kCscFirst, sizeof(kCscFirst), kCsc));
+    assert(notifyEv(r, kCsc60, sizeof(kCsc60), kCsc));
+    r.update();
+    assert(g_cadCalls == 3 && g_cadValues[2] == 60 && r.port.relays[kCsc] == 2);
+    assert(r.core->lastCadence(rpm, age, r.now) && rpm == 60);
+    r.discEv(r.cscGen(), 0x08, kCsc);                  // reconnecting CSC still wins
+    r.update();
+    assert(r.cscState() != SlotState::SUBSCRIBED && !r.core->providesCadence());
+    assert(!r.core->lastCadence(rpm, age, r.now));
+  }
+  {
+    // CSC not in the begin() mask; also CSC not compiled (enabled_ is mask ∩
+    // compiled, so both lack the CSC bit): Power is the source.
+    Rig r(Mode::MAC, 0x05);
+    resetValues(r);
+    r.core->setCadenceCallback(onCadence);
+    assert(!r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 0, "CSC", r.now));
+    powerToSubscribed(r);
+    assert(r.core->providesCadence());
+    assert(crankEv(r, 10, 1024));
+    assert(crankEv(r, 11, 2048));
+    r.update();
+    assert(g_cadCalls == 1 && g_cadValues[0] == 60);
+    assert(r.core->lastCadence(rpm, age, r.now) && rpm == 60);
+    r.port.linkUp[kPowerSlot] = false;                 // missed DISCONNECTED, found by resync
+    r.core->queue().requestResync();
+    r.update();
+    assert(!r.core->providesCadence());
+  }
+}
+
+// Getters: stale rule at the caller's now, now read before update(), ages.
+static void testPowerGetters() {
+  Rig r;
+  powerToSubscribed(r);
+  assert(crankEv(r, 10, 1024));
+  r.update();
+  r.now += 100;
+  const uint32_t t = r.now;
+  assert(crankEv(r, 11, 2048));
+  r.update();
+  BikeSensor::PowerSample s{};
+  uint32_t age = 0;
+  uint16_t rpm = 0;
+  assert(r.core->lastPower(s, age, t - 5) && age == 0 && s.cadence == 60);   // no wrap
+  assert(r.core->lastCadence(rpm, age, t - 5) && rpm == 60 && age == 0);
+  assert(r.core->lastPower(s, age, t + BBS_POWER_STALE_MS) && s.cadence == 60);
+  assert(r.core->lastPower(s, age, t + BBS_POWER_STALE_MS + 1) && s.cadence == 0 && s.hasCadence);
+  assert(r.core->lastCadence(rpm, age, t + BBS_POWER_STALE_MS + 1) && rpm == 0);
+  assert(age == BBS_POWER_STALE_MS + 1);
+  r.now = t + 1000;                                    // packet age vs crank-event age
+  assert(notifyEv(r, kCpsPlain, sizeof(kCpsPlain), kPowerSlot));
+  r.update();
+  assert(r.core->lastPower(s, age, t + 1500) && age == 500 && s.cadence == 60);
+  assert(r.core->lastCadence(rpm, age, t + 1500) && age == 1500 && rpm == 60);
+  r.discEv(r.core->attemptGen(kPowerSlot), 0x08, kPowerSlot);   // link end clears
+  r.update();
+  assert(!r.core->lastPower(s, age, r.now) && !r.core->lastCadence(rpm, age, r.now));
+  assert(!r.core->slot(kPowerSlot).crank.crankValid);
+  r.connectedEv(r.core->attemptGen(kPowerSlot), kPowerSlot);   // no cadence carried over
+  r.update();
+  assert(notifyEv(r, kCpsPlain, sizeof(kCpsPlain), kPowerSlot));
+  r.update();
+  assert(r.core->lastPower(s, age, r.now) && !s.hasCadence && s.cadence == 0);
+  assert(!r.core->lastCadence(rpm, age, r.now));
+}
+
+// §4 / §7.5: the meter's MAC or name cannot be added for another type; a
+// SCAN_MATCH for its address is ignored by another slot.
+static void testPowerDuplicates() {
+  {
+    Rig r;
+    assert(r.core->addByMac(SensorType::POWER, kPowerMacStr, 0, "PWR", r.now));
+    assert(!r.core->addByMac(SensorType::SPEED_CADENCE, kPowerMacStr, 0, "CSC", r.now));
+    assert(!r.core->addByMac(SensorType::HEART_RATE, "AA:BB:CC:DD:EE:04", 1, nullptr, r.now));
+    assert(r.cscState() == SlotState::EMPTY && r.state() == SlotState::EMPTY);
+    r.addCsc();
+    assert(!r.core->addByMac(SensorType::POWER, kCscMacStr, 0, "PWR", r.now));
+    assert(memcmp(r.core->slot(kPowerSlot).mac, kPowerMac, 6) == 0);
+    r.core->remove(SensorType::POWER, r.now);
+    r.core->remove(SensorType::SPEED_CADENCE, r.now);
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kPowerMacStr, 0, "CSC", r.now));
+  }
+  {
+    Rig r(Mode::NAME);
+    r.port.expect[kPowerSlot] = kPowerMac;
+    assert(r.core->addByName(SensorType::POWER, "Assioma", r.now));
+    assert(!r.core->addByName(SensorType::SPEED_CADENCE, "Assioma", r.now));
+    r.update();
+    assert(r.report(kPowerMac, "Assioma"));
+    r.update();
+    r.connectedEv(r.core->attemptGen(kPowerSlot), kPowerSlot);
+    r.update();
+    assert(r.core->slot(kPowerSlot).state == SlotState::SUBSCRIBED);
+    assert(r.core->addByName(SensorType::SPEED_CADENCE, "Assio", r.now));   // its shortened name
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::NAME_SCAN);
+    assert(r.report(kPowerMac, "Assio"));
+    r.update();
+    assert(r.cscState() == SlotState::IDLE && countEvents(EventType::SENSOR_FOUND) == 1);
+  }
+}
+#else
+static void onPowerNever(const BikeSensor::PowerSample&) { assert(false); }
+
+// §4: lastPower/setPowerCallback exist without Power; false / never called.
+static void testPowerAbsent() {
+  Rig r;
+  r.core->setPowerCallback(onPowerNever);
+  r.toSubscribed();
+  const uint8_t hr[] = {0x00, 72};
+  assert(notifyEv(r, hr, sizeof(hr)));
+  r.update();
+  BikeSensor::PowerSample s{};
+  uint32_t age = 0;
+  assert(!r.core->lastPower(s, age, r.now) && !r.core->providesCadence());
+}
+#endif
+
 // 2.x BBSIdentity::SetDeviceNamePrefix + GetBleDeviceNameLower, String ops
 // replaced one to one.
 static std::string legacyName(const char* prefix, uint32_t id32) {
@@ -3602,7 +3987,7 @@ static void testRefreshAdvertising() {
   assert(r.core->refreshAdvertising(r.now));
   assert(r.port.advDataSets == 2 && strcmp(r.port.advName, "trainer-da4eb580") == 0);
   assert(!r.port.advOnAtDataSet && r.port.advStops == 1);   // stopped before the rebuild
-  assert(r.port.advOn && r.port.advStarts == 2 && r.port.advMask == 0x03);
+  assert(r.port.advOn && r.port.advStarts == 2 && r.port.advMask == bs::kCompiledMask);
   assert(r.core->stats().advertisingEnforced == 0);
 
   r.port.advOn = false;                                // not advertising: no stop
@@ -4900,9 +5285,6 @@ int main() {
   testNotifyTruncated();
   testNotifyMalformedStillRelayed();
   testCrankResetOnLinkEnd();
-#if BBS_COMPILE_POWER
-  testPowerNotifyNotWiredYet();
-#endif
   testCentralEvents();
   testCentralCountResync();
   testAdvertisingDesiredState();
@@ -4921,6 +5303,17 @@ int main() {
   testDataCallbackReentrancy();
   testRefreshFromEventCallback();
   testLinkLossClearsMeasurement();
+  testCscFeatureCopy();
+#if BBS_COMPILE_POWER
+  testPowerNotify();
+  testPowerFeatureCopy();
+  testPowerCadenceCallback();
+  testCadenceSource();
+  testPowerGetters();
+  testPowerDuplicates();
+#else
+  testPowerAbsent();
+#endif
   testDiscoveryNatural();
   testDiscoveryFields();
   testDiscoveryDuration();

@@ -18,6 +18,15 @@ constexpr int kHsEBusy = 15;
 constexpr int kHsENotSynced = 22;
 constexpr uint16_t kConnHandleNone = 0xFFFF;         // BLE_HS_CONN_HANDLE_NONE
 
+// gattPass() reads. has* false: characteristic missing, not readable or too short.
+struct GattResult {
+  uint8_t battery = 255;                             // 255 = not readable
+  bool hasFeature = false;                           // CSC 0x2A5C (2 B), CP 0x2A65 (4 B)
+  uint32_t feature = 0;
+  bool hasLocation = false;                          // CP 0x2A5D (1 B)
+  uint8_t location = 0;
+};
+
 class BlePort {
  public:
   virtual bool hsSynced() = 0;                       // ble_hs_synced()
@@ -38,16 +47,20 @@ class BlePort {
   // onDisconnect/onConnectFail (NimBLEClient.cpp:1081–1087).
   virtual uint16_t connHandle(uint8_t slot) = 0;
 
-  // One blocking GATT pass (§5.2): service, characteristic, subscribe, battery.
-  // battery = 255 if not readable.
-  virtual bool gattPass(uint8_t slot, SensorType type, uint8_t& battery) = 0;
+  // One blocking GATT pass (§5.2): service, characteristic, CSC/CP Feature
+  // (CP also Sensor Location) reads, subscribe, battery. The reads are optional.
+  virtual bool gattPass(uint8_t slot, SensorType type, GattResult& out) = 0;
   virtual void gattTimerStart(uint32_t ms) = 0;      // one-shot esp_timer
   virtual void gattTimerStop() = 0;
 
   // Local GATT server (§5.4). serverStart() creates the server, the local
-  // measurement characteristics of the typeBit()s in typeMask and their
-  // callbacks once, then starts the GATT server; true if already started.
+  // services of the typeBit()s in typeMask (measurement; CSC/CP Feature and CP
+  // Sensor Location with their defaults) and their callbacks once, then
+  // starts the GATT server; true if already started.
   virtual bool serverStart(uint8_t typeMask) = 0;
+  // Local CSC Feature (2 B) or CP Feature (4 B) + Sensor Location; no-op for
+  // HR or without that local service.
+  virtual void setLocalFeature(SensorType type, uint32_t feature, uint8_t location) = 0;
   // Replaces the advertising data with name + the service UUIDs of typeMask.
   // Takes effect at the next advStart(). False if a field did not fit.
   virtual bool advSetData(const char* name, uint8_t typeMask) = 0;

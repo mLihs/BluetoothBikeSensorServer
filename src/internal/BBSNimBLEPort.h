@@ -73,7 +73,9 @@ class NimBLEPort final : public BlePort {
     for (uint8_t i = 0; i < kSlots; ++i) {
       clients_[i] = nullptr;
       localChr_[i] = nullptr;
+      featureChr_[i] = nullptr;
     }
+    locationChr_ = nullptr;
     server_ = nullptr;
     return true;
   }
@@ -126,14 +128,24 @@ class NimBLEPort final : public BlePort {
     return clients_[slot] != nullptr ? clients_[slot]->getConnHandle() : BLE_HS_CONN_HANDLE_NONE;
   }
 
-  bool gattPass(uint8_t slot, SensorType type, uint8_t& battery) override {
+  bool gattPass(uint8_t slot, SensorType type, GattResult& out) override {
     NimBLEClient* client = clients_[slot];
-    battery = 255;
+    out = GattResult{};
+    // Power pass step 1, proactive security (§5.2, §6a): §10 step 9.
     NimBLERemoteService* service = client->getService(NimBLEUUID(serviceUuid(type)));
     if (service == nullptr) return false;
     NimBLERemoteCharacteristic* chr =
         service->getCharacteristic(NimBLEUUID(measurementUuid(type)));
     if (chr == nullptr || !chr->canNotify()) return false;
+    uint32_t value = 0;
+    if (type != SensorType::HEART_RATE) {          // optional, non-fatal
+      out.hasFeature = readLe(service, featureUuid(type), type == SensorType::POWER ? 4 : 2,
+                              out.feature);
+    }
+    if (type == SensorType::POWER && readLe(service, 0x2A5D, 1, value)) {
+      out.hasLocation = true;
+      out.location = static_cast<uint8_t>(value);
+    }
     // Captures one byte: std::function keeps it inline, no heap.
     if (!chr->subscribe(true,
                         [slot](NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
@@ -144,13 +156,8 @@ class NimBLEPort final : public BlePort {
       return false;
     }
     NimBLERemoteService* batt = client->getService(NimBLEUUID(static_cast<uint16_t>(0x180F)));
-    NimBLERemoteCharacteristic* level =
-        batt != nullptr ? batt->getCharacteristic(NimBLEUUID(static_cast<uint16_t>(0x2A19)))
-                        : nullptr;
-    if (level != nullptr && level->canRead()) {
-      const NimBLEAttValue value = level->readValue();
-      if (value.size() >= 1) battery = value[0];
-    }
+    if (readLe(batt, 0x2A19, 1, value)) out.battery = static_cast<uint8_t>(value);
+    // Power pass step 6, encryption/bond sample (§5.2): §10 step 9.
     return true;
   }
 
@@ -159,10 +166,12 @@ class NimBLEPort final : public BlePort {
   }
   void gattTimerStop() override { esp_timer_stop(gattTimer_); }
 
-  // HR and CSC measurement characteristics for the types in typeMask (the
-  // Core passes enabled ∩ compiled). Each value is pre-sized to
-  // BBS_NOTIFY_MAX_LEN, so setValue() in relay() never reallocates
-  // (NimBLEAttValue grows only past its capacity).
+  // One local service per type in typeMask (the Core passes begin() mask ∩
+  // compiled; rev 31: no runtime service changes), §5.4: measurement (NOTIFY); CSC also Feature 0x2A5C, CP also
+  // Feature 0x2A65 and Sensor Location 0x2A5D (READ, defaults until a GATT
+  // pass). Each measurement value is pre-sized to BBS_NOTIFY_MAX_LEN, so
+  // setValue() in relay() never reallocates (NimBLEAttValue grows only past
+  // its capacity).
   bool serverStart(uint8_t typeMask) override {
     if (server_ == nullptr) {
       NimBLEServer* server = NimBLEDevice::createServer();
@@ -170,8 +179,7 @@ class NimBLEPort final : public BlePort {
       server->setCallbacks(&serverCb_, false);
       server->advertiseOnDisconnect(false);
       static const uint8_t kZeros[BBS_NOTIFY_MAX_LEN] = {};
-      const SensorType types[] = {SensorType::HEART_RATE, SensorType::SPEED_CADENCE};
-      for (SensorType type : types) {
+      for (SensorType type : kTypes) {
         const int slot = slotIndex(type);
         if (slot < 0 || (typeMask & typeBit(type)) == 0) continue;
         NimBLEService* service = server->createService(NimBLEUUID(serviceUuid(type)));
@@ -180,6 +188,16 @@ class NimBLEPort final : public BlePort {
         chr->setValue(kZeros, sizeof(kZeros));
         chrCb_[slot].slot = static_cast<uint8_t>(slot);
         chr->setCallbacks(&chrCb_[slot]);
+        if (type != SensorType::HEART_RATE) {
+          featureChr_[slot] =
+              service->createCharacteristic(NimBLEUUID(featureUuid(type)), NIMBLE_PROPERTY::READ);
+        }
+        if (type == SensorType::POWER) {
+          locationChr_ = service->createCharacteristic(NimBLEUUID(static_cast<uint16_t>(0x2A5D)),
+                                                       NIMBLE_PROPERTY::READ);
+        }
+        setLocalFeature(type, type == SensorType::POWER ? kCpFeatureDefault : kCscFeatureDefault,
+                        kCpLocationDefault);
         service->start();
         localChr_[slot] = chr;
       }
@@ -192,14 +210,24 @@ class NimBLEPort final : public BlePort {
     return server_->start();
   }
 
+  // Little endian, same sizes as created: setValue() does not reallocate.
+  void setLocalFeature(SensorType type, uint32_t feature, uint8_t location) override {
+    const int slot = slotIndex(type);
+    if (slot < 0 || featureChr_[slot] == nullptr) return;
+    const uint8_t bytes[4] = {static_cast<uint8_t>(feature), static_cast<uint8_t>(feature >> 8),
+                              static_cast<uint8_t>(feature >> 16),
+                              static_cast<uint8_t>(feature >> 24)};
+    featureChr_[slot]->setValue(bytes, type == SensorType::POWER ? 4 : 2);
+    if (type == SensorType::POWER && locationChr_ != nullptr) locationChr_->setValue(&location, 1);
+  }
+
   // Edits NimBLE's own advertising data (no HCI); start() applies it, also
   // the restart after a host reset (NimBLEAdvertising::onHostSync).
   bool advSetData(const char* name, uint8_t typeMask) override {
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->clearData();
     bool ok = adv->setName(name);
-    const SensorType types[] = {SensorType::HEART_RATE, SensorType::SPEED_CADENCE};
-    for (SensorType type : types) {
+    for (SensorType type : kTypes) {
       if ((typeMask & typeBit(type)) != 0) {
         ok = adv->addServiceUUID(NimBLEUUID(serviceUuid(type))) && ok;
       }
@@ -293,6 +321,24 @@ class NimBLEPort final : public BlePort {
     }
   }
 
+  // CSC Feature, CP Feature.
+  static uint16_t featureUuid(SensorType type) {
+    return type == SensorType::SPEED_CADENCE ? 0x2A5C : 0x2A65;
+  }
+
+  // GATT pass: the first len bytes of a readable characteristic, little endian.
+  // False if the service or characteristic is missing, or the read is short.
+  static bool readLe(NimBLERemoteService* service, uint16_t uuid, size_t len, uint32_t& out) {
+    NimBLERemoteCharacteristic* chr =
+        service != nullptr ? service->getCharacteristic(NimBLEUUID(uuid)) : nullptr;
+    if (chr == nullptr || !chr->canRead()) return false;
+    const NimBLEAttValue value = chr->readValue();
+    if (value.size() < len) return false;
+    out = 0;
+    for (size_t i = 0; i < len; ++i) out |= static_cast<uint32_t>(value[i]) << (8 * i);
+    return true;
+  }
+
   // NimBLE host task. cb_arg carries the scan epoch.
   static int gapScanCb(ble_gap_event* event, void* arg) {
     const uint16_t epoch = static_cast<uint16_t>(reinterpret_cast<uintptr_t>(arg));
@@ -336,6 +382,8 @@ class NimBLEPort final : public BlePort {
     if (watchdog.onTimer()) ble_gap_terminate(watchdog.connHandle(), BLE_ERR_REM_USER_CONN_TERM);
   }
 
+  static constexpr SensorType kTypes[] = {SensorType::HEART_RATE, SensorType::SPEED_CADENCE,
+                                          SensorType::POWER};
   static inline NimBLEPort* self_ = nullptr;
   Core* core_ = nullptr;
   NimBLEClient* clients_[kSlots] = {};
@@ -346,6 +394,8 @@ class NimBLEPort final : public BlePort {
   ServerCallbacks serverCb_;
   CharacteristicCallbacks chrCb_[kSlots];
   NimBLECharacteristic* localChr_[kSlots] = {};
+  NimBLECharacteristic* featureChr_[kSlots] = {};   // CSC 0x2A5C, CP 0x2A65
+  NimBLECharacteristic* locationChr_ = nullptr;      // CP 0x2A5D
 };
 
 }  // namespace internal

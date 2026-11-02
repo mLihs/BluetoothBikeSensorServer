@@ -15,13 +15,13 @@
 #include "BBSScanController.h"
 #include "BBSTypes.h"
 
-// One slot per compiled sensor type, one mode for all slots (§10 steps 3–7):
+// One slot per compiled sensor type, one mode for all slots (§10 steps 3–8):
 // slot machine (§5.2), event handling (§5.1), resync (§3.2), HOST_RESET, the
-// app lifecycle, DATA and central events (§4), HR/CSC data callbacks, relay,
-// server name and advertising desired state (§5.4), discovery (§3.3, §5.3),
-// pause/quiesce and begin()/end() (§4), driven through BlePort. Arduino-free;
-// the caller passes millis() as `now`. Everything except the members marked
-// "any task" runs on the update() task.
+// app lifecycle, DATA and central events (§4), HR/CSC/Power data callbacks,
+// cadence source (§6b), relay, server name and advertising desired state
+// (§5.4), discovery (§3.3, §5.3), pause/quiesce and begin()/end() (§4),
+// driven through BlePort. Arduino-free; the caller passes millis() as `now`.
+// Everything except the members marked "any task" runs on the update() task.
 
 namespace BikeSensor {
 namespace internal {
@@ -84,6 +84,17 @@ constexpr uint32_t kTransientRetryMs = 500;
 constexpr uint32_t kBackoffMinMs = 1000;
 constexpr uint32_t kBackoffMaxMs = 30000;
 
+// §5.4 local Feature/Location defaults, and the sensor bits the relay copies
+// (it has no Control Point).
+constexpr uint32_t kCscFeatureDefault = 0x0002;         // crank data
+constexpr uint32_t kCscFeatureMask = 0x0003;
+constexpr uint32_t kCpFeatureDefault = 0;
+constexpr uint32_t kCpFeatureMask = 0x000301FF;
+constexpr uint8_t kCpLocationDefault = 0x0D;            // rear hub
+
+// §6b. Kept in the Core (info().providesCadence is §10 step 9).
+enum class CadenceSource : uint8_t { NONE, CSC, POWER };
+
 struct SensorSlot {
   SensorType type;                      // fixed by the slot index
   SlotState  state;
@@ -98,12 +109,14 @@ struct SensorSlot {
   uint32_t   stateSinceMs;
   uint32_t   holdFromMs;                // FOUND connects not before holdFromMs + holdMs
   uint32_t   holdMs;
-  CrankState crank;                     // CSC; reset whenever an attempt or link ends
-  // Last measurement (HR bpm, CSC cadence), under tableMux. Set only in
-  // SUBSCRIBED and cleared whenever an attempt or link ends.
+  CrankState crank;                     // CSC and Power; reset whenever an attempt or link ends
+  // Last measurement (HR bpm, CSC cadence, Power sample), under tableMux. Set
+  // only in SUBSCRIBED and cleared whenever an attempt or link ends.
   bool       hasValue;
   uint16_t   value;
   uint32_t   valueMs;                   // `now` of the packet that produced it
+  PowerSample power;                    // Power: stale rule applied at valueMs
+  uint32_t   crankMs;                   // Power: crank.lastCrankEventMs, for the getters
   bool       removing;                  // remove() in a link state: EMPTY on the outcome
   // Per-attempt flags. Set only during an attempt or link; leaveAttempt()
   // resets all three when it ends. clearSlot() also clears them; retarget()
@@ -156,6 +169,7 @@ class Core {
     } else {
       enter(s, SlotState::WAIT_SCAN, now);
     }
+    refreshCadenceSource();
     return true;
   }
 
@@ -185,14 +199,17 @@ class Core {
     } else {
       enter(s, SlotState::IDLE, now);
     }
+    refreshCadenceSource();
     return true;
   }
 
-  // §5.2 remove() table. Link states finish on their outcome event.
+  // §5.2 remove() table. Link states finish on their outcome event. The local
+  // Feature/Location of the type return to their defaults (§5.4).
   void remove(SensorType type, uint32_t now) {
     const int i = slotIndex(type);
     if (i < 0) return;
     SensorSlot& s = slots_[i];
+    if (s.state != SlotState::EMPTY) copyFeature(type, GattResult{});
     switch (s.state) {
       case SlotState::EMPTY:
         return;
@@ -211,6 +228,7 @@ class Core {
         return;
       default:  // IDLE, WAIT_SCAN, FOUND, STOPPING_FOR_CONNECT (its stop already set the scan OFF)
         clearSlot(s);
+        refreshCadenceSource();         // remove(CSC) hands back to Power at once
         return;
     }
   }
@@ -277,6 +295,8 @@ class Core {
 
   void setHeartRateCallback(void (*cb)(uint16_t bpm)) { heartRateCb_ = cb; }
   void setCadenceCallback(void (*cb)(uint16_t rpm)) { cadenceCb_ = cb; }
+  // Never called without BBS_COMPILE_POWER.
+  void setPowerCallback(void (*cb)(const PowerSample&)) { powerCb_ = cb; }
 
   // Any task; now: the caller's millis(). False while the source slot is not
   // SUBSCRIBED or has not delivered since entering it (§4 rev 27); the outputs
@@ -284,9 +304,38 @@ class Core {
   bool lastHeartRate(uint16_t& bpm, uint32_t& ageMs, uint32_t now) {
     return lastValue(slotIndex(SensorType::HEART_RATE), bpm, ageMs, now);
   }
+  // §6b source. Power: false until a crank delta (hasCadence); the stale rule
+  // applies and ageMs is the time since the last crank event.
   bool lastCadence(uint16_t& rpm, uint32_t& ageMs, uint32_t now) {
-    if (!cadenceFromCsc()) return false;  // source none (§6b)
-    return lastValue(slotIndex(SensorType::SPEED_CADENCE), rpm, ageMs, now);
+    CadenceSource source;
+    {
+      MuxGuard guard(tableMux_);
+      source = source_;
+    }
+    if (source == CadenceSource::CSC) {
+      return lastValue(slotIndex(SensorType::SPEED_CADENCE), rpm, ageMs, now);
+    }
+    PowerSample sample;
+    uint32_t at, crankMs;
+    if (source != CadenceSource::POWER || !readPower(sample, at, crankMs, now) ||
+        !sample.hasCadence) {
+      return false;
+    }
+    rpm = sample.cadence;
+    ageMs = now - crankMs;
+    return true;
+  }
+  // Always false without BBS_COMPILE_POWER. The stale rule (§6) applies at now.
+  bool lastPower(PowerSample& out, uint32_t& ageMs, uint32_t now) {
+    uint32_t at, crankMs;
+    if (!readPower(out, at, crankMs, now)) return false;
+    ageMs = now - at;
+    return true;
+  }
+  // Any task. §6b: Power is the cadence source.
+  bool providesCadence() {
+    MuxGuard guard(tableMux_);
+    return source_ == CadenceSource::POWER;
   }
 
   // §5.3. False under quiesce, while a discovery is pending or open, or for a
@@ -404,6 +453,8 @@ class Core {
     enabled_ = typeMask & kCompiledMask;
     scan_.reset(mode);
     for (SensorSlot& s : slots_) clearSlot(s);
+    refreshCadenceSource();
+    cadenceArmed_ = false;
     Event ev;
     while (queue_.pop(ev)) {}
     queue_.takeResync();
@@ -516,6 +567,7 @@ class Core {
     enforceAdvertising(now);
     if (!quiesced_) gattStep(now);
     for (uint8_t i = 0; i < kSlotCount; ++i) advanceSlot(i, now);
+    advanceCadence(now);
     orphanSweep();
     if (quiesced_) return;
     FinishReason finish;
@@ -686,6 +738,8 @@ class Core {
     s.hasValue = false;
     s.value = 0;
     s.valueMs = 0;
+    s.power = PowerSample{};
+    s.crankMs = 0;
   }
 
   // The single exit of an attempt or link. Resets the per-attempt flags, the
@@ -867,14 +921,16 @@ class Core {
 
   // §5.1 NOTIFY on a SUBSCRIBED slot. A cut packet contradicts its own flags:
   // neither parsed nor relayed. A malformed one is still relayed raw, without
-  // data callbacks or DATA. Power notifies are wired with the local CPS
-  // (§10 step 8).
+  // data callbacks or DATA.
   void onNotify(uint8_t i, const Event& ev, uint32_t now) {
     SensorSlot& s = slots_[i];
-    if (s.type == SensorType::POWER) return;  // step 8: count notifies++ above this
     stats_.notifies++;
     if (ev.reason > ev.notify.len) {
       stats_.notifiesTruncated++;
+      return;
+    }
+    if (s.type == SensorType::POWER) {
+      onPowerNotify(i, ev, now);
       return;
     }
     uint16_t value = 0;
@@ -892,10 +948,56 @@ class Core {
     const SensorType type = s.type;
     if (type == SensorType::HEART_RATE) {
       if (heartRateCb_ != nullptr) heartRateCb_(value);
-    } else if (hasValue && cadenceFromCsc() && cadenceCb_ != nullptr) {
+    } else if (hasValue && currentCadenceSource() == CadenceSource::CSC &&
+               cadenceCb_ != nullptr) {
       cadenceCb_(value);
     }
     emit(EventType::DATA, type);
+  }
+
+  // §6, §6b. The stored sample carries cadence over packets without a crank
+  // event. Relay → power callback → cadence callback (Power source, new crank
+  // delta only) → DATA.
+  void onPowerNotify(uint8_t i, const Event& ev, uint32_t now) {
+    SensorSlot& s = slots_[i];
+    PowerSample sample = s.power;       // only this task writes it
+    bool crankUpdated = false;
+    const bool ok = parsePower(ev.notify.data, ev.notify.len, now, s.crank, sample, crankUpdated);
+    if (!ok) stats_.notifiesMalformed++;
+    port_.relay(i, ev.notify.data, ev.notify.len);
+    if (!ok) return;
+    {
+      MuxGuard guard(tableMux_);
+      s.power = sample;
+      s.hasValue = true;
+      s.valueMs = now;
+      s.crankMs = s.crank.lastCrankEventMs;
+    }
+    if (powerCb_ != nullptr) powerCb_(sample);
+    if (crankUpdated && currentCadenceSource() == CadenceSource::POWER) {
+      cadenceArmed_ = sample.cadence != 0;
+      if (cadenceCb_ != nullptr) cadenceCb_(sample.cadence);
+    }
+    emit(EventType::DATA, SensorType::POWER);
+  }
+
+  // Any task: the Power slot's sample with the stale rule at now (moved up to
+  // the packet time if read before update() stored it). out is written only on true.
+  bool readPower(PowerSample& out, uint32_t& at, uint32_t& crankMs, uint32_t& now) {
+    const int p = slotIndex(SensorType::POWER);
+    if (p < 0) return false;
+    {
+      MuxGuard guard(tableMux_);
+      if (!slots_[p].hasValue) return false;
+      out = slots_[p].power;
+      at = slots_[p].valueMs;
+      crankMs = slots_[p].crankMs;
+    }
+    if (static_cast<int32_t>(now - at) < 0) now = at;
+    CrankState crank{};
+    crank.lastCrankEventMs = crankMs;
+    applyPowerStale(out, crank, now);
+    return true;
   }
 
   // HR: bpm. CSC: cadence, hasValue only when the packet reports one (§6:
@@ -928,9 +1030,37 @@ class Core {
     return true;
   }
 
-  // §6b source rule until step 8: CSC in the begin() mask (its slot is
-  // SUBSCRIBED whenever it delivers).
-  bool cadenceFromCsc() const { return (enabled_ & typeBit(SensorType::SPEED_CADENCE)) != 0; }
+  // §6b source rule (rev 31): a configured (non-EMPTY) CSC slot, CSC compiled
+  // and in the begin() mask, always wins; otherwise a SUBSCRIBED Power slot;
+  // otherwise none.
+  CadenceSource currentCadenceSource() const {
+    const int csc = enabledSlot(SensorType::SPEED_CADENCE);
+    if (csc >= 0 && slots_[csc].state != SlotState::EMPTY) return CadenceSource::CSC;
+    const int p = slotIndex(SensorType::POWER);
+    if (p >= 0 && slots_[p].state == SlotState::SUBSCRIBED) return CadenceSource::POWER;
+    return CadenceSource::NONE;
+  }
+
+  // The copy the any-task getters read.
+  void refreshCadenceSource() {
+    const CadenceSource source = currentCadenceSource();
+    MuxGuard guard(tableMux_);
+    source_ = source;
+  }
+
+  // §5.1 step 5, §6b: after non-zero Power cadence callbacks, one 0 when no
+  // crank event came for BBS_POWER_STALE_MS or the source left Power.
+  void advanceCadence(uint32_t now) {
+    refreshCadenceSource();
+    if (!cadenceArmed_) return;
+    const int p = slotIndex(SensorType::POWER);
+    if (p >= 0 && currentCadenceSource() == CadenceSource::POWER &&
+        now - slots_[p].crank.lastCrankEventMs <= BBS_POWER_STALE_MS) {
+      return;
+    }
+    cadenceArmed_ = false;
+    if (cadenceCb_ != nullptr) cadenceCb_(0);
+  }
 
   // The server's count is authoritative: a +1/-1 per event would count twice
   // the CENTRAL_* events still queued behind a resync that read it.
@@ -960,11 +1090,21 @@ class Core {
     return (enabled_ & typeBit(type)) != 0 ? slotIndex(type) : -1;
   }
 
-  // Enabled types with a local service; the local CPS is §10 step 8.
+  // begin() mask ∩ compiled; each has a local service, created once per
+  // begin() (rev 31), and its UUID in the advertising.
   uint8_t localTypes() const { return localTypes(enabled_); }
-  static uint8_t localTypes(uint8_t typeMask) {
-    return typeMask & kCompiledMask &
-           (typeBit(SensorType::HEART_RATE) | typeBit(SensorType::SPEED_CADENCE));
+  static uint8_t localTypes(uint8_t typeMask) { return typeMask & kCompiledMask; }
+
+  // §5.4: the sensor's Feature without the bits that need a Control Point (CP
+  // also the Sensor Location); a missing read gives the default. HR: no-op.
+  void copyFeature(SensorType type, const GattResult& r) {
+    if (type == SensorType::SPEED_CADENCE) {
+      port_.setLocalFeature(type, r.hasFeature ? r.feature & kCscFeatureMask : kCscFeatureDefault,
+                            0);
+    } else if (type == SensorType::POWER) {
+      port_.setLocalFeature(type, r.hasFeature ? r.feature & kCpFeatureMask : kCpFeatureDefault,
+                            r.hasLocation ? r.location : kCpLocationDefault);
+    }
   }
 
   // Rev 28: a failed start holds the next one for BBS_SCAN_START_BACKOFF_MS
@@ -1129,15 +1269,16 @@ class Core {
     for (uint8_t i = 0; i < kSlotCount; ++i) {
       SensorSlot& s = slots_[i];
       if (s.state != SlotState::DISCOVERING || s.gattDone || s.removing) continue;
-      uint8_t battery = 255;
+      GattResult result;
       const uint32_t gen = watchdog_.arm(port_.connHandle(i));
       port_.gattTimerStart(BBS_GATT_BUDGET_MS);
-      const bool ok = port_.gattPass(i, s.type, battery);
+      const bool ok = port_.gattPass(i, s.type, result);
       watchdog_.disarm();
       port_.gattTimerStop();
       const bool aborted = watchdog_.fired(gen);
       if (ok && !aborted) {
-        s.battery = battery;
+        s.battery = result.battery;
+        copyFeature(s.type, result);
         s.failCount = 0;
         enter(s, SlotState::SUBSCRIBED, now);
         emit(EventType::SENSOR_CONNECTED, s.type);
@@ -1278,6 +1419,9 @@ class Core {
   EventCallback eventCb_ = nullptr;
   void (*heartRateCb_)(uint16_t) = nullptr;
   void (*cadenceCb_)(uint16_t) = nullptr;
+  void (*powerCb_)(const PowerSample&) = nullptr;
+  CadenceSource source_ = CadenceSource::NONE;     // under tableMux_; refreshCadenceSource()
+  bool cadenceArmed_ = false;           // §6b "once": a non-zero Power cadence callback since the last 0
   char prefix_[kNamePrefixMax + 1] = "homewind";   // under tableMux_
   uint8_t centralCount_ = 0;            // under tableMux_
   bool serverStarted_ = false;
