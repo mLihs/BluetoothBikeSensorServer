@@ -113,9 +113,11 @@ class NimBLEPort final : public BlePort {
   bool connActive() override { return ble_gap_conn_active() != 0; }
 
   int discStart(uint16_t epoch, uint32_t durationMs, bool filterDuplicates) override {
-    uint8_t ownAddrType = 0;
-    const int rc = ble_hs_id_infer_auto(0, &ownAddrType);
-    if (rc != 0) return rc;
+    // NimBLE's rule (NimBLEDevice::onSync), not ble_hs_id_infer_auto(): that prefers a
+    // random address the controller lacks after end() + begin() (§5.3).
+    const uint8_t ownAddrType = ble_hs_id_copy_addr(BLE_ADDR_PUBLIC, nullptr, nullptr) == 0
+                                    ? BLE_OWN_ADDR_PUBLIC
+                                    : BLE_OWN_ADDR_RANDOM;
     ble_gap_disc_params params{};
     params.itvl = 97;                   // 2.x server/sleep-scan parameters
     params.window = 67;
