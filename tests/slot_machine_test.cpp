@@ -118,7 +118,7 @@ struct FakePort final : BlePort {
     if (onConnHandle) onConnHandle(slot);
     return linkUp[slot] || disconnecting[slot] ? 7 : bs::kConnHandleNone;
   }
-  bs::GattResult gattRead;                             // Feature/Location the sensor returns
+  bs::GattResult gattRead;                             // Feature/Location, encryption the pass returns
   bool gattPass(uint8_t slot, SensorType type, bs::GattResult& out) override {
     assert(bs::slotIndex(type) == slot);
     gattPasses++;
@@ -5327,7 +5327,7 @@ static void testInfoAndConnected() {
   bool inPass = false;                                 // during the GATT pass: DISCOVERING
   r.port.duringGatt = [&] {
     assert(r.core->info(SensorType::HEART_RATE, info) && info.state == SlotState::DISCOVERING);
-    assert(!r.core->connected(SensorType::HEART_RATE));
+    assert(!r.core->connected(SensorType::HEART_RATE) && !info.encrypted);
     inPass = true;
   };
   r.port.gattRead.encrypted = true;                    // paired on demand (§5.2, every type)
@@ -5360,15 +5360,17 @@ static void testInfoAndConnected() {
 }
 
 // info() from another task while update() changes the slot (no deadlock, a
-// consistent copy: battery known only in SUBSCRIBED).
+// consistent copy: battery and encrypted known only in SUBSCRIBED).
 static void testInfoConcurrent() {
   Rig r;
+  r.port.gattRead.encrypted = true;
   std::atomic<bool> stop{false};
   std::thread reader([&] {
     BikeSensor::SensorInfo info{};
     while (!stop.load()) {
       assert(r.core->info(SensorType::HEART_RATE, info));
       assert(!info.hasBattery || info.state == SlotState::SUBSCRIBED);
+      assert(!info.encrypted || info.state == SlotState::SUBSCRIBED);
     }
   });
   r.toSubscribed();
