@@ -25,9 +25,7 @@ struct GattResult {
   uint32_t feature = 0;
   bool hasLocation = false;                          // CP 0x2A5D (1 B)
   uint8_t location = 0;
-  bool encrypted = false;                            // Power step 6 (§5.2)
-  bool bonded = false;
-  bool secureCut = false;                            // Power step 1 ended without a link
+  bool encrypted = false;                            // end of the pass, every type (§5.2)
 };
 
 class BlePort {
@@ -53,9 +51,8 @@ class BlePort {
 
   // One blocking GATT pass (§5.2): service, characteristic, CSC/CP Feature
   // (CP also Sensor Location) reads, subscribe, battery. The reads are optional.
-  // secure: Power step 1, secureConnection(false) first. Power also samples
-  // the link's encryption and bond state (step 6).
-  virtual bool gattPass(uint8_t slot, SensorType type, bool secure, GattResult& out) = 0;
+  // Then samples the link's encryption state.
+  virtual bool gattPass(uint8_t slot, SensorType type, GattResult& out) = 0;
   virtual void gattTimerStart(uint32_t ms) = 0;      // one-shot esp_timer
   virtual void gattTimerStop() = 0;
 
@@ -82,9 +79,7 @@ class BlePort {
 
   // Lifecycle (§4 initStack()/begin()/end()).
   virtual bool stackReady() = 0;                     // NimBLEDevice::isInitialized()
-  // NimBLEDevice::init(); with BBS_SENSOR_SECURITY also the §6a settings.
-  virtual bool stackInit(const char* gapName) = 0;
-  virtual bool deleteAllBonds() = 0;                 // NimBLEDevice::deleteAllBonds()
+  virtual bool stackInit(const char* gapName) = 0;   // NimBLEDevice::init()
   // Per-slot clients, reset detector, GATT timer; existing ones are kept.
   virtual bool open() = 0;
   // end() steps 5 and 6: delete the GATT timer, NimBLEDevice::deinit(true).

@@ -13,7 +13,6 @@
 #include "BBSGattWatchdog.h"
 #include "BBSMux.h"
 #include "BBSScanController.h"
-#include "BBSStoreStatus.h"
 #include "BBSTypes.h"
 
 // One slot per compiled sensor type, one mode for all slots (§10 steps 3–9):
@@ -21,8 +20,8 @@
 // app lifecycle, DATA and central events (§4), HR/CSC/Power data callbacks,
 // cadence source (§6b), relay, server name and advertising desired state
 // (§5.4), discovery (§3.3, §5.3), pause/quiesce and begin()/end() (§4),
-// Power pass security (§6a), info()/connected()/deleteBonds(), driven
-// through BlePort. Arduino-free; the caller passes millis() as `now`.
+// info()/connected(), driven through BlePort. Arduino-free; the caller passes
+// millis() as `now`.
 // Everything except the members marked "any task" runs on the update() task.
 
 namespace BikeSensor {
@@ -98,7 +97,7 @@ constexpr uint8_t kCpLocationDefault = 0x0D;            // rear hub
 enum class CadenceSource : uint8_t { NONE, CSC, POWER };
 
 // Written under tableMux for info(): state, name, mac, addrType, hasAddr,
-// battery, lastDisconnectReason, encrypted, bonded and the last measurement.
+// battery, lastDisconnectReason, encrypted and the last measurement.
 struct SensorSlot {
   SensorType type;                      // fixed by the slot index
   SlotState  state;
@@ -109,8 +108,7 @@ struct SensorSlot {
   std::atomic<uint16_t> attemptGen{0};  // never reset; read by client callbacks
   uint8_t    battery;                   // 255 = unknown; read in the pass, cleared when the link ends
   int        lastDisconnectReason;
-  bool       encrypted, bonded;         // Power: sampled at the end of the pass, cleared with battery
-  bool       skipProactiveSecure;       // Power: a GATT abort hit step 1 (§5.2); addBy*/remove() clear it
+  bool       encrypted;                 // sampled at the end of the pass, cleared with battery
   uint8_t    failCount;
   uint32_t   stateSinceMs;
   uint32_t   holdFromMs;                // FOUND connects not before holdFromMs + holdMs
@@ -170,7 +168,6 @@ class Core {
       s.addrType = addrType >= 0 ? static_cast<uint8_t>(addrType)
                                  : ((bytes[0] & 0xC0) == 0xC0 ? 1 : 0);
     }
-    s.skipProactiveSecure = false;
     if (replace) {
       retarget(static_cast<uint8_t>(i), now);
     } else {
@@ -201,7 +198,6 @@ class Core {
       s.hasAddr = false;
       s.addrType = 0;
     }
-    s.skipProactiveSecure = false;
     if (replace) {
       retarget(static_cast<uint8_t>(i), now);
     } else {
@@ -348,7 +344,7 @@ class Core {
   }
 
   // Any task. False only for a type that is not compiled; an unused slot
-  // reports EMPTY. Battery and encrypted/bonded are known only while SUBSCRIBED.
+  // reports EMPTY. Battery and encrypted are known only while SUBSCRIBED.
   bool info(SensorType type, SensorInfo& out) {
     const int i = slotIndex(type);
     if (i < 0) return false;
@@ -362,7 +358,6 @@ class Core {
     out.hasBattery = s.battery != 255;
     out.lastDisconnectReason = s.lastDisconnectReason;
     out.encrypted = s.encrypted;
-    out.bonded = s.bonded;
     out.providesCadence = type == SensorType::POWER && source_ == CadenceSource::POWER;
     return true;
   }
@@ -374,20 +369,6 @@ class Core {
     if (i < 0) return false;
     MuxGuard guard(tableMux_);
     return slots_[i].state == SlotState::SUBSCRIBED;
-  }
-
-  // §4 deleteBonds(), update() task, also under quiesce (factory reset).
-  // False while a slot is CONNECTING/CANCELLING/DISCOVERING/SUBSCRIBED or
-  // without an initialised stack. The NVS erase may take longer than a loop
-  // pass; bonded centrals are disconnected (CENTRAL_DISCONNECTED follows).
-  bool deleteBonds() {
-    for (const SensorSlot& s : slots_) {
-      if (s.state == SlotState::CONNECTING || s.state == SlotState::CANCELLING ||
-          s.state == SlotState::DISCOVERING || s.state == SlotState::SUBSCRIBED) {
-        return false;
-      }
-    }
-    return port_.stackReady() && port_.deleteAllBonds();
   }
 
   // §5.3. False under quiesce, while a discovery is pending or open, or for a
@@ -606,8 +587,6 @@ class Core {
     out.eventsDropped = q.eventsDropped;
     out.notifiesDropped = q.notifiesDropped;
     out.matchesDropped = q.matchesDropped;
-    out.bondEvictions = bondCounters_.evictions.load(std::memory_order_relaxed);
-    out.bondStoreRejects = bondCounters_.rejects.load(std::memory_order_relaxed);
     return out;
   }
 
@@ -667,7 +646,6 @@ class Core {
 
   EventQueue& queue() { return queue_; }
   GattWatchdog& watchdog() { return watchdog_; }
-  BondCounters& bondCounters() { return bondCounters_; }   // any task (store handler)
   const SensorSlot& slot(uint8_t i) const { return slots_[i]; }
   const ScanController& scan() const { return scan_; }
 
@@ -772,7 +750,6 @@ class Core {
       s.addrType = 0;
       s.lastDisconnectReason = 0;
     }
-    s.skipProactiveSecure = false;
     s.failCount = 0;
     s.stateSinceMs = 0;
     s.holdFromMs = 0;
@@ -791,7 +768,7 @@ class Core {
                        std::memory_order_release);
   }
 
-  // Caller holds tableMux_. Battery and encrypted/bonded belong to the link
+  // Caller holds tableMux_. Battery and encrypted belong to the link
   // (2.x reset the battery on disconnect too).
   static void clearValue(SensorSlot& s) {
     s.hasValue = false;
@@ -800,7 +777,7 @@ class Core {
     s.power = PowerSample{};
     s.crankMs = 0;
     s.battery = 255;
-    s.encrypted = s.bonded = false;
+    s.encrypted = false;
   }
 
   // The single exit of an attempt or link. Resets the per-attempt flags, the
@@ -1340,19 +1317,13 @@ class Core {
       SensorSlot& s = slots_[i];
       if (s.state != SlotState::DISCOVERING || s.gattDone || s.removing) continue;
       GattResult result;
-      // §6a: HR/CSC never call secureConnection().
-      const bool power = s.type == SensorType::POWER;
-      const bool secure = BBS_SENSOR_SECURITY && power && !s.skipProactiveSecure;
       const uint32_t gen = watchdog_.arm(port_.connHandle(i));
       port_.gattTimerStart(BBS_GATT_BUDGET_MS);
-      const bool ok = port_.gattPass(i, s.type, secure, result);
+      const bool ok = port_.gattPass(i, s.type, result);
       watchdog_.disarm();
       port_.gattTimerStop();
       const bool aborted = watchdog_.fired(gen);
       if (ok && !aborted) {
-        if (BBS_SENSOR_SECURITY && power) {
-          (result.encrypted ? stats_.securityOk : stats_.securityFails)++;
-        }
         copyFeature(s.type, result);
         s.failCount = 0;
         enter(s, SlotState::SUBSCRIBED, now);
@@ -1360,18 +1331,12 @@ class Core {
           MuxGuard guard(tableMux_);
           s.battery = result.battery;
           s.encrypted = result.encrypted;
-          s.bonded = result.bonded;
         }
         refreshCadenceSource();
         emit(EventType::SENSOR_CONNECTED, s.type);
         return;
       }
-      if (aborted) {
-        stats_.gattBudgetAborts++;
-        // A meter that ignores the pairing request (30 s SM timeout > budget):
-        // later attempts rely on on-demand pairing only.
-        if (result.secureCut) s.skipProactiveSecure = true;
-      }
+      if (aborted) stats_.gattBudgetAborts++;
       s.gattDone = true;
       s.failPending = true;
       port_.disconnect(i);
@@ -1503,7 +1468,6 @@ class Core {
   uint32_t discGen_ = 0;                // one per accepted startDiscovery()
   bool discOpen_ = false;               // startDiscovery() until DISCOVERY_DONE
   Stats stats_{};
-  BondCounters bondCounters_;           // written by the store handler (§6a)
   EventCallback eventCb_ = nullptr;
   void (*heartRateCb_)(uint16_t) = nullptr;
   void (*cadenceCb_)(uint16_t) = nullptr;

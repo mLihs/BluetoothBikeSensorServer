@@ -28,9 +28,6 @@
 #ifndef BBS_NOTIFY_MAX_LEN
 #define BBS_NOTIFY_MAX_LEN 36               // full CPS measurement is 34 B (§6)
 #endif
-#ifndef BBS_SENSOR_SECURITY
-#define BBS_SENSOR_SECURITY BBS_COMPILE_POWER
-#endif
 #ifndef BBS_POWER_STALE_MS
 #define BBS_POWER_STALE_MS 3000             // cadence → 0 without a new crank event
 #endif
@@ -62,9 +59,6 @@
 static_assert(BBS_COMPILED_SENSOR_COUNT >= 1 && BBS_COMPILED_SENSOR_COUNT <= 3, "");
 static_assert(BBS_MAX_DISCOVERED >= 1 && BBS_MAX_DISCOVERED <= 255, "discoveredCount() is uint8_t");
 static_assert(BBS_NOTIFY_MAX_LEN >= 20 && BBS_NOTIFY_MAX_LEN <= 38, "Event must stay <= 48 B");
-#if BBS_SENSOR_SECURITY && !BBS_COMPILE_POWER
-#error "BBS_SENSOR_SECURITY is only used for Power sensors"
-#endif
 #if CONFIG_BT_NIMBLE_EXT_ADV
 #error "BikeSensor 3.0 uses legacy ble_gap_disc events; disable CONFIG_BT_NIMBLE_EXT_ADV"
 #endif

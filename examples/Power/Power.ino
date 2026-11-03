@@ -1,22 +1,18 @@
 /**
  * @file Power.ino
- * @brief V3 hardware checkpoint: one power meter by name, with sensor
- * security (Just Works bonding, design §6a).
+ * @brief V3 hardware checkpoint: one power meter by name (design §8).
  *
  * EXPERIMENTAL: drives the V3 internals (src/internal) directly. This is not
  * the final public API; it will be ported to the public BikeSensor facade.
  * The 2.x API and examples are unaffected.
  *
  * build_opt.h (next to this sketch; ESP32 core 3.x passes it to every
- * source, including the libraries) sets BBS_COMPILE_POWER=1, which turns on
- * BBS_SENSOR_SECURITY, and sizes the bond store: 6 bonds, 6 CSFC records
- * (at least one per bond) and 20 CCCD records (4 per bonded central).
+ * source, including the libraries) sets BBS_COMPILE_POWER=1.
  *
  * At start a Power discovery runs; the first named meter is added by name.
  * Samples are printed from the power callback.
  */
 
-#include <NimBLEDevice.h>
 // Only puts this library on the include path (Arduino resolves libraries by
 // their top-level headers); nothing from the 2.x API is used.
 #include <BluetoothBikeSensorServer.h>
@@ -37,7 +33,6 @@ bs::internal::Core core(port, bs::Mode::NAME, POWER_MASK);
 
 char meterName[32] = "";
 bool discoveryDone = false;
-bool repairing = false;          // 'c': waiting for the slot to reach EMPTY
 
 const char* eventName(bs::EventType type) {
   switch (type) {
@@ -105,18 +100,15 @@ void pickMeter() {
 void printStatus() {
   bs::SensorInfo info;
   if (core.info(bs::SensorType::POWER, info)) {
-    Serial.printf("power \"%s\" state=%u battery=%s%u encrypted=%u bonded=%u cadenceSource=%u "
+    Serial.printf("power \"%s\" state=%u battery=%s%u encrypted=%u cadenceSource=%u "
                   "lastReason=0x%x\n",
                   info.name, static_cast<unsigned>(info.state), info.hasBattery ? "" : "?",
-                  info.hasBattery ? info.battery : 0, info.encrypted, info.bonded,
-                  info.providesCadence, info.lastDisconnectReason);
+                  info.hasBattery ? info.battery : 0, info.encrypted, info.providesCadence,
+                  info.lastDisconnectReason);
   }
   const bs::Stats s = core.stats();
-  Serial.printf("bonds=%d securityOk=%lu securityFails=%lu bondEvictions=%lu "
-                "bondStoreRejects=%lu gattAborts=%lu centrals=%u heap=%lu\n",
-                NimBLEDevice::getNumBonds(), s.securityOk, s.securityFails, s.bondEvictions,
-                s.bondStoreRejects, s.gattBudgetAborts, core.centralCount(),
-                static_cast<unsigned long>(ESP.getFreeHeap()));
+  Serial.printf("gattAborts=%lu centrals=%u heap=%lu\n", s.gattBudgetAborts,
+                core.centralCount(), static_cast<unsigned long>(ESP.getFreeHeap()));
 }
 
 void setup() {
@@ -132,7 +124,7 @@ void setup() {
   core.setEventCallback(onEvent);
   core.setPowerCallback(onPower);
   startDiscovery();
-  Serial.println("Commands: c=re-pair (remove, deleteBonds, addByName), d=discovery, s=status");
+  Serial.println("Commands: d=discovery, s=status");
 }
 
 void loop() {
@@ -142,29 +134,9 @@ void loop() {
     discoveryDone = false;
     if (meterName[0] == '\0') pickMeter();
   }
-  // Re-pairing (§4): remove(POWER), wait until the slot has left its link,
-  // deleteBonds(), addByName().
-  if (repairing) {
-    bs::SensorInfo info;
-    if (core.info(bs::SensorType::POWER, info) && info.state == bs::SlotState::EMPTY) {
-      repairing = false;
-      Serial.printf("deleteBonds(): %s, bonds=%d\n", core.deleteBonds() ? "ok" : "refused",
-                    NimBLEDevice::getNumBonds());
-      addMeter();
-    }
-  }
 
   if (Serial.available()) {
     switch (Serial.read()) {
-      case 'c':
-        if (meterName[0] == '\0') {
-          Serial.println("No meter configured yet");
-          break;
-        }
-        core.remove(bs::SensorType::POWER, millis());
-        repairing = true;
-        Serial.println("remove(POWER)");
-        break;
       case 'd': startDiscovery(); break;
       case 's': printStatus(); break;
       default: break;
