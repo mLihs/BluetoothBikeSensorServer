@@ -35,8 +35,9 @@ class BlePort {
   virtual bool hsSynced() = 0;                       // ble_hs_synced()
   virtual bool discActive() = 0;                     // ble_gap_disc_active()
   virtual bool connActive() = 0;                     // ble_gap_conn_active()
-  // ble_gap_disc() with cb_arg = epoch; returns its rc.
-  virtual int discStart(uint16_t epoch, uint32_t durationMs) = 0;
+  // ble_gap_disc() with cb_arg = epoch; returns its rc. filterDuplicates only
+  // for SLEEP windows: the controller drops a SCAN_RSP after an ADV (§5.3).
+  virtual int discStart(uint16_t epoch, uint32_t durationMs, bool filterDuplicates) = 0;
   virtual int discCancel() = 0;                      // ble_gap_disc_cancel() rc
 
   // Per-slot client. connect() sets the timeout and 0 retries, then calls

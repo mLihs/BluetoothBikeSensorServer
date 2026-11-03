@@ -135,7 +135,7 @@ class ScanController {
                               : remainderMs_ != 0 ? remainderMs_
                                                   : BBS_SLEEP_SCAN_DURATION_MS;
     nextEpoch();
-    if (port.discStart(epoch_, duration) != 0) {
+    if (port.discStart(epoch_, duration, !name) != 0) {
       stats.scanStartFails++;
       hold(now, BBS_SCAN_START_BACKOFF_MS);
       return false;
@@ -201,7 +201,7 @@ class ScanController {
     // Published before the start: the first report can arrive before
     // discStart() returns here.
     activeDiscEpoch_.store(epoch_, std::memory_order_release);
-    if (port.discStart(epoch_, discDurationMs_) != 0) {   // tryFinish() clears the epoch
+    if (port.discStart(epoch_, discDurationMs_, false) != 0) {   // tryFinish() clears the epoch
       stats.scanStartFails++;
       hold(now, BBS_SCAN_START_BACKOFF_MS);
       finish = FinishReason::START_FAILED;

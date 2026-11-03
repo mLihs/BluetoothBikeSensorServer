@@ -52,6 +52,7 @@ struct FakePort final : BlePort {
   int slotConnects[bs::kSlotCount] = {}, slotDisconnects[bs::kSlotCount] = {};
   uint16_t lastEpoch = 0;
   uint32_t lastDurationMs = 0, timerMs = 0;
+  bool lastFilterDuplicates = false;
   uint8_t lastAddrType = 0xFF, lastConnectSlot = 0xFF, lastGattSlot = 0xFF;
   // Local server.
   bool serverOk = true, advOn = false, advStartOk = true, advDataOk = true;
@@ -76,11 +77,12 @@ struct FakePort final : BlePort {
   bool hsSynced() override { return synced; }
   bool discActive() override { return discOn; }
   bool connActive() override { return connOn; }
-  int discStart(uint16_t epoch, uint32_t durationMs) override {
+  int discStart(uint16_t epoch, uint32_t durationMs, bool filterDuplicates) override {
     discStarts++;
     lastEpoch = epoch;
     if (core != nullptr) activeAtStart = core->scan().activeDiscEpoch();
     lastDurationMs = durationMs;
+    lastFilterDuplicates = filterDuplicates;
     if (discOn) return bs::kHsEAlready;
     if (discStartRc == 0) discOn = true;
     return discStartRc;
@@ -1802,6 +1804,7 @@ static void testTwoMatchesOneWindow() {
   r.addCsc();
   r.update();
   assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW && r.port.discStarts == 1);
+  assert(r.port.lastFilterDuplicates);                 // SLEEP: controller filter on (§5.3)
   const uint16_t e = r.core->scan().epoch();
   r.match(e, kCscMac, 1);
   r.match(e, kMac);
@@ -2225,6 +2228,7 @@ static void testNameWindows() {
   r.update();
   assert(r.core->scan().owner() == ScanOwner::NAME_SCAN && r.port.discStarts == 1);
   assert(r.port.lastDurationMs == BBS_NAME_SCAN_WINDOW_MS);
+  assert(!r.port.lastFilterDuplicates);                // the name may be in SCAN_RSP only
   const uint16_t e1 = r.core->scan().epoch();
 
   r.at(r.now + BBS_NAME_SCAN_WINDOW_MS);               // natural end: next window at once
@@ -4294,6 +4298,7 @@ static void testDiscoveryNatural() {
   r.update();
   assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.port.discStarts == 1);
   assert(r.port.lastDurationMs == 15000 && r.core->stats().scansStarted == 1);
+  assert(!r.port.lastFilterDuplicates);                // names from SCAN_RSP (§3.3)
   const uint16_t e = r.core->scan().epoch();
   assert(e != 0 && r.core->scan().activeDiscEpoch() == e);
   assert(r.port.activeAtStart == e);                   // published before ble_gap_disc()
@@ -4471,6 +4476,7 @@ static void testDiscoveryCancelsWindows() {
     assert(r.port.discCancels == 1 && !r.port.discOn);
     r.update();                                        // the stale SCAN_END/SCAN_MATCH change nothing
     assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.core->scan().epoch() == e1 + 1);
+    assert(!r.port.lastFilterDuplicates);
     assert(r.state() == SlotState::WAIT_SCAN && countEvents(EventType::SENSOR_FOUND) == 0);
     r.match(r.core->scan().epoch());                   // discovery epoch: no SCAN_MATCH use
     r.update();
@@ -4483,6 +4489,7 @@ static void testDiscoveryCancelsWindows() {
     assert(r.port.discStarts == 2);
     r.at(windowStart + BBS_SLEEP_SCAN_DURATION_MS + BBS_SLEEP_SCAN_INTERVAL_MS);
     assert(r.port.discStarts == 3 && r.core->scan().owner() == ScanOwner::SLEEP_WINDOW);
+    assert(r.port.lastFilterDuplicates);
   }
   {
     Rig r(Mode::NAME);                                 // NAME: windows resume after the discovery
@@ -4493,6 +4500,7 @@ static void testDiscoveryCancelsWindows() {
     assert(r.port.discCancels == 1);
     r.update();
     assert(r.core->scan().owner() == ScanOwner::DISCOVERY && r.port.discStarts == 2);
+    assert(!r.port.lastFilterDuplicates);
     assert(r.report(kMac, "HRM"));                     // SCAN_MATCH with the discovery epoch
     r.update();
     assert(r.state() == SlotState::IDLE && countEvents(EventType::SENSOR_FOUND) == 0);

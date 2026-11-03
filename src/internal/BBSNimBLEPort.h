@@ -112,7 +112,7 @@ class NimBLEPort final : public BlePort {
   bool discActive() override { return ble_gap_disc_active() != 0; }
   bool connActive() override { return ble_gap_conn_active() != 0; }
 
-  int discStart(uint16_t epoch, uint32_t durationMs) override {
+  int discStart(uint16_t epoch, uint32_t durationMs, bool filterDuplicates) override {
     uint8_t ownAddrType = 0;
     const int rc = ble_hs_id_infer_auto(0, &ownAddrType);
     if (rc != 0) return rc;
@@ -120,7 +120,7 @@ class NimBLEPort final : public BlePort {
     params.itvl = 97;                   // 2.x server/sleep-scan parameters
     params.window = 67;
     params.passive = 0;
-    params.filter_duplicates = 1;
+    params.filter_duplicates = filterDuplicates ? 1 : 0;
     return ble_gap_disc(ownAddrType, static_cast<int32_t>(durationMs), &params, gapScanCb,
                         reinterpret_cast<void*>(static_cast<uintptr_t>(epoch)));
   }
