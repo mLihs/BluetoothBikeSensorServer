@@ -38,6 +38,13 @@ typedef void (*EventCallback)(const EventInfo&);
 struct DiscoveredSensor { char name[32]; uint8_t mac[6]; uint8_t addrType; uint8_t typeMask; };
 static_assert(sizeof(DiscoveredSensor) == 40, "");
 
+struct SensorInfo {
+  char name[32]; uint8_t mac[6]; int8_t addrType;
+  SlotState state; uint8_t battery; bool hasBattery; int lastDisconnectReason;
+  bool encrypted, bonded;     // Power only (HR/CSC false), end of the GATT pass; false when not SUBSCRIBED
+  bool providesCadence;       // POWER only: this slot is the cadence source (§6b)
+};
+
 struct Stats {
   uint32_t connects, connectFails, disconnects, notifies, notifiesTruncated, notifiesMalformed;
   uint32_t eventsDropped, notifiesDropped, matchesDropped, scansStarted, scanStartFails;

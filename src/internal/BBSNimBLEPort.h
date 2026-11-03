@@ -18,6 +18,13 @@ static_assert(BLE_HS_EALREADY == BikeSensor::internal::kHsEAlready, "");
 static_assert(BLE_HS_EBUSY == BikeSensor::internal::kHsEBusy, "");
 static_assert(BLE_HS_ENOTSYNCED == BikeSensor::internal::kHsENotSynced, "");
 static_assert(BLE_HS_CONN_HANDLE_NONE == BikeSensor::internal::kConnHandleNone, "");
+static_assert(BLE_STORE_EVENT_OVERFLOW == BikeSensor::internal::kStoreEventOverflow, "");
+static_assert(BLE_STORE_EVENT_FULL == BikeSensor::internal::kStoreEventFull, "");
+static_assert(BLE_STORE_OBJ_TYPE_OUR_SEC == BikeSensor::internal::kStoreObjOurSec, "");
+static_assert(BLE_STORE_OBJ_TYPE_PEER_SEC == BikeSensor::internal::kStoreObjPeerSec, "");
+static_assert(BLE_STORE_OBJ_TYPE_CCCD == BikeSensor::internal::kStoreObjCccd, "");
+static_assert(BLE_STORE_OBJ_TYPE_PEER_ADDR == BikeSensor::internal::kStoreObjPeerAddr, "");
+static_assert(BLE_STORE_OBJ_TYPE_CSFC == BikeSensor::internal::kStoreObjCsfc, "");
 
 namespace BikeSensor {
 namespace internal {
@@ -34,7 +41,25 @@ class NimBLEPort final : public BlePort {
   }
 
   bool stackReady() override { return NimBLEDevice::isInitialized(); }
-  bool stackInit(const char* gapName) override { return NimBLEDevice::init(gapName); }
+  // §6a: init() resets the sm_* settings (NimBLEDevice.cpp:996–1004), so they
+  // follow every init: bonding, no MITM, Secure Connections, Just Works, and
+  // ENC-only key distribution (sm_our/sm_their_key_dist). init() adds ID with
+  // LL privacy; an IRK bond makes ble_gap_unpair return BLE_HS_EBUSY while
+  // advertising or discovery runs (ble_gap.c:8313–8323).
+  bool stackInit(const char* gapName) override {
+    if (!NimBLEDevice::init(gapName)) return false;
+#if BBS_SENSOR_SECURITY
+    NimBLEDevice::setSecurityAuth(true, false, true);
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+    NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC);
+    NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC);
+    NimBLEDevice::setDeviceCallbacks(&storeCb_);
+#endif
+    return true;
+  }
+
+  // ble_gap_unpair per bond: also terminates links to bonded peers.
+  bool deleteAllBonds() override { return NimBLEDevice::deleteAllBonds(); }
 
   // After NimBLEDevice::init(). False if a client, the reset detector or the
   // GATT timer cannot be created; a retry keeps what exists.
@@ -128,10 +153,19 @@ class NimBLEPort final : public BlePort {
     return clients_[slot] != nullptr ? clients_[slot]->getConnHandle() : BLE_HS_CONN_HANDLE_NONE;
   }
 
-  bool gattPass(uint8_t slot, SensorType type, GattResult& out) override {
+  bool gattPass(uint8_t slot, SensorType type, bool secure, GattResult& out) override {
     NimBLEClient* client = clients_[slot];
     out = GattResult{};
-    // Power pass step 1, proactive security (§5.2, §6a): §10 step 9.
+    // Power step 1 (§5.2): blocks until ENC_CHANGE or DISCONNECT; the return
+    // value is not reliable (§0.12). Unencrypted is not fatal. The DISCONNECT
+    // handler clears the link state before it releases the wait.
+    if (secure) {
+      client->secureConnection(false);
+      if (!client->isConnected()) {
+        out.secureCut = true;
+        return false;
+      }
+    }
     NimBLERemoteService* service = client->getService(NimBLEUUID(serviceUuid(type)));
     if (service == nullptr) return false;
     NimBLERemoteCharacteristic* chr =
@@ -157,7 +191,11 @@ class NimBLEPort final : public BlePort {
     }
     NimBLERemoteService* batt = client->getService(NimBLEUUID(static_cast<uint16_t>(0x180F)));
     if (readLe(batt, 0x2A19, 1, value)) out.battery = static_cast<uint8_t>(value);
-    // Power pass step 6, encryption/bond sample (§5.2): §10 step 9.
+    if (type == SensorType::POWER) {              // step 6
+      const NimBLEConnInfo info = client->getConnInfo();
+      out.encrypted = info.isEncrypted();
+      out.bonded = info.isBonded();
+    }
     return true;
   }
 
@@ -299,6 +337,54 @@ class NimBLEPort final : public BlePort {
     }
   };
 
+#if BBS_SENSOR_SECURITY
+  // §6a store status, host task without the host lock (ble_store.c:102;
+  // overflow runs after the unlock, :53–71), so the store and GAP calls below
+  // may take it. No disconnect, no heap.
+  class StoreCallbacks : public NimBLEDeviceCallbacks {
+   public:
+    int onStoreStatus(ble_store_status_event* event, void* arg) override {
+      Bonds bonds;
+      const int type = event->event_code == BLE_STORE_EVENT_OVERFLOW ? event->overflow.obj_type : 0;
+      switch (storeStatus(event->event_code, type, bonds, self_->core_->bondCounters())) {
+        case StoreVerdict::PROCEED: return 0;
+        case StoreVerdict::REJECT: return BLE_HS_ESTORE_CAP;
+        default: return ble_store_util_status_rr(event, arg);
+      }
+    }
+  };
+
+  // storeStatus() view of the bond list, read on first use.
+  struct Bonds {
+    ble_addr_t peers[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
+    int n = -1;
+    int count() {
+      if (n < 0 && ble_store_util_bonded_peers(peers, &n, MYNEWT_VAL(BLE_STORE_MAX_BONDS)) != 0) {
+        n = 0;
+      }
+      return n;
+    }
+    bool live(int i) { return ble_gap_conn_find_by_addr(&peers[i], nullptr) == 0; }
+    bool erase(int i) { return ble_store_util_delete_peer(&peers[i]) == 0; }
+    bool owns(int i, int objType) {
+      Owner owner{&peers[i], false};
+      ble_store_iterate(objType, ownerCb, &owner);
+      return owner.found;
+    }
+    struct Owner {
+      const ble_addr_t* peer;
+      bool found;
+    };
+    static int ownerCb(int objType, ble_store_value* value, void* arg) {
+      Owner& owner = *static_cast<Owner*>(arg);
+      const ble_addr_t& addr =
+          objType == BLE_STORE_OBJ_TYPE_CCCD ? value->cccd.peer_addr : value->csfc.peer_addr;
+      owner.found = ble_addr_cmp(&addr, owner.peer) == 0;
+      return owner.found ? 1 : 0;       // 1 stops the iteration
+    }
+  };
+#endif
+
   static int16_t clampReason(int reason) {
     if (reason > INT16_MAX) return INT16_MAX;
     if (reason < INT16_MIN) return INT16_MIN;
@@ -396,6 +482,9 @@ class NimBLEPort final : public BlePort {
   NimBLECharacteristic* localChr_[kSlots] = {};
   NimBLECharacteristic* featureChr_[kSlots] = {};   // CSC 0x2A5C, CP 0x2A65
   NimBLECharacteristic* locationChr_ = nullptr;      // CP 0x2A5D
+#if BBS_SENSOR_SECURITY
+  StoreCallbacks storeCb_;
+#endif
 };
 
 }  // namespace internal

@@ -117,9 +117,14 @@ struct FakePort final : BlePort {
     return linkUp[slot] || disconnecting[slot] ? 7 : bs::kConnHandleNone;
   }
   bs::GattResult gattRead;                             // Feature/Location the sensor returns
-  bool gattPass(uint8_t slot, SensorType type, bs::GattResult& out) override {
+  int securePasses = 0;
+  bool lastSecure = false;
+  bool gattPass(uint8_t slot, SensorType type, bool secure, bs::GattResult& out) override {
     assert(bs::slotIndex(type) == slot);
+    assert(!secure || (BBS_SENSOR_SECURITY && type == SensorType::POWER));   // §6a
     gattPasses++;
+    securePasses += secure ? 1 : 0;
+    lastSecure = secure;
     lastGattSlot = slot;
     if (duringGatt) duringGatt();
     out = gattRead;
@@ -192,6 +197,12 @@ struct FakePort final : BlePort {
     }
     if (closeOk) stackUp = false;
     return closeOk;
+  }
+  bool bondsOk = true;
+  int bondDeletes = 0;
+  bool deleteAllBonds() override {
+    bondDeletes++;
+    return bondsOk;
   }
   uint32_t nowMs() override { return clock; }
   void waitTick() override {
@@ -1128,6 +1139,21 @@ static void testResync() {
     assert(r.core->stats().disconnects == 1);
     assert(g_eventCount == 1);
     expectEvent(0, EventType::SENSOR_DISCONNECTED, SlotState::WAIT_SCAN, 0);
+  }
+  {
+    Rig r;                                             // the repair sets lastDisconnectReason 0
+    r.toSubscribed();
+    r.discEv(r.gen(), 0x13);
+    r.update();
+    r.connectedEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::SUBSCRIBED && r.hr().lastDisconnectReason == 0x13);
+    r.port.connected = false;
+    fillQueueToResync(*r.core);
+    r.update();
+    BikeSensor::SensorInfo info{};
+    assert(r.core->info(SensorType::HEART_RATE, info) && info.state == SlotState::WAIT_SCAN);
+    assert(info.lastDisconnectReason == 0);
   }
   {
     Rig r;                                             // lost link after a failed pass: hard fail
@@ -3916,6 +3942,157 @@ static void testPowerDuplicates() {
     assert(r.cscState() == SlotState::IDLE && countEvents(EventType::SENSOR_FOUND) == 1);
   }
 }
+
+#if BBS_SENSOR_SECURITY
+// As powerToSubscribed(), with a pass that fails: the slot stays DISCOVERING.
+static void powerToSubscribedFails(Rig& r) {
+  r.port.expect[kPowerSlot] = kPowerMac;
+  assert(r.core->addByMac(SensorType::POWER, kPowerMacStr, 0, "PWR", r.now));
+  r.update();
+  r.match(r.core->scan().epoch(), kPowerMac);
+  r.update();
+  r.connectedEv(r.core->attemptGen(kPowerSlot), kPowerSlot);
+  r.update();
+  assert(r.core->slot(kPowerSlot).state == SlotState::DISCOVERING);
+}
+
+// Power slot after a hard fail: next sleep window, match, connect, one pass.
+static void powerRetry(Rig& r) {
+  r.at(r.now + 40000);
+  assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW);
+  r.match(r.core->scan().epoch(), kPowerMac);
+  r.update();
+  assert(r.core->slot(kPowerSlot).state == SlotState::CONNECTING);
+  r.connectedEv(r.core->attemptGen(kPowerSlot), kPowerSlot);
+  r.update();
+}
+#endif
+
+// §5.2 Power steps 1 and 6, §6a: proactive security only with
+// BBS_SENSOR_SECURITY; encryption/bond state in info() while SUBSCRIBED;
+// securityOk/Fails per successful pass.
+static void testPowerSecurity() {
+  Rig r;
+  r.port.gattRead.encrypted = true;
+  r.port.gattRead.bonded = true;
+  powerToSubscribed(r);
+  assert(r.port.lastSecure == (BBS_SENSOR_SECURITY != 0));
+  BikeSensor::SensorInfo info{};
+  assert(r.core->info(SensorType::POWER, info) && info.encrypted && info.bonded);
+  assert(info.state == SlotState::SUBSCRIBED && info.providesCadence);
+  assert(r.core->stats().securityOk == (BBS_SENSOR_SECURITY ? 1u : 0u));
+  assert(r.core->stats().securityFails == 0);
+  r.discEv(r.core->attemptGen(kPowerSlot), 0x08, kPowerSlot);
+  r.update();
+  assert(r.core->info(SensorType::POWER, info) && !info.encrypted && !info.bonded);
+  assert(!info.providesCadence && !info.hasBattery);
+  r.port.gattRead.encrypted = r.port.gattRead.bonded = false;   // pairing refused (Tacx)
+  assert(r.core->slot(kPowerSlot).state == SlotState::CONNECTING);   // direct attempt
+  r.connectedEv(r.core->attemptGen(kPowerSlot), kPowerSlot);
+  r.update();
+  assert(r.core->slot(kPowerSlot).state == SlotState::SUBSCRIBED);  // unencrypted is not fatal
+  assert(r.core->stats().securityFails == (BBS_SENSOR_SECURITY ? 1u : 0u));
+  assert(r.core->stats().securityOk == (BBS_SENSOR_SECURITY ? 1u : 0u));
+  // HR and CSC passes never secure (the fake asserts it), and count nothing.
+  r.now += BBS_SLEEP_SCAN_DURATION_MS + BBS_SLEEP_SCAN_INTERVAL_MS;
+  cscToSubscribed(r);
+  assert(!r.port.lastSecure && r.port.securePasses == (BBS_SENSOR_SECURITY ? 2 : 0));
+  assert(r.core->stats().securityOk + r.core->stats().securityFails ==
+         (BBS_SENSOR_SECURITY ? 2u : 0u));
+  r.port.gattRead.encrypted = true;                    // HR: the Core does not count it
+  r.now += BBS_SLEEP_SCAN_DURATION_MS + BBS_SLEEP_SCAN_INTERVAL_MS;
+  r.toSubscribed();
+  assert(r.core->stats().securityOk == (BBS_SENSOR_SECURITY ? 1u : 0u));
+}
+
+#if BBS_SENSOR_SECURITY
+// §5.2: a watchdog abort while step 1 runs sets skipProactiveSecure; later
+// passes skip step 1 until remove()/addBy* clear it.
+static void testSkipProactiveSecure() {
+  const auto abortInSecure = [](Rig& r) {
+    r.port.gattOk = false;
+    r.port.gattRead.secureCut = true;
+    r.port.duringGatt = [&r] { assert(r.core->watchdog().onTimer()); };
+  };
+  const auto healthy = [](Rig& r) {
+    r.port.gattOk = true;
+    r.port.gattRead.secureCut = false;
+    r.port.duringGatt = nullptr;
+  };
+  {
+    Rig r;
+    abortInSecure(r);
+    powerToSubscribedFails(r);
+    assert(r.port.lastSecure && r.core->slot(kPowerSlot).skipProactiveSecure);
+    assert(r.core->stats().gattBudgetAborts == 1);
+    r.discEv(r.core->attemptGen(kPowerSlot), 0x16, kPowerSlot);
+    r.update();
+    assert(countEvents(EventType::SENSOR_FAILED) == 1);
+    healthy(r);
+    powerRetry(r);
+    assert(!r.port.lastSecure && r.port.securePasses == 1);   // on-demand pairing only
+    assert(r.core->slot(kPowerSlot).state == SlotState::SUBSCRIBED);
+    r.discEv(r.core->attemptGen(kPowerSlot), 0x08, kPowerSlot);   // link loss keeps it
+    r.update();
+    assert(r.core->slot(kPowerSlot).skipProactiveSecure);
+    r.connectedEv(r.core->attemptGen(kPowerSlot), kPowerSlot);
+    r.update();
+    assert(!r.port.lastSecure && r.port.securePasses == 1);
+    r.core->remove(SensorType::POWER, r.now);           // from SUBSCRIBED: cleared at EMPTY
+    r.discEv(r.core->attemptGen(kPowerSlot), 0x16, kPowerSlot);
+    r.update();
+    assert(r.core->slot(kPowerSlot).state == SlotState::EMPTY);
+    assert(!r.core->slot(kPowerSlot).skipProactiveSecure);
+    r.now += 40000;
+    powerToSubscribed(r);
+    assert(r.port.lastSecure && r.port.securePasses == 2);
+  }
+  for (int viaRemove = 0; viaRemove < 2; ++viaRemove) {
+    Rig r;                                             // same-type addByMac replace, remove()
+    abortInSecure(r);
+    powerToSubscribedFails(r);
+    r.discEv(r.core->attemptGen(kPowerSlot), 0x16, kPowerSlot);
+    r.update();
+    assert(r.core->slot(kPowerSlot).state == SlotState::WAIT_SCAN);
+    assert(r.core->slot(kPowerSlot).skipProactiveSecure);
+    if (viaRemove) {
+      r.core->remove(SensorType::POWER, r.now);
+      assert(r.core->slot(kPowerSlot).state == SlotState::EMPTY);
+    } else {
+      assert(r.core->addByMac(SensorType::POWER, kPowerMacStr, 0, "PWR", r.now));
+      assert(r.core->slot(kPowerSlot).state == SlotState::FOUND);
+    }
+    assert(!r.core->slot(kPowerSlot).skipProactiveSecure);
+  }
+  {
+    Rig r;                                             // not set: abort after step 1, or a
+    r.port.gattOk = false;                             // link lost in step 1 without the watchdog
+    r.port.duringGatt = [&r] { assert(r.core->watchdog().onTimer()); };
+    powerToSubscribedFails(r);
+    assert(r.core->stats().gattBudgetAborts == 1 && !r.core->slot(kPowerSlot).skipProactiveSecure);
+    r.discEv(r.core->attemptGen(kPowerSlot), 0x16, kPowerSlot);
+    r.update();
+    r.port.duringGatt = nullptr;
+    r.port.gattRead.secureCut = true;
+    powerRetry(r);
+    assert(r.port.lastSecure && !r.core->slot(kPowerSlot).skipProactiveSecure);
+  }
+  {
+    Rig r(Mode::NAME);                                 // addByName (replace) clears it
+    r.port.expect[kPowerSlot] = kPowerMac;
+    abortInSecure(r);
+    assert(r.core->addByName(SensorType::POWER, "Assioma", r.now));
+    r.update();
+    assert(r.report(kPowerMac, "Assioma"));
+    r.update();
+    r.connectedEv(r.core->attemptGen(kPowerSlot), kPowerSlot);
+    r.update();
+    assert(r.core->slot(kPowerSlot).skipProactiveSecure);
+    assert(r.core->addByName(SensorType::POWER, "Assioma", r.now));
+    assert(!r.core->slot(kPowerSlot).skipProactiveSecure);
+  }
+}
+#endif
 #else
 static void onPowerNever(const BikeSensor::PowerSample&) { assert(false); }
 
@@ -5253,6 +5430,144 @@ static void testNameQuiesceDiscovering() {
   assert(r.port.discStarts == 1 && r.port.connects == 1 && r.port.gattPasses == 0);
 }
 
+// §4 info()/connected(): identity, state, battery only while SUBSCRIBED
+// (2.x reset it on disconnect), last disconnect reason.
+static void testInfoAndConnected() {
+  Rig r;
+  BikeSensor::SensorInfo info{};
+  assert(!r.core->info(static_cast<SensorType>(0x08), info));
+  assert(!r.core->connected(static_cast<SensorType>(0x08)));
+#if !BBS_COMPILE_POWER
+  assert(!r.core->info(SensorType::POWER, info) && !r.core->connected(SensorType::POWER));
+#endif
+  assert(r.core->info(SensorType::HEART_RATE, info));
+  assert(info.state == SlotState::EMPTY && info.name[0] == '\0' && !info.hasBattery);
+  assert(info.battery == 255 && info.lastDisconnectReason == 0 && !info.providesCadence);
+  r.add();
+  assert(r.core->info(SensorType::HEART_RATE, info) && info.state == SlotState::WAIT_SCAN);
+  assert(strcmp(info.name, "HRM") == 0 && memcmp(info.mac, kMac, 6) == 0 && info.addrType == 0);
+  assert(!r.core->connected(SensorType::HEART_RATE));
+  r.update();
+  r.match(r.core->scan().epoch(), kMac, 1);
+  r.update();
+  assert(r.core->info(SensorType::HEART_RATE, info) && info.state == SlotState::CONNECTING);
+  assert(info.addrType == 1 && !r.core->connected(SensorType::HEART_RATE));
+  bool inPass = false;                                 // during the GATT pass: DISCOVERING
+  r.port.duringGatt = [&] {
+    assert(r.core->info(SensorType::HEART_RATE, info) && info.state == SlotState::DISCOVERING);
+    assert(!r.core->connected(SensorType::HEART_RATE));
+    inPass = true;
+  };
+  r.connectedEv(r.gen());
+  r.update();
+  r.port.duringGatt = nullptr;
+  assert(inPass && r.core->connected(SensorType::HEART_RATE));
+  assert(r.core->info(SensorType::HEART_RATE, info) && info.state == SlotState::SUBSCRIBED);
+  assert(info.hasBattery && info.battery == 80 && !info.encrypted && !info.bonded);
+  assert(!info.providesCadence);
+  r.discEv(r.gen(), 0x13);
+  r.update();
+  assert(!r.core->connected(SensorType::HEART_RATE));
+  assert(r.core->info(SensorType::HEART_RATE, info) && info.state == SlotState::CONNECTING);
+  assert(!info.hasBattery && info.battery == 255 && info.lastDisconnectReason == 0x13);
+  r.port.gattBattery = 255;                            // no battery service
+  r.connectedEv(r.gen());
+  r.update();
+  assert(r.core->info(SensorType::HEART_RATE, info) && info.state == SlotState::SUBSCRIBED);
+  assert(!info.hasBattery && info.lastDisconnectReason == 0x13);
+  r.remove();
+  r.discEv(r.gen(), 0x16);
+  r.update();
+  assert(r.core->info(SensorType::HEART_RATE, info) && info.state == SlotState::EMPTY);
+  assert(info.name[0] == '\0' && info.lastDisconnectReason == 0 && !info.hasBattery);
+  const uint8_t zeros[6] = {};
+  assert(memcmp(info.mac, zeros, 6) == 0);
+}
+
+// info() from another task while update() changes the slot (no deadlock, a
+// consistent copy: battery known only in SUBSCRIBED).
+static void testInfoConcurrent() {
+  Rig r;
+  std::atomic<bool> stop{false};
+  std::thread reader([&] {
+    BikeSensor::SensorInfo info{};
+    while (!stop.load()) {
+      assert(r.core->info(SensorType::HEART_RATE, info));
+      assert(!info.hasBattery || info.state == SlotState::SUBSCRIBED);
+    }
+  });
+  r.toSubscribed();
+  r.core->setEventCallback(nullptr);                   // more events than g_events holds
+  for (int i = 0; i < 200; ++i) {
+    r.discEv(r.gen(), 0x08);
+    r.update();
+    r.connectedEv(r.gen());
+    r.update();
+    assert(r.state() == SlotState::SUBSCRIBED);
+  }
+  stop = true;
+  reader.join();
+}
+
+// §4 deleteBonds(): false while a slot is CONNECTING/CANCELLING/DISCOVERING/
+// SUBSCRIBED or without a stack; allowed in the other states and under quiesce.
+static void testDeleteBonds() {
+  Rig r;
+  assert(!r.core->deleteBonds() && r.port.bondDeletes == 0);   // no stack
+  r.port.stackUp = true;
+  assert(r.core->deleteBonds() && r.port.bondDeletes == 1);    // all EMPTY
+  r.add();
+  assert(r.core->deleteBonds() && r.port.bondDeletes == 2);    // WAIT_SCAN
+  r.port.cancelLeavesDiscOn = true;
+  r.update();
+  r.match(r.core->scan().epoch());
+  r.update();
+  assert(r.state() == SlotState::STOPPING_FOR_CONNECT);
+  assert(r.core->deleteBonds() && r.port.bondDeletes == 3);
+  r.port.cancelLeavesDiscOn = false;
+  r.port.discOn = false;
+  r.update();
+  assert(r.state() == SlotState::CONNECTING && !r.core->deleteBonds());
+  r.core->quiesce(r.now);
+  assert(r.state() == SlotState::CANCELLING && !r.core->deleteBonds());
+  r.failEv(r.gen());
+  r.update();
+  assert(r.state() == SlotState::WAIT_SCAN && r.core->quiesced());
+  assert(r.core->deleteBonds() && r.port.bondDeletes == 4);    // under quiesce
+  r.port.bondsOk = false;
+  assert(!r.core->deleteBonds() && r.port.bondDeletes == 5);
+  {
+    Rig s;                                             // DISCOVERING (failed pass), SUBSCRIBED
+    s.port.stackUp = true;
+    s.port.gattOk = false;
+    s.toConnecting();
+    s.connectedEv(s.gen());
+    s.update();
+    assert(s.state() == SlotState::DISCOVERING && !s.core->deleteBonds());
+    s.port.gattOk = true;
+    s.discEv(s.gen());
+    s.update();
+    s.at(s.now + 40000);
+    s.match(s.core->scan().epoch());
+    s.update();
+    s.connectedEv(s.gen());
+    s.update();
+    assert(s.state() == SlotState::SUBSCRIBED && !s.core->deleteBonds());
+    s.addCsc();                                        // another slot idle: still false
+    assert(!s.core->deleteBonds() && s.port.bondDeletes == 0);
+  }
+}
+
+// §4 Stats: the store handler's atomic counters are copied into stats().
+static void testBondStats() {
+  Rig r;
+  assert(r.core->stats().bondEvictions == 0 && r.core->stats().bondStoreRejects == 0);
+  r.core->bondCounters().evictions += 2;
+  r.core->bondCounters().rejects += 1;
+  const BikeSensor::Stats st = r.core->stats();
+  assert(st.bondEvictions == 2 && st.bondStoreRejects == 1);
+}
+
 int main() {
   testAddByMac();
   testHappyPath();
@@ -5340,6 +5655,10 @@ int main() {
   testCadenceSource();
   testPowerGetters();
   testPowerDuplicates();
+  testPowerSecurity();
+#if BBS_SENSOR_SECURITY
+  testSkipProactiveSecure();
+#endif
 #else
   testPowerAbsent();
 #endif
@@ -5370,5 +5689,9 @@ int main() {
   testQuiesceAfterFailedPass();
   testQuiesceHostResetAndResync();
   testNameQuiesceDiscovering();
+  testInfoAndConnected();
+  testInfoConcurrent();
+  testDeleteBonds();
+  testBondStats();
   return 0;
 }
