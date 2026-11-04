@@ -436,6 +436,9 @@ void BikeSensorServerSetConnectionMode(BBSConnectionMode mode);
  */
 BBSConnectionMode BikeSensorServerGetConnectionMode();
 
+/**
+ * @note Has no effect; kept for API compatibility and removed in 3.0.
+ */
 void BikeSensorServerSetConnectIntervalMs(uint32_t intervalMs);
 
 /**
@@ -820,10 +823,11 @@ void BikeSensorServerSetEnabledSensorTypes(uint8_t newEnabledSensorTypes);
 /**
  * Enable/disable preserving sensor MAC address on disconnect for faster reconnection.
  * When enabled, the library will keep the sensor's MAC address and attempt direct reconnection
- * without scanning. When disabled (default), sensor MAC is cleared and rescan is performed.
+ * without scanning. This is enabled by default. When disabled, sensor MAC is cleared and
+ * a rescan is performed.
  * 
- * @param preserve true to preserve sensor MAC on disconnect (faster reconnection),
- *                 false to clear sensor MAC and rescan (default, more conservative)
+ * @param preserve true to preserve sensor MAC on disconnect (default, faster reconnection),
+ *                 false to clear sensor MAC and rescan (more conservative)
  * 
  * @note Sensor MAC Preservation is faster but less conservative. Use if:
  *       - You trust your sensors have stable MAC addresses

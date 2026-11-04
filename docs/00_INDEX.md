@@ -1,9 +1,9 @@
 # BluetoothBikeSensorServer Documentation Index
 
-**Version**: 2.2.20.0  
+**Version**: 2.2.21.0
 **Platform**: ESP32 (Arduino Core)  
 **Author**: Martin Lihs  
-**Last Updated**: 2026-01-24
+**Last Updated**: 2026-10-31
 
 ---
 

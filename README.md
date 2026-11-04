@@ -2,10 +2,10 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Version**: 2.2.20.0  
+**Version**: 2.2.21.0
 **Platform**: ESP32 (Arduino Core)  
 **Author**: Martin Lihs  
-**Last Updated**: 2026-02-20
+**Last Updated**: 2026-10-31
 
 > **Note**: This library uses a modern per-sensor-type API. All sensor operations require specifying the sensor type (`SENSOR_TYPE_HEART_RATE`, `SENSOR_TYPE_SPEED_CADENCE`, or `SENSOR_TYPE_POWER_METER`). Legacy APIs have been removed for a cleaner, more consistent interface.
 
@@ -883,7 +883,7 @@ Advertising is automatically managed:
 
 ## Version History
 
-### Version 2.2.13.0 (Current)
+### Version 2.2.21.0 (Current)
 - Name-based sensor connection workflow
 - Multi-sensor support (HR, CSC, Power)
 - Discovery functionality

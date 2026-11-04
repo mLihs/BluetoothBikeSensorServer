@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.2.21.0] - 2026-10-31
+
+### Fixed
+- Manual discovery stop now completes exactly once on the NimBLE host task, publishes partial results, restores server callbacks and advertising, and frees retained scan results.
+- A failed discovery start now completes with zero results and restores server mode.
+- MAC mode reapplies its 5-second connect timeout on every attempt.
+- NimBLE-Arduino 2.5.0+ connect retries are disabled in both connection modes, preventing one failed connect from blocking for about 15 seconds.
+- The production init heap log now defaults to off.
+- Corrected the documented default for MAC preservation and marked the no-op connect-interval setter as compatibility-only.
+
+### Behavior Notes
+- Discovery completion callbacks now run after server mode has resumed.
+- A new discovery start is rejected while stop results are queued or publishing.
+- Discovery scan results are freed immediately after publication.
+- Scan ownership, web-task BLE calls, cross-core active-sensor access, and host-reset recovery remain planned for 3.0.
+
+### Compatibility
+- ✅ Public API unchanged
+- ✅ NimBLE-Arduino 2.3.9 through 2.5.2
+
+---
+
 ## [2.2.20.0] - 2026-02-20
 
 ### Fixed - arduino-esp32 3.3.7 NimBLE Boot Crash

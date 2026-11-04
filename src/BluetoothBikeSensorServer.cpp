@@ -5,6 +5,7 @@
 #include "modules/BLEConnectionManager.h"
 #include "modules/SensorDataParser.h"
 #include "modules/BLEAdvertisingManager.h"
+#include "internal/BBSDiscoveryStop.h"
 
 /*
  * arduino-esp32 3.3.7 BT memory fix:
@@ -24,6 +25,8 @@
 #endif
 
 #include <NimBLEDevice.h>
+#include "nimble/nimble/include/nimble/nimble_npl.h"
+#include "nimble/porting/nimble/include/nimble/nimble_port.h"
 // NimBLEDevice.h includes all necessary NimBLE classes (NimBLEServer, NimBLEClient, etc.)
 
 #if BBS_ENABLE_INIT_HEAP_LOG
@@ -151,6 +154,12 @@ DiscoveredSensor g_discoveredSensors[MAX_DISCOVERED_SENSORS];
 int g_discoveredCount = 0;
 bool g_discoveryRunning = false;
 bool g_discoveryDone = false;
+static BBSInternal::DiscoveryStopState g_discoveryPub;
+static std::atomic<uint32_t> g_discoveryStartedMs{0};
+static std::atomic<uint32_t> g_discoveryRunDurationMs{0};
+static struct ble_npl_event g_discoveryCompleteEvent;
+static bool g_discoveryCompleteEventInitialized = false;
+static void discoveryCompleteEventCb(struct ble_npl_event* event);
 
 // Active sensors - one per type (max 3: HR, CSC, Power)
 ActiveSensor* activeSensors = BLEConnectionManagerGetSensors();  // Index 0=HR, 1=CSC, 2=Power
@@ -576,104 +585,125 @@ BLE_LIB_LOGHOT_F("[SCAN] Sensor found, but continuing scan for other sensors..."
 MyAdvertisedDeviceCallbacks advertisedDeviceCallbacks;
 NimBLEScan *pBLEScan = nullptr;
 
-// Discovery scan callbacks
+static void publishDiscoveryResults(const NimBLEScanResults& results) {
+  // Clear previous results (char[] - no heap involved, just zero out)
+  for (int i = 0; i < g_discoveredCount; i++) {
+    g_discoveredSensors[i].clear();
+  }
+  g_discoveredCount = 0;
+
+  int foundCount = results.getCount();
+  BLE_LIB_LOGI_F("Scan fertig, Rohanzahl: %d", foundCount);
+
+  // Process all results (matching async example lines 57-80)
+  for (int i = 0; i < foundCount && g_discoveredCount < maxSensors && g_discoveredCount < MAX_DISCOVERED_SENSORS; ++i) {
+    const NimBLEAdvertisedDevice* advPtr = results.getDevice(i);
+    if (!advPtr) continue;
+    const NimBLEAdvertisedDevice& adv = *advPtr;
+
+    // Check for compiled services
+#if BBS_COMPILE_HEART_RATE
+    bool hasHR = adv.isAdvertisingService(HR_SERVICE_UUID);
+#else
+    bool hasHR = false;
+#endif
+#if BBS_COMPILE_CSC
+    bool hasCSC = adv.isAdvertisingService(SPEED_CADENCE_SERVICE_UUID);
+#else
+    bool hasCSC = false;
+#endif
+#if BBS_COMPILE_POWER
+    bool hasPWR = adv.isAdvertisingService(POWER_SERVICE_UUID);
+#else
+    bool hasPWR = false;
+#endif
+
+    // Only include if it matches the discovery type mask
+    bool matchesMask = false;
+    if ((g_discoveryTypeMask & SENSOR_TYPE_HEART_RATE) && hasHR) matchesMask = true;
+    if ((g_discoveryTypeMask & SENSOR_TYPE_SPEED_CADENCE) && hasCSC) matchesMask = true;
+    if ((g_discoveryTypeMask & SENSOR_TYPE_POWER_METER) && hasPWR) matchesMask = true;
+
+    if (!matchesMask) continue;
+
+    DiscoveredSensor d;
+    d.clear();
+    if (adv.haveName())
+      d.setName(adv.getName().c_str());
+    else
+      d.setName("(kein Name)");
+
+    // v2.2.4.7 FIX: toString() wird nur bei Discovery aufgerufen (User-Aktion, nicht Hot-Path)
+    // This is acceptable because discovery is a rare user action, not continuous scanning
+    d.setMac(adv.getAddress().toString().c_str());
+    d.addrType = adv.getAddress().getType();  // Store BLE address type (0=Public, 1=Random)
+    d.hasHR = hasHR;
+    d.hasCSC = hasCSC;
+    d.hasPWR = hasPWR;
+
+    g_discoveredSensors[g_discoveredCount++] = d;
+  }
+
+  // Sort discovered sensors by name (in-place selection sort).
+  // With char[] members (Phase 5), struct swap is a plain memcpy (~54 bytes)
+  // with zero heap involvement - no need for the old index-array approach
+  // that required a full sorted[MAX_DISCOVERED_SENSORS] temp array on the stack.
+  for (int i = 0; i < g_discoveredCount - 1; ++i) {
+    int minIdx = i;
+    for (int j = i + 1; j < g_discoveredCount; ++j) {
+      if (strcmp(g_discoveredSensors[j].name, g_discoveredSensors[minIdx].name) < 0) {
+        minIdx = j;
+      }
+    }
+    if (minIdx != i) {
+      DiscoveredSensor tmp = g_discoveredSensors[i];
+      g_discoveredSensors[i] = g_discoveredSensors[minIdx];
+      g_discoveredSensors[minIdx] = tmp;
+    }
+  }
+}
+
+static void completeClaimedDiscovery(const NimBLEScanResults& results,
+                                     bool waitForHostDrain) {
+  publishDiscoveryResults(results);
+  if (pBLEScan) {
+    pBLEScan->setScanCallbacks(&advertisedDeviceCallbacks);
+    pBLEScan->setMaxResults(0);
+    pBLEScan->clearResults();
+    BLE_LIB_LOGI_F("[DISCOVERY] Callbacks + maxResults(0) restored to server mode");
+  }
+  g_discoveryDone = true;
+  if (waitForHostDrain) {
+    g_discoveryPub.markWaitingForHostDrain();
+  } else {
+    g_discoveryPub.markReady();
+  }
+}
+
+static void queueDiscoveryCompletionEvent() {
+  ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &g_discoveryCompleteEvent);
+}
+
+static void discoveryCompleteEventCb(struct ble_npl_event* event) {
+  (void)event;
+  if (!g_discoveryPub.tryClaimHost()) {
+    (void)g_discoveryPub.finishHostDrain();
+    return;
+  }
+  NimBLEScanResults results =
+      pBLEScan ? pBLEScan->getResults() : NimBLEScanResults{};
+  completeClaimedDiscovery(results, false);
+}
+
 // Discovery scan callbacks - async pattern using onScanEnd (matching BLE_BikeSensorScan_Async.ino)
 class DiscoveryScanCallbacks : public NimBLEScanCallbacks {
   void onScanEnd(const NimBLEScanResults &results, int reason) override {
-    if (!g_discoveryRunning) return;
-    
+    if (pBLEScan && pBLEScan->isScanning()) return;
+    bool hostEventPending = false;
+    if (!g_discoveryPub.tryClaimScanEnd(hostEventPending)) return;
+
     BLE_LIB_LOGI_F(">>> onScanEnd, reason=%d", reason);
-    
-    // Clear previous results (char[] - no heap involved, just zero out)
-    for (int i = 0; i < g_discoveredCount; i++) {
-      g_discoveredSensors[i].clear();
-    }
-    g_discoveredCount = 0;
-    
-    int foundCount = results.getCount();
-    BLE_LIB_LOGI_F("Scan fertig, Rohanzahl: %d", foundCount);
-    
-    // Process all results (matching async example lines 57-80)
-    for (int i = 0; i < foundCount && g_discoveredCount < maxSensors && g_discoveredCount < MAX_DISCOVERED_SENSORS; ++i) {
-      const NimBLEAdvertisedDevice* advPtr = results.getDevice(i);
-      if (!advPtr) continue;
-      const NimBLEAdvertisedDevice& adv = *advPtr;
-      
-      // Check for compiled services
-#if BBS_COMPILE_HEART_RATE
-      bool hasHR = adv.isAdvertisingService(HR_SERVICE_UUID);
-#else
-      bool hasHR = false;
-#endif
-#if BBS_COMPILE_CSC
-      bool hasCSC = adv.isAdvertisingService(SPEED_CADENCE_SERVICE_UUID);
-#else
-      bool hasCSC = false;
-#endif
-#if BBS_COMPILE_POWER
-      bool hasPWR = adv.isAdvertisingService(POWER_SERVICE_UUID);
-#else
-      bool hasPWR = false;
-#endif
-      
-      // Only include if it matches the discovery type mask
-      bool matchesMask = false;
-      if ((g_discoveryTypeMask & SENSOR_TYPE_HEART_RATE) && hasHR) matchesMask = true;
-      if ((g_discoveryTypeMask & SENSOR_TYPE_SPEED_CADENCE) && hasCSC) matchesMask = true;
-      if ((g_discoveryTypeMask & SENSOR_TYPE_POWER_METER) && hasPWR) matchesMask = true;
-      
-      if (!matchesMask) continue;
-      
-      DiscoveredSensor d;
-      d.clear();
-      if (adv.haveName())
-        d.setName(adv.getName().c_str());
-      else
-        d.setName("(kein Name)");
-      
-      // v2.2.4.7 FIX: toString() wird nur bei Discovery aufgerufen (User-Aktion, nicht Hot-Path)
-      // This is acceptable because discovery is a rare user action, not continuous scanning
-      d.setMac(adv.getAddress().toString().c_str());
-      d.addrType = adv.getAddress().getType();  // Store BLE address type (0=Public, 1=Random)
-      d.hasHR = hasHR;
-      d.hasCSC = hasCSC;
-      d.hasPWR = hasPWR;
-      
-      g_discoveredSensors[g_discoveredCount++] = d;
-    }
-    
-    // Sort discovered sensors by name (in-place selection sort).
-    // With char[] members (Phase 5), struct swap is a plain memcpy (~54 bytes)
-    // with zero heap involvement - no need for the old index-array approach
-    // that required a full sorted[MAX_DISCOVERED_SENSORS] temp array on the stack.
-    for (int i = 0; i < g_discoveredCount - 1; ++i) {
-      int minIdx = i;
-      for (int j = i + 1; j < g_discoveredCount; ++j) {
-        if (strcmp(g_discoveredSensors[j].name, g_discoveredSensors[minIdx].name) < 0) {
-          minIdx = j;
-        }
-      }
-      if (minIdx != i) {
-        DiscoveredSensor tmp = g_discoveredSensors[i];
-        g_discoveredSensors[i] = g_discoveredSensors[minIdx];
-        g_discoveredSensors[minIdx] = tmp;
-      }
-    }
-    
-    g_discoveryRunning = false;
-    g_discoveryDone = true;
-    
-    // CRITICAL FIX: Restore server-mode scan state after discovery ends
-    if (pBLEScan) {
-      // Restore callbacks (without this, AddSensor/sleep-scan won't find devices)
-      pBLEScan->setScanCallbacks(&advertisedDeviceCallbacks);
-      // Reset maxResults to 0 (= callbacks only, no result storage).
-      // Discovery sets maxResults>0 to store results for onScanEnd().
-      // Server/sleep-scan uses onResult() per device and must NOT store results,
-      // otherwise the sleep-scan auto-stops after maxResults devices are found.
-      pBLEScan->setMaxResults(0);
-      BLE_LIB_LOGI_F("[DISCOVERY] Callbacks + maxResults(0) restored to server mode");
-    }
+    completeClaimedDiscovery(results, hostEventPending);
   }
 };
 
@@ -855,16 +885,22 @@ bool connectAndSubscribeSensor(SensorType type) {
     sensor.client->setClientCallbacks(BLEConnectionManagerCreateClientCallbacks(type), false);
     // Set connection parameters BEFORE connect (NimBLE 2.x requirement)
     sensor.client->setConnectionParams(12, 24, 0, 200);
-    
-    // Sleep Scan Mode: Kurzer Connect-Timeout (5s statt 30s)
-    // MAC wurde gerade im Scan gefunden, also sollte Connect schnell gehen
-    if (g_connectionMode == BBS_MODE_MAC) {
-      sensor.client->setConnectTimeout(5000);  // 5 Sekunden Timeout
-      BLE_LIB_LOGI_F("[CLIENT] Created client with 5s connect timeout (Sleep Scan mode)");
-    }
-    
+
     BLE_LIB_LOGI_F("[CLIENT] Created client for %s sensor (reusable, static callbacks).", getSensorTypeName(type));
   }
+
+  if (g_connectionMode == BBS_MODE_MAC) {
+    sensor.client->setConnectTimeout(BBS_CONNECT_TIMEOUT_MS);
+  }
+#if defined(NIMBLE_CPP_VERSION) && defined(NIMBLE_CPP_VERSION_VAL)
+  #if NIMBLE_CPP_VERSION >= NIMBLE_CPP_VERSION_VAL(2, 5, 0)
+  sensor.client->setConnectRetries(0);
+  #endif
+#elif defined(__has_include)
+  #if __has_include(<NimBLECppVersion.h>)
+    #error "NimBLECppVersion.h exists but is not included; retries would stay enabled"
+  #endif
+#endif
   
   // Disconnect first if already connected to a different device
   if (sensor.client->isConnected()) {
@@ -1152,26 +1188,32 @@ void startSleepScan() {
   }
 }
 
-// Discovery asynchron starten (matching BLE_BikeSensorScan_Async.ino pattern)
-void startDiscoveryScan(uint8_t sensorTypeMask) {
-  if (g_discoveryRunning) return; // Already scanning
-  
+static bool startDiscoveryScanImpl(uint8_t sensorTypeMask, bool clearDiscovered) {
+  if (!g_discoveryPub.tryBeginStart()) return false;
+
+  if (clearDiscovered) {
+    BikeSensorServerDeleteAllSensors();
+  }
+
+  g_discoveryRunning = true;
+  g_discoveryDone = false;
+
   // Pause server mode (stops Virtual Server if running)
   pauseServerMode();
-  
+
   // Get scan instance
   if (!pBLEScan) {
     pBLEScan = NimBLEDevice::getScan();
   }
-  
+
   // Stop any existing scan and clear results (async example pattern - line 135-136)
   pBLEScan->stop();
   delay(100); // Small delay to ensure stop completes
   pBLEScan->clearResults();
-  
+
   // Set discovery callbacks
   pBLEScan->setScanCallbacks(&discoveryScanCallbacks);
-  
+
   // Configure discovery scan parameters (faster interval/window)
   BLEScanManager::configureScanParameters(pBLEScan, BLEScanManager::SCAN_MODE_DISCOVERY);
   BLETelemetry::setScanDuplicateFilter(true);
@@ -1183,30 +1225,39 @@ void startDiscoveryScan(uint8_t sensorTypeMask) {
   
   // Set discovery type mask
   g_discoveryTypeMask = sensorTypeMask;
-  g_discoveryDone = false;
-  g_discoveryRunning = true;
-  
+  g_discoveryRunDurationMs.store(discoveryDuration, std::memory_order_relaxed);
+  g_discoveryStartedMs.store(millis(), std::memory_order_relaxed);
+
   BLE_LIB_LOGI_F("Starte Discovery für %lu Sekunden (async)...", discoveryDuration / 1000);
-  
+
   // Start async scan (matching async example line 147: duration_ms, isContinue=false, restart=true)
-  pBLEScan->start(discoveryDuration, false, true);
-  
-  // Telemetry: Record discovery start
-  BLETelemetry::recordDiscoveryStart();
+  if (pBLEScan->start(discoveryDuration, false, true)) {
+    g_discoveryPub.markRunning();
+    BLETelemetry::recordDiscoveryStart();
+    return true;
+  }
+
+  pBLEScan->setScanCallbacks(&advertisedDeviceCallbacks);
+  pBLEScan->setMaxResults(0);
+  g_discoveredCount = 0;
+  g_discoveryDone = true;
+  g_discoveryPub.markStartFailed();
+  return false;
+}
+
+// Discovery asynchron starten (matching BLE_BikeSensorScan_Async.ino pattern)
+void startDiscoveryScan(uint8_t sensorTypeMask) {
+  (void)startDiscoveryScanImpl(sensorTypeMask, false);
 }
 
 // Manual stop function for discovery (if needed)
 void stopDiscoveryScan() {
-  if (!g_discoveryRunning) {
-    return;
+  uint32_t generation = 0;
+  if (!g_discoveryPub.tryRequestStop(generation)) return;
+  if (!pBLEScan || !pBLEScan->stop()) return;
+  if (g_discoveryPub.tryQueueStopped(generation)) {
+    queueDiscoveryCompletionEvent();
   }
-  
-  // Stop the scan
-  if (pBLEScan && pBLEScan->isScanning()) {
-    pBLEScan->stop();
-  }
-  
-  // The onScanEnd callback will handle cleanup
 }
 
 // Debug function to print virtual device and server state
@@ -1314,6 +1365,10 @@ void BluetoothBikeSensorServerInitStack(const char *deviceName,
 
   NimBLEDevice::init(advertisingName.c_str());
   NimBLEDevice::setPower(txPower);
+  if (!g_discoveryCompleteEventInitialized) {
+    ble_npl_event_init(&g_discoveryCompleteEvent, discoveryCompleteEventCb, nullptr);
+    g_discoveryCompleteEventInitialized = true;
+  }
 
 #if BBS_ENABLE_INIT_HEAP_LOG
   bbsInitHeapLog("BEGIN:STACK:AFTER_NIMBLE_INIT");
@@ -1519,9 +1574,24 @@ void BluetoothBikeSensorServerLoop() {
     lastBeat = now;
   }
 
-  // Handle discovery mode - async pattern (matching async example lines 162-185)
-  if (g_discoveryDone) {
+  // Observe RUNNING first. Once RUNNING is acquired, a new generation cannot
+  // start before this generation leaves RUNNING and the CAS below will fail.
+  if (g_discoveryPub.state() == BBSInternal::DiscoveryPub::RUNNING) {
+    const bool discoveryScanIdle = !pBLEScan || !pBLEScan->isScanning();
+    const bool discoveryExpired = BBSInternal::runExpired(
+        static_cast<uint32_t>(now),
+        g_discoveryStartedMs.load(std::memory_order_relaxed),
+        g_discoveryRunDurationMs.load(std::memory_order_relaxed),
+        BBS_DISCOVERY_END_GRACE_MS);
+    if (discoveryScanIdle && discoveryExpired && g_discoveryPub.tryQueueExpired()) {
+      queueDiscoveryCompletionEvent();
+    }
+  }
+
+  // Handle results only after the host task has completed publication.
+  if (g_discoveryPub.isReady()) {
     g_discoveryDone = false;
+    const int discoveryCount = g_discoveredCount;
 
 #if defined(BLE_LIB_DEBUG_GEN)
     BLE_LIB_LOGI_F("");
@@ -1560,15 +1630,17 @@ void BluetoothBikeSensorServerLoop() {
 #endif
 
     // Telemetry: Record discovery complete
-    BLETelemetry::recordDiscoveryComplete(g_discoveredCount);
-
-    // Call completion callback
-    if (g_discoveryCompleteCallback) {
-      g_discoveryCompleteCallback(g_discoveredCount);
-    }
+    BLETelemetry::recordDiscoveryComplete(discoveryCount);
 
     // Restore server mode (resumes Virtual Server if it was running)
+    g_discoveryRunning = false;
     resumeServerMode();
+    g_discoveryPub.finishPublish();
+
+    // Run after READY -> IDLE so a callback-triggered Start can be accepted.
+    if (g_discoveryCompleteCallback) {
+      g_discoveryCompleteCallback(discoveryCount);
+    }
   }
 
   // Skip server mode operations during discovery
@@ -2464,12 +2536,8 @@ void BikeSensorServerStartDiscovery(uint8_t sensorTypeMask) {
   if (!isInitialised) {
     return;
   }
-  
-  // Delete all previously found sensors
-  BikeSensorServerDeleteAllSensors();
-  
-  // Start discovery scan (pauseServerMode is called inside startDiscoveryScan)
-  startDiscoveryScan(sensorTypeMask);
+
+  (void)startDiscoveryScanImpl(sensorTypeMask, true);
 }
 
 void BikeSensorServerStopDiscovery() {
