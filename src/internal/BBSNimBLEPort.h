@@ -147,6 +147,9 @@ class NimBLEPort final : public BlePort {
       out.hasLocation = true;
       out.location = static_cast<uint8_t>(value);
     }
+    // §5.2 rev 36: subscribe() returns true without a CCCD, also when the link dropped
+    // during descriptor discovery (NimBLERemoteCharacteristic.cpp:246–248).
+    if (chr->getDescriptor(NimBLEUUID(static_cast<uint16_t>(0x2902))) == nullptr) return false;
     // Captures one byte: std::function keeps it inline, no heap.
     if (!chr->subscribe(true,
                         [slot](NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
@@ -160,7 +163,7 @@ class NimBLEPort final : public BlePort {
     if (readLe(batt, 0x2A19, 1, value)) out.battery = static_cast<uint8_t>(value);
     // Every type (§5.2): NimBLE may pair on demand during the reads or the subscribe.
     out.encrypted = client->getConnInfo().isEncrypted();
-    return true;
+    return client->isConnected();       // a link lost after the subscribe fails the pass (rev 36)
   }
 
   void gattTimerStart(uint32_t ms) override {
