@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.0.0] - 2026-11-04
 
-New major version with a new API (`#include <BikeSensor.h>`, `namespace BikeSensor`, 35 functions). There is no 2.x compatibility layer.
+New major version with a new API (`#include <BikeSensor.h>`, `namespace BikeSensor`, 34 functions). There is no 2.x compatibility layer.
 
 ### Added
 - One application task: NimBLE callbacks only queue events; `update()` runs the state machines and calls the application. No `delay()` in the library, non-blocking connects, GATT pass bounded by `BBS_GATT_BUDGET_MS`.
@@ -47,7 +47,10 @@ New major version with a new API (`#include <BikeSensor.h>`, `namespace BikeSens
 - Advertising data carries the flags field; the name prefix may be at most 11 bytes with HR + CSC, 9 with HR + CSC + Power. `refreshAdvertising()` returns false when the data was not applied.
 - `info()` battery is known only while the sensor is connected (as 2.x `GetBatteryLevel`); `info().encrypted` is sampled for every type.
 - `quiesced()` and `stats()` belong to the `update()` task.
-- Before a successful `begin()`, `update()`, `addBy*`, `remove()`, `startDiscovery()`, `stopDiscovery()` and `startServer()` are ignored; `end()` returns true.
+- Before a successful `begin()`, `update()`, `addBy*`, `remove()`, `startDiscovery()` and `stopDiscovery()` are ignored; `end()` returns true. `pause()`/`resume()`/`quiesce()` are not blocked: `quiesce()` before `begin()` makes `begin()` fail until reboot.
+- `remove()` returns false before `begin()` and for a type that is not compiled.
+- `advertising()` reports NimBLE's advertising state, also before `begin()` (2.x `IsAdvertising` returned false before init).
+- `begin()` starts the relay server; there is no public `startServer()`. `deviceName` is ignored when NimBLE is already initialized.
 - `disconnectReasonString()` maps NimBLE's `0x200` + HCI reasons; other non-zero host codes give "Unknown Reason" (2.x looked up the raw value, so NimBLE reasons were unknown).
 - A sensor whose measurement characteristic has no CCCD, or whose link drops during the GATT pass, is not reported connected; the pass fails with `SENSOR_FAILED` and backoff.
 - A sensor connect refused with `0x207` while advertising runs is retried once with advertising stopped; advertising is off for at most 7 s.

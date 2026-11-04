@@ -78,19 +78,20 @@ All functions live in `namespace BikeSensor` (`src/BikeSensor.h`).
 
 ### Threading
 
-Call `update()` and every mutating function from one task, normally `loop()`. Getters marked *any task* in the header (`info`, `connected`, `discovered*`, `last*`, `scanning`, `advertising`, `centralCount`, `serverName`) copy under a lock and may run from other tasks. `quiesced()` and `stats()` belong to the `update()` task. Never call the library from AsyncTCP or other web callbacks; set a flag and act in `loop()` (see `Relay_WebServer`). Callbacks run inside `update()`; never call `end()` from one.
+Call `update()` and every mutating function from one task, normally `loop()`. Getters marked *any task* in the header (`info`, `connected`, `discovering`, `discovered*`, `last*`, `scanning`, `advertising`, `centralCount`, `serverName`) copy under a lock and may run from other tasks. `quiesced()` and `stats()` belong to the `update()` task. Never call the library from AsyncTCP or other web callbacks; set a flag and act in `loop()` (see `Relay_WebServer`). Callbacks run inside `update()`; never call `end()` from one.
 
 ### Lifecycle
 
 | Function | Notes |
 |---|---|
 | `bool initStack(const char* deviceName)` | Optional two-phase start: NimBLE only. |
-| `bool begin(const char* deviceName, uint8_t typeMask, Mode mode)` | Check the result. False while already begun, after an `end()` that returned false, or if the name and service UUIDs do not fit the advertising data. |
-| `bool startServer()` | `begin()` already starts the server; kept for the two-phase API. |
+| `bool begin(const char* deviceName, uint8_t typeMask, Mode mode)` | Check the result. Starts the relay server. False while already begun, after an `end()` that returned false, or if the name and service UUIDs do not fit the advertising data. |
 | `void update()` | Call on every loop pass. |
 | `bool end()` | Quiesces, disconnects every link, deinitializes NimBLE. False means not torn down: reboot. |
 
-Before a successful `begin()` (and after a successful `end()`), `update()`, `addByName()`, `addByMac()`, `remove()`, `startDiscovery()`, `stopDiscovery()` and `startServer()` are ignored and return false; `end()` returns true. `typeMask` is built with `typeBit()`: `HEART_RATE` 0x01, `SPEED_CADENCE` 0x02, `POWER` 0x04. Types that are not compiled are ignored. Changing types or mode needs `end()` + `begin()`.
+Before a successful `begin()` (and after a successful `end()`), `update()`, `addByName()`, `addByMac()`, `remove()`, `startDiscovery()`, `stopDiscovery()` are ignored and return false; `end()` returns true. `pause()`, `resume()` and `quiesce()` are not blocked: `pause()` before `begin()` also stops advertising the application started itself, and `quiesce()` before `begin()` makes `begin()` fail until reboot. `typeMask` is built with `typeBit()`: `HEART_RATE` 0x01, `SPEED_CADENCE` 0x02, `POWER` 0x04. Types that are not compiled are ignored. Changing types or mode needs `end()` + `begin()`.
+
+`deviceName` is the name prefix only when `begin()` (or `initStack()`) initializes NimBLE; if NimBLE is already up, `begin()` ignores it and keeps the current prefix (call `setNamePrefix()` before `begin()` in that case). When `begin()` does initialize NimBLE, its `deviceName` replaces a prefix set earlier with `setNamePrefix()`.
 
 ### Sensors
 
@@ -137,15 +138,15 @@ CSC speed is not reported (raw CSC packets are still relayed). `PowerSample`: `w
 | Event | Fields |
 |---|---|
 | `SENSOR_FOUND` | scan found the configured sensor |
-| `SENSOR_CONNECTED` / `SENSOR_DISCONNECTED` | paired; `reason` = NimBLE disconnect reason (0 if the library found the link gone) |
-| `SENSOR_FAILED` | attempt failed, backoff 1 s → 30 s; `reason` 0, or a capacity code (below) |
+| `SENSOR_CONNECTED` / `SENSOR_DISCONNECTED` | subscribed / link ended; `reason` = NimBLE disconnect reason (0 if the library found the link gone) |
+| `SENSOR_FAILED` | attempt failed, backoff 1 s → 30 s; `reason` 0, or the NimBLE host return code `6`, `0x207` or `0x209` of a capacity wait (below) — not a disconnect reason |
 | `DATA` | a parsed packet from a sensor |
 | `DISCOVERY_DONE` | `count`, `generation`, `reason` = `FinishReason` |
 | `CENTRAL_CONNECTED` / `CENTRAL_DISCONNECTED` | `count` = centrals now; `reason` on disconnect |
 | `CENTRAL_SUBSCRIBED` / `CENTRAL_UNSUBSCRIBED` | `sensorType` of the local characteristic |
 | `HOST_RESET` | NimBLE host reset; slots recover on their own |
 
-`disconnectReasonString(int)` names NimBLE's HCI reasons (`0x200` + HCI code, e.g. `0x213` "Remote User Terminated"); other non-zero codes give "Unknown Reason".
+`disconnectReasonString(int)` names NimBLE's HCI reasons (`0x200` + HCI code, e.g. `0x213` "Remote User Terminated"); other non-zero codes give "Unknown Reason". Use it only for `SENSOR_DISCONNECTED`/`CENTRAL_DISCONNECTED` reasons and `info().lastDisconnectReason`.
 
 ### Relay server and advertising
 
@@ -192,6 +193,7 @@ Set with `-D` (e.g. a sketch `build_opt.h` on core 3.x, which also reaches libra
 | `BBS_SLEEP_SCAN_DURATION_MS` / `BBS_SLEEP_SCAN_INTERVAL_MS` | 5000 / 30000 |
 | `BBS_NAME_SCAN_WINDOW_MS` | 10000 |
 | `BBS_POWER_STALE_MS` | 3000 |
+| `BBS_SCAN_END_GRACE_MS` | 3000 |
 | `BBS_CAPACITY_RETRY_MS` | 60000 |
 | `BBS_EVENT_QUEUE_DEPTH`, `BBS_NOTIFY_MAX_LEN` | 24, 36 |
 
