@@ -2,931 +2,199 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Version**: 2.2.21.0
-**Platform**: ESP32 (Arduino Core)  
-**Author**: Martin Lihs  
-**Last Updated**: 2026-10-31
+**Version**: 3.0.0
+**Platform**: ESP32 (Arduino Core 3.x)
+**Author**: Martin Lihs
+**Last Updated**: 2026-11-04
 
-> **Note**: This library uses a modern per-sensor-type API. All sensor operations require specifying the sensor type (`SENSOR_TYPE_HEART_RATE`, `SENSOR_TYPE_SPEED_CADENCE`, or `SENSOR_TYPE_POWER_METER`). Legacy APIs have been removed for a cleaner, more consistent interface.
+> **3.0 is a new major version.** The 2.x functions (`BluetoothBikeSensorServer*`, `BikeSensorServer*`), `BLETelemetry` and `HomewindBleIdentity` are gone; there is no compatibility layer. See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
 ---
 
 ## Overview
 
-**BluetoothBikeSensorServer** is an ESP32 Arduino library that acts as a Bluetooth Low Energy (BLE) relay for fitness sensors. It connects to BLE sensors (Heart Rate, Speed/Cadence, Power Meter) and relays their data to connected central devices (fitness apps, trainers, etc.) via a local GATT server.
+BluetoothBikeSensorServer connects an ESP32 to BLE fitness sensors (Heart Rate `0x180D`, Speed/Cadence `0x1816`, Cycling Power `0x1818`) and relays their measurements to centrals (Zwift, Garmin, phone apps) through a local GATT server.
 
-The library provides a simple, name-based connection workflow using **NimBLE-Arduino 2.x**, making it easy to connect to sensors without managing MAC addresses manually.
+- One application task: NimBLE callbacks only queue events; `BikeSensor::update()` runs the state machines and calls your callbacks.
+- No `delay()` in the library, non-blocking connects, no heap churn while scanning.
+- MAC mode (a 5 s sleep scan every 30 s until the MAC is seen; after a drop one direct attempt first) or NAME mode (10 s scan windows until the name is seen).
+- Discovery with name, MAC, address type and advertised types.
+- HR, CSC cadence and Power (watts, cadence, pedal balance, energy) as callbacks and getters; cadence from the power meter when no CSC sensor is configured.
+- One-way `quiesce()` for OTA and maintenance.
 
----
+## Requirements
 
-## What is BluetoothBikeSensorServer?
+- ESP32 with BLE (built for ESP32 and ESP32-S3, hardware-tested on the ESP32-S3), arduino-esp32 core 3.3.x.
+- [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) **2.5.0 or newer** (2.5.2 tested).
+- Extended advertising (`CONFIG_BT_NIMBLE_EXT_ADV`) must be off (`#error` otherwise).
 
-BluetoothBikeSensorServer serves as a **BLE sensor relay** that:
-
-1. **Connects to BLE sensors** (Heart Rate monitors, Speed/Cadence sensors, Power meters)
-2. **Relays sensor data** to connected central devices (Zwift, TrainerRoad, Garmin, etc.)
-3. **Provides discovery functionality** to find and list available sensors
-4. **Manages sensor connections** automatically with name-based matching
-5. **Supports multiple sensor types** simultaneously (HR + CSC + Power)
-
-### Use Cases
-
-- **Fitness App Integration**: Relay sensor data to Zwift, TrainerRoad, or other fitness apps
-- **Multi-Device Support**: Connect multiple sensors and relay to multiple central devices
-- **Sensor Discovery**: Find and list available BLE sensors in range
-- **Smart Trainer Integration**: Provide sensor data to smart trainers and training platforms
-
----
-
-## Key Features
-
-### ✅ Implemented Features
-
-1. **Multi-Sensor Support**
-   - Heart Rate (HR) sensors (BLE Service 0x180D)
-   - Speed/Cadence (CSC) sensors (BLE Service 0x1816)
-   - Power Meter sensors (BLE Service 0x1818)
-   - Support for all three sensor types simultaneously
-
-2. **Connection Modes**
-   - **Scan-Based Mode** (default): Connect to sensors by device name (no MAC address required)
-   - **MAC Sleep-Scan Mode** (v2.2.13.0+): Connect by MAC address using periodic short scans
-   - Automatic scanning and connection when sensor is in range (scan mode)
-   - Robust reconnection handling with permanent MAC preservation in MAC mode (v2.2.8.0+)
-
-3. **Sensor Discovery**
-   - Async discovery mode to find available sensors
-   - Filter by sensor type (HR, CSC, Power)
-   - List discovered sensors with name, MAC, and type
-   - Configurable discovery duration and max sensors
-
-4. **BLE GATT Server**
-   - Creates virtual sensor server that central devices can connect to
-   - Mirrors sensor data to connected centrals in real-time
-   - Supports multiple simultaneous central connections
-   - Dynamic service advertising based on connected sensors
-
-5. **Device Identity**
-   - MAC-based device naming: `{prefix}-xxxxxxxx` (e.g., "homewind-da4eb580")
-   - Configurable device name prefix
-   - Homewind BLE Identity integration for consistent naming
-
-6. **Connection Management**
-   - Automatic sensor reconnection on disconnect
-   - Sensor MAC preservation option for faster reconnection (scan mode)
-   - Permanent MAC preservation in MAC Sleep-Scan mode (v2.2.8.0+) - sensors reconnect even after long offline periods
-   - Per-sensor-type connection status tracking
-   - Battery level monitoring (when available)
-
-7. **Runtime Configuration**
-   - Enable/disable sensor types at runtime
-   - Add/remove sensors dynamically
-   - Pause/resume advertising
-   - Refresh advertising identity (for Zwift cache bypass)
-
-8. **Callbacks & Events**
-   - Data update callbacks (HR, Speed/Cadence, Power)
-   - Sensor connection/disconnection callbacks (per type)
-   - Central device connection/disconnection callbacks
-   - Discovery complete callback
-
----
-
-## Hardware Requirements
-
-### Minimum Requirements
-- **Microcontroller**: ESP32 (any variant: ESP32, ESP32-S2, ESP32-S3, ESP32-C3, ESP32-C6, ESP32-H2)
-- **BLE**: Built-in Bluetooth Low Energy support
-- **RAM**: ~50KB free heap (typical)
-- **Flash**: Minimal (library code only)
-
-### Supported Sensors
-- **Heart Rate Monitors**: Any BLE HR sensor (e.g., Wahoo TICKR, Polar H10)
-- **Speed/Cadence Sensors**: Any BLE CSC sensor (e.g., Wahoo RPM, Garmin Speed/Cadence)
-- **Power Meters**: Any BLE Power meter (e.g., Stages, 4iiii, Garmin)
-
----
-
-## Software Dependencies
-
-### Required
-- **ESP32 Arduino Core** - Platform support
-- **NimBLE-Arduino** - Version **2.x** (REQUIRED, NOT compatible with 1.x)
-
-### Optional
-- **DebugLog** - For debug logging (optional, can use Serial directly)
-
----
-
-## Installation
-
-### Arduino IDE
-
-1. Download or clone this library into your Arduino `libraries` folder:
-   ```bash
-   cd ~/Documents/Arduino/libraries
-   git clone <repository-url> BluetoothBikeSensorServer
-   ```
-
-2. Install the required dependency:
-   - Open Arduino IDE
-   - Go to **Tools → Manage Libraries**
-   - Search for **NimBLE-Arduino** and install version **2.x** (NOT 1.x)
-
-3. Restart Arduino IDE
-
-### PlatformIO
-
-Add to your `platformio.ini`:
-
-```ini
-[env:esp32dev]
-platform = espressif32
-board = esp32dev
-framework = arduino
-lib_deps = 
-    h2zero/NimBLE-Arduino@^2.0.0
-    file://../libraries/BluetoothBikeSensorServer
-```
-
-### Manual Installation
-
-1. Copy the `BluetoothBikeSensorServer` folder to your project's `libraries` directory
-2. Ensure `NimBLE-Arduino` version 2.x is installed (required dependency)
-3. Include the header in your sketch:
-   ```cpp
-   #include <BluetoothBikeSensorServer.h>
-   ```
-
----
-
-## Quick Start
-
-### Minimal Example (Heart Rate Only)
+Install into your Arduino `libraries` folder and include one header:
 
 ```cpp
-#include <BluetoothBikeSensorServer.h>
+#include <BikeSensor.h>
+```
 
-const char* HR_SENSOR_NAME = "TICKR FIT";  // Replace with your sensor name
+## Quick start
 
-void onHeartRateChanged(uint16_t hr) {
-  Serial.print("Heart rate: ");
-  Serial.println(hr);
-}
+```cpp
+#include <BikeSensor.h>
+
+namespace bs = BikeSensor;
+
+void onHeartRate(uint16_t bpm) { Serial.printf("HR %u\n", bpm); }
 
 void setup() {
   Serial.begin(115200);
-  
-  // Initialize library (default device name prefix: "homewind")
-  BluetoothBikeSensorServerBegin();
-  
-  // Set data callback
-  BluetoothBikeSensorServerSetHeartRateCallback(onHeartRateChanged);
-  
-  // Add sensor by name
-  BikeSensorServerAddSensor(SENSOR_TYPE_HEART_RATE, HR_SENSOR_NAME);
+  if (!bs::begin("homewind", bs::typeBit(bs::SensorType::HEART_RATE), bs::Mode::MAC)) {
+    Serial.println("begin() failed");
+    return;
+  }
+  bs::setHeartRateCallback(onHeartRate);
+  bs::addByMac(bs::SensorType::HEART_RATE, "f0:13:c3:ee:56:97", 0, "HR");
 }
 
 void loop() {
-  // Must call this regularly
-  BluetoothBikeSensorServerLoop();
-  
-  delay(100);
+  bs::update();   // every loop pass
 }
 ```
 
-### Multi-Sensor Example
-
-```cpp
-#include <BluetoothBikeSensorServer.h>
-
-void onHeartRateChanged(uint16_t hr) {
-  Serial.print("HR: ");
-  Serial.println(hr);
-}
-
-void onSpeedCadenceChanged(uint16_t speed, uint16_t cadence) {
-  Serial.print("Speed: ");
-  Serial.print(speed / 100.0 * 3.6);  // Convert to km/h
-  Serial.print(" km/h, Cadence: ");
-  Serial.print(cadence);
-  Serial.println(" rpm");
-}
-
-void onPowerChanged(int16_t power) {
-  Serial.print("Power: ");
-  Serial.println(power);
-}
-
-void setup() {
-  Serial.begin(115200);
-  BluetoothBikeSensorServerBegin();
-  
-  // Set data callbacks
-  BluetoothBikeSensorServerSetHeartRateCallback(onHeartRateChanged);
-  BluetoothBikeSensorServerSetSpeedCadenceCallback(onSpeedCadenceChanged);
-  BluetoothBikeSensorServerSetPowerCallback(onPowerChanged);
-  
-  // Add sensors by name
-  BikeSensorServerAddSensor(SENSOR_TYPE_HEART_RATE, "TICKR FIT");
-  BikeSensorServerAddSensor(SENSOR_TYPE_SPEED_CADENCE, "Ridesense");
-  BikeSensorServerAddSensor(SENSOR_TYPE_POWER_METER, "Power Meter");
-}
-
-void loop() {
-  BluetoothBikeSensorServerLoop();
-  delay(100);
-}
-```
-
-### MAC Sleep-Scan Mode Example (v2.2.13.0+)
-
-Connect by MAC address using periodic short scans (Sleep-Scan). Ideal for fixed sensor setups with known MAC addresses.
-
-**Important (v2.2.10.0+):** Run Discovery first to find the correct BLE address type (0 or 1) for your sensor!
-
-```cpp
-#include <BluetoothBikeSensorServer.h>
-
-const char* HR_SENSOR_MAC = "F0:13:C3:EE:56:97";  // Replace with your sensor MAC
-const int8_t HR_ADDR_TYPE = 0;  // Get from Discovery output: [HR] Name (MAC) 0
-
-void onHeartRateChanged(uint16_t hr) {
-  Serial.print("Heart rate: ");
-  Serial.println(hr);
-}
-
-void setup() {
-  Serial.begin(115200);
-  
-  // Initialize in MAC Sleep-Scan mode (periodic scan)
-  BluetoothBikeSensorServerBegin("mydevice", SENSOR_TYPE_HEART_RATE, BBS_MODE_MAC);
-  
-  // Set data callback
-  BluetoothBikeSensorServerSetHeartRateCallback(onHeartRateChanged);
-  
-  // Add sensor by MAC address with explicit address type (RECOMMENDED)
-  BikeSensorServerAddSensorByMac(SENSOR_TYPE_HEART_RATE, nullptr, HR_SENSOR_MAC, HR_ADDR_TYPE);
-}
-
-void loop() {
-  BluetoothBikeSensorServerLoop();
-  delay(100);
-}
-```
-
-**How to find the address type:**
-1. Run Discovery (e.g., press 'd' in Serial Monitor)
-2. Check the output: `[HR] TICKR FIT (f0:13:c3:ee:56:97) 0` → use `0`
-3. Use that value (0 or 1) as the `addrType` parameter
-
-**Advantages of MAC Sleep-Scan Mode:**
-- ✅ Periodic short scans reduce power and avoid long connect timeouts
-- ✅ MAC address permanently preserved (v2.2.8.0+) - sensors reconnect even after long offline periods
-- ✅ Connect only after MAC was seen (more reliable)
-- ✅ Ideal for fixed sensor setups
-
-**Note**: In MAC Sleep-Scan mode, the MAC address is permanently preserved. Sensors will reconnect even after long offline periods (e.g., overnight).
-
----
-
-## API Reference
-
-### Initialization
-
-#### `void BluetoothBikeSensorServerBegin(const char *deviceNamePrefix = nullptr, uint8_t enabledSensorTypes = SENSOR_TYPE_HEART_RATE | SENSOR_TYPE_SPEED_CADENCE | SENSOR_TYPE_POWER_METER, BBSConnectionMode connectionMode = BBS_MODE_SCAN, esp_power_level_t txPower = ESP_PWR_LVL_P9)`
-
-Initializes the library. The device name parameter is used as a prefix for MAC-based identity. The actual BLE device name will be `"{prefix}-xxxxxxxx"` where `xxxxxxxx` is derived from the chip eFuse MAC (lower 32-bit, WiFi-style suffix).
-
-**Parameters:**
-- `deviceNamePrefix`: Optional device name prefix (default: "homewind"). Will be converted to lowercase.
-- `enabledSensorTypes`: Bitmask of sensor types to enable (default: all)
-- `connectionMode`: Connection mode - `BBS_MODE_SCAN` (default) for name-based scanning, or `BBS_MODE_MAC` for MAC-based Sleep-Scan connections (v2.2.13.0+)
-- `txPower`: BLE transmit power level (default: `ESP_PWR_LVL_P9`)
-
-**Connection Modes:**
-- `BBS_MODE_SCAN` (default): Scan-based mode - use with `BikeSensorServerAddSensor()`
-- `BBS_MODE_MAC`: MAC Sleep-Scan mode - use with `BikeSensorServerAddSensorByMac()` (v2.2.13.0+)
-
-**Example:**
-```cpp
-BluetoothBikeSensorServerBegin();  // Uses default "homewind" prefix, scan mode
-BluetoothBikeSensorServerBegin("mydevice");  // Custom prefix: "mydevice-xxxxxxxx", scan mode
-BluetoothBikeSensorServerBegin("mydevice", SENSOR_TYPE_HEART_RATE, BBS_MODE_MAC);  // MAC Sleep-Scan mode
-```
-
-#### `void BluetoothBikeSensorServerLoop()`
-
-Must be called regularly in your `loop()` function to handle BLE operations.
-
----
-
-### Sensor Management
-
-#### `bool BikeSensorServerAddSensor(SensorType type, const char* sensorName)`
-
-Add a sensor to connect to by device name. The library will scan for the device and connect automatically when found.
-
-**Parameters:**
-- `type`: Sensor type (`SENSOR_TYPE_HEART_RATE`, `SENSOR_TYPE_SPEED_CADENCE`, or `SENSOR_TYPE_POWER_METER`)
-- `sensorName`: Device name to search for (exact match required)
-
-**Returns:** `true` if sensor was added successfully
-
-**Example:**
-```cpp
-BikeSensorServerAddSensor(SENSOR_TYPE_HEART_RATE, "TICKR FIT");
-```
-
-#### `bool BikeSensorServerAddSensorByMac(SensorType type, const char* sensorName, const char* macAddress, int8_t addrType)` (v2.2.10.0+)
-#### `bool BikeSensorServerAddSensorByMac(SensorType type, const char* sensorName, const char* macAddress)`
-#### `bool BikeSensorServerAddSensorByMac(SensorType type, const char* macAddress)`
-
-Add a sensor to connect by MAC address (MAC Sleep-Scan mode). Requires `BBS_MODE_MAC` connection mode.
-
-**Parameters:**
-- `type`: Sensor type (`SENSOR_TYPE_HEART_RATE`, `SENSOR_TYPE_SPEED_CADENCE`, or `SENSOR_TYPE_POWER_METER`)
-- `sensorName`: Optional device name (can be `nullptr` or empty, used for logging only)
-- `macAddress`: MAC address in format "aa:bb:cc:dd:ee:ff" (case-insensitive)
-- `addrType`: BLE address type (v2.2.10.0+):
-  - `0` = Public address
-  - `1` = Random address
-  - `-1` = Auto-detect (not recommended - may not work for all devices)
-  - **Recommended**: Run Discovery to find the correct type! Discovery output shows: `[HR] Name (MAC) 0` → use `0`
-
-**Returns:** `true` if sensor was added successfully
-
-**Note:** In MAC Sleep-Scan mode, the MAC address is permanently preserved (v2.2.8.0+), even after disconnections and connection failures. The system will continue attempting to reconnect indefinitely.
-
-**Example:**
-```cpp
-// Initialize in MAC Sleep-Scan mode
-BluetoothBikeSensorServerBegin("mydevice", SENSOR_TYPE_HEART_RATE, BBS_MODE_MAC);
-
-// Method 1: With explicit address type (RECOMMENDED - v2.2.10.0+)
-// Discovery shows: [HR] TICKR FIT (f0:13:c3:ee:56:97) 0
-BikeSensorServerAddSensorByMac(SENSOR_TYPE_HEART_RATE, nullptr, "F0:13:C3:EE:56:97", 0);
-
-// Method 2: Auto-detect (may not work for all devices)
-BikeSensorServerAddSensorByMac(SENSOR_TYPE_HEART_RATE, "F0:13:C3:EE:56:97");
-```
-
-#### `bool BikeSensorServerRemoveSensor(SensorType type)`
-
-Remove a sensor and disconnect.
-
-**Returns:** `true` if sensor was removed
-
-#### `bool BikeSensorServerIsSensorConnected(SensorType type)`
-
-Check if a specific sensor type is currently connected.
-
-**Returns:** `true` if connected
-
-#### `bool BikeSensorServerGetSensorMac(SensorType type, char* mac, size_t len)`
-
-Get the MAC address of the active sensor.
-
-**Returns:** `true` if sensor is active and MAC was copied
-
-#### `bool BikeSensorServerGetSensorName(SensorType type, char* name, size_t len)`
-
-Get the name of the active sensor.
-
-**Returns:** `true` if sensor is active and name was copied
-
-#### `bool BikeSensorServerGetBatteryLevel(SensorType type, uint8_t* batteryLevel)`
-
-Get the battery level of the active sensor (0-100, 255 = unknown).
-
-**Returns:** `true` if sensor is active and battery level is available
-
----
-
-### Data Access
-
-#### Heart Rate
-
-```cpp
-uint16_t BluetoothBikeSensorServerGetLastHeartRate();
-bool BluetoothBikeSensorServerHasHeartRate();
-uint32_t BluetoothBikeSensorServerGetLastHeartRateTimestamp();
-```
-
-#### Speed/Cadence
-
-```cpp
-bool BluetoothBikeSensorServerGetLastSpeedCadence(uint16_t* speed, uint16_t* cadence);
-bool BluetoothBikeSensorServerHasSpeedCadence();
-uint32_t BluetoothBikeSensorServerGetLastSpeedCadenceTimestamp();
-```
-
-**Note:** Speed is in units of 1/256 m/s. To convert to km/h: `speed / 100.0 * 3.6`
-
-#### Power Meter
-
-```cpp
-int16_t BluetoothBikeSensorServerGetLastPower();
-bool BluetoothBikeSensorServerHasPower();
-uint32_t BluetoothBikeSensorServerGetLastPowerTimestamp();
-```
-
----
-
-### Callbacks
-
-#### Data Callbacks
-
-```cpp
-void BluetoothBikeSensorServerSetHeartRateCallback(void (*callback)(uint16_t heartRate));
-void BluetoothBikeSensorServerSetSpeedCadenceCallback(void (*callback)(uint16_t speed, uint16_t cadence));
-void BluetoothBikeSensorServerSetPowerCallback(void (*callback)(int16_t power));
-```
-
-#### Sensor Connection Callbacks (Per Type)
-
-```cpp
-void BikeSensorServerSetSensorConn(SensorType type, void (*callback)());
-void BikeSensorServerSetSensorDisc(SensorType type, void (*callback)());
-```
-
-**Example:**
-```cpp
-void onHRConnected() {
-  Serial.println("HR sensor connected!");
-}
-
-BikeSensorServerSetSensorConn(SENSOR_TYPE_HEART_RATE, onHRConnected);
-```
-
-#### Central Device Callbacks
-
-```cpp
-void BikeSensorServerSetClientConn(void (*callback)(uint8_t centralCount));
-void BikeSensorServerSetClientDisc(void (*callback)(uint8_t centralCount));
-```
-
----
-
-### Discovery Functions
-
-#### `void BikeSensorServerStartDiscovery(uint8_t sensorTypeMask)`
-
-Start discovery mode to search for Bluetooth sensors. Automatically deletes all previously found sensors before starting.
-
-**Parameters:**
-- `sensorTypeMask`: Bitmask of sensor types to search for:
-  - `SENSOR_TYPE_HEART_RATE` (0x01)
-  - `SENSOR_TYPE_SPEED_CADENCE` (0x02)
-  - `SENSOR_TYPE_POWER_METER` (0x04)
-  - Can combine: `SENSOR_TYPE_HEART_RATE | SENSOR_TYPE_POWER_METER`
-
-**Example:**
-```cpp
-BikeSensorServerStartDiscovery(SENSOR_TYPE_HEART_RATE | SENSOR_TYPE_POWER_METER);
-```
-
-#### `void BikeSensorServerStopDiscovery()`
-
-Manually stop discovery mode before timeout.
-
-#### `uint8_t BikeSensorServerGetSensorCount()`
-
-Get total count of discovered sensors.
-
-#### `bool BikeSensorServerGetSensor(uint8_t index, SensorType* type, char* name, size_t nameLen, uint8_t mac[6])`
-
-Get sensor information by index. MAC is returned as raw 6-byte array.
-
-#### `const char* BikeSensorServerListSensors(SensorListFormat format)`
-
-Get formatted list of all discovered sensors.
-
-**Format options:**
-- `LIST_FORMAT_NAME` - Names only
-- `LIST_FORMAT_MAC` - MAC addresses only
-- `LIST_FORMAT_FULL` - Name and MAC
-
-#### `void BikeSensorServerSetDiscoveryCompleteCallback(void (*callback)(uint8_t count))`
-
-Set callback function called when discovery completes.
-
-#### `void BikeSensorServerSetDiscoveryDuration(uint32_t durationMs)`
-
-Set discovery duration in milliseconds (default: 20000 = 20 seconds).
-
-#### `void BikeSensorServerSetMaxSensors(uint8_t maxSensors)`
-
-Set maximum number of sensors to discover (default: 12).
-
----
-
-### Runtime Configuration
-
-### Compile-Time Feature Flags
-
-Feature flags are defined in `src/config/BBSConfig.h` and control optional subsystems.
-
-**Current defaults:**
-```cpp
-BBS_ENABLE_TELEMETRY   0
-BBS_ENABLE_NAME_DISCOVERY 1
-BBS_ENABLE_VERBOSE_LOG 0
-BBS_ENABLE_GETTERS     0
-BBS_ENABLE_CENTRAL_CB  1
-```
-
-**Sleep-Scan (MAC Mode) Configuration:**
-```cpp
-// How long each scan runs (ms)
-#define BBS_SLEEP_SCAN_DURATION_MS 2000
-
-// Interval between scans (ms)
-#define BBS_SLEEP_SCAN_INTERVAL_MS 30000
-```
-
-#### `void BikeSensorServerSetEnabledSensorTypes(uint8_t newEnabledSensorTypes)`
-
-Dynamically change the enabled sensor types at runtime. This will:
-- Update the enabled sensor types
-- Create/remove services as needed
-- Update advertising to reflect new services
-- Disconnect all connected central devices (forces them to rediscover)
-
-**Example:**
-```cpp
-// Enable only HR and Power
-BikeSensorServerSetEnabledSensorTypes(SENSOR_TYPE_HEART_RATE | SENSOR_TYPE_POWER_METER);
-```
-
-#### `void BikeSensorServerSetPreserveMacOnDisconnect(bool preserve)`
-
-Enable/disable preserving sensor MAC address on disconnect for faster reconnection.
-
-**Parameters:**
-- `preserve`: `true` for faster reconnection (preserves MAC), `false` for standard reconnection (rescans)
-
-**Example:**
-```cpp
-BikeSensorServerSetPreserveMacOnDisconnect(true);  // Enable fast reconnection
-```
-
-#### `void BikeSensorServerTriggerReconnect()` (v2.2.13.0+)
-
-Manually trigger an immediate reconnection attempt for disconnected sensors.
-
-**Behavior:**
-- **MAC Sleep-Scan mode**: Resets scan timer + starts immediate scan
-- **Scan mode**: Starts scanning if not already running
-
-**Example:**
-```cpp
-// Reconnect button handler
-void onReconnectButtonPressed() {
-  BikeSensorServerTriggerReconnect();
-}
-```
-
-#### `void BikeSensorServerSetDeviceNamePrefix(const char* prefix)`
-
-Set the device name prefix for MAC-based identity. Format: `"{prefix}-xxxxxxxx"`.
-
-**Example:**
-```cpp
-BikeSensorServerSetDeviceNamePrefix("mydevice");  // Device name: "mydevice-da4eb580"
-```
-
-#### `void BikeSensorServerPause()`
-
-Pause the BLE Relay Server (stops advertising). Useful when opening sensor configuration UI.
-
-#### `void BikeSensorServerResume()`
-
-Resume the BLE Relay Server (restarts advertising).
-
-#### `bool BikeSensorServerIsAdvertising()`
-
-Check if the BLE Relay Server is currently advertising.
-
----
-
-### Central Device Status
-
-```cpp
-bool BluetoothBikeSensorServerHasCentral();
-uint8_t BluetoothBikeSensorServerGetCentralCount();
-void BluetoothBikeSensorServerCheckCentralConnections();
-```
-
----
+`begin()` initializes NimBLE (unless it is already up), creates one client per compiled sensor type and the relay server. Advertising starts on the next `update()` with the name `"<prefix>-<chip id>"`, e.g. `homewind-da4eb580`.
 
 ## Examples
 
-The library includes several example sketches demonstrating different use cases:
+| Example | Shows |
+|---|---|
+| `Basic_MAC` | one HR sensor by MAC, lifecycle events, status |
+| `Basic_Name` | one HR sensor by name |
+| `Discovery` | periodic discovery, prints name / MAC / address type |
+| `Telemetry` | HR + CSC by MAC, `stats()`, heap and `update()` timing |
+| `Relay_WebServer` | HR + CSC relay plus a WebSocket page (ESPAsyncWebServer, AsyncTCP) |
+| `Power` | power meter by name; ships `build_opt.h` with `-DBBS_COMPILE_POWER=1` |
+| `NimBLEHeapTest` | heap cost of NimBLE, the library and one connection |
 
-### 1. HR_Only_Example
-**Location:** `examples/HR_Only_Example/HR_Only_Example.ino`
+## API
 
-Minimal example connecting to a single Heart Rate sensor.
+All functions live in `namespace BikeSensor` (`src/BikeSensor.h`).
 
-**Key Features:**
-- Single sensor connection
-- Basic data callback
-- Connection status callbacks
+### Threading
 
-### 2. HR_CSC_Example
-**Location:** `examples/HR_CSC_Example/HR_CSC_Example.ino`
+Call `update()` and every mutating function from one task, normally `loop()`. Getters marked *any task* in the header (`info`, `connected`, `discovered*`, `last*`, `scanning`, `advertising`, `centralCount`, `serverName`) copy under a lock and may run from other tasks. `quiesced()` and `stats()` belong to the `update()` task. Never call the library from AsyncTCP or other web callbacks; set a flag and act in `loop()` (see `Relay_WebServer`). Callbacks run inside `update()`; never call `end()` from one.
 
-Example connecting to both Heart Rate and Speed/Cadence sensors.
+### Lifecycle
 
-**Key Features:**
-- Multi-sensor support
-- Per-sensor-type callbacks
-- Data access methods
+| Function | Notes |
+|---|---|
+| `bool initStack(const char* deviceName)` | Optional two-phase start: NimBLE only. |
+| `bool begin(const char* deviceName, uint8_t typeMask, Mode mode)` | Check the result. False while already begun, after an `end()` that returned false, or if the name and service UUIDs do not fit the advertising data. |
+| `bool startServer()` | `begin()` already starts the server; kept for the two-phase API. |
+| `void update()` | Call on every loop pass. |
+| `bool end()` | Quiesces, disconnects every link, deinitializes NimBLE. False means not torn down: reboot. |
 
-### 3. DiscoveryExample
-**Location:** `examples/DiscoveryExample/DiscoveryExample.ino`
+Before a successful `begin()` (and after a successful `end()`), `update()`, `addByName()`, `addByMac()`, `remove()`, `startDiscovery()`, `stopDiscovery()` and `startServer()` are ignored and return false; `end()` returns true. `typeMask` is built with `typeBit()`: `HEART_RATE` 0x01, `SPEED_CADENCE` 0x02, `POWER` 0x04. Types that are not compiled are ignored. Changing types or mode needs `end()` + `begin()`.
 
-Demonstrates the discovery feature to find and list available sensors.
+### Sensors
 
-**Key Features:**
-- Async discovery mode
-- Sensor listing and filtering
-- Discovery callbacks
+| Function | Notes |
+|---|---|
+| `bool addByMac(SensorType, const char* mac, int8_t addrType, const char* name = nullptr)` | MAC mode. `mac` = `xx:xx:xx:xx:xx:xx`; `addrType` 0 public, 1 random, -1 auto. |
+| `bool addByName(SensorType, const char* name)` | NAME mode. Exact, case-sensitive match. |
+| `bool remove(SensorType)` | From every state; a live link is disconnected first. True once the slot is empty or on its way there. |
+| `bool connected(SensorType)` | Subscribed: between `SENSOR_CONNECTED` and `SENSOR_DISCONNECTED`. |
+| `bool info(SensorType, SensorInfo&)` | Name, MAC, address type, state, battery, last disconnect reason, `encrypted`, `providesCadence`. False only for a type that is not compiled. |
 
-### 4. FastReconnectionExample
-**Location:** `examples/FastReconnectionExample/FastReconnectionExample.ino`
+`addBy*` returns false for a type outside the `begin()` mask, in the other mode, under quiesce, for an empty name, or when **another** type already holds the same MAC (or, in NAME mode, the same name). Identical names for different types are rejected on purpose. Calling `addBy*` again for the same type replaces the identity and reconnects. In NAME mode, avoid a name that equals another sensor's shortened advertised name: the slot that resolves first keeps that address until `remove()` or a replace.
 
-Shows how to use Sensor MAC Preservation for faster reconnection.
+Battery and `encrypted` are only known while the sensor is connected. One device cannot fill two slots: a power meter that also advertises CSC delivers cadence through the Power slot (below).
 
-**Key Features:**
-- Fast reconnection configuration
-- MAC address preservation
-- Reconnection time comparison
+### Discovery
 
-### 5. WebSocketStreamingExample
-**Location:** `examples/WebSocketStreamingExample/WebSocketStreamingExample.ino`
+| Function | Notes |
+|---|---|
+| `bool startDiscovery(uint8_t typeMask, uint32_t durationMs = 15000)` | False under quiesce, while a discovery is open, or for a duration of 0 or ≥ `INT32_MAX − BBS_SCAN_END_GRACE_MS`. Waits for a running connect; no connect starts until it ends. |
+| `void stopDiscovery()` | Finishes with `FinishReason::MANUAL`; results are kept. |
+| `bool discovering()` | True until `DISCOVERY_DONE`. |
+| `uint8_t discoveredCount()`, `bool discovered(uint8_t i, DiscoveredSensor&)` | Table of the last finished discovery: named sensors first (sorted by name), unnamed last with an empty name. At most `BBS_MAX_DISCOVERED` (16). |
 
-Integration example with WebSocket for real-time data streaming.
+Discovery also works while the server is paused.
 
-**Key Features:**
-- WebSocket integration
-- Real-time data streaming
-- Web UI integration
+### Measurements
 
-### 6. WebUI_Integration
-**Location:** `examples/WebUI_Integration/WebUI_Integration.ino`
+| Function | Notes |
+|---|---|
+| `setHeartRateCallback(void (*)(uint16_t bpm))` | Every HR packet. |
+| `setCadenceCallback(void (*)(uint16_t rpm))` | Only packets that report a cadence. |
+| `setPowerCallback(void (*)(const PowerSample&))` | Every valid CPS packet (needs `BBS_COMPILE_POWER=1`). |
+| `bool lastHeartRate(uint16_t&, uint32_t& ageMs)`, `bool lastCadence(...)`, `bool lastPower(PowerSample&, uint32_t& ageMs)` | False while the sensor is not connected or has not delivered yet. `ageMs` = age of the packet that produced the value. |
 
-Full WebUI integration example with sensor management.
+CSC speed is not reported (raw CSC packets are still relayed). `PowerSample`: `watts`, `cadence` (0 when stale: no crank event for `BBS_POWER_STALE_MS`, 3 s), `hasCadence`, `balance` (½ %, 0xFF = none), `balanceIsLeft`, `energyKJ`/`hasEnergy`, raw `flags`.
 
-**Key Features:**
-- Web-based sensor configuration
-- Real-time monitoring
-- Discovery UI integration
+**Cadence source.** A configured CSC sensor (connected or not) is the cadence source. Without one, a connected power meter is; `info(POWER).providesCadence` then is true and the cadence callback reports 0 once after the meter stops sending crank data. A CSC sensor that is configured but left at home means no cadence until it is removed. Nothing is synthesized onto the local CSC service: pair the app's cadence to the relayed power service, which carries the meter's crank data.
 
-### 7. IdentityExample
-**Location:** `examples/IdentityExample/IdentityExample.ino`
+### Events
 
-Demonstrates device identity and advertising configuration.
+`setEventCallback(void (*)(const EventInfo&))` reports:
 
-**Key Features:**
-- Custom device name prefix
-- Advertising identity management
-- MAC-based naming
+| Event | Fields |
+|---|---|
+| `SENSOR_FOUND` | scan found the configured sensor |
+| `SENSOR_CONNECTED` / `SENSOR_DISCONNECTED` | paired; `reason` = NimBLE disconnect reason (0 if the library found the link gone) |
+| `SENSOR_FAILED` | attempt failed, backoff 1 s → 30 s; `reason` 0, or a capacity code (below) |
+| `DATA` | a parsed packet from a sensor |
+| `DISCOVERY_DONE` | `count`, `generation`, `reason` = `FinishReason` |
+| `CENTRAL_CONNECTED` / `CENTRAL_DISCONNECTED` | `count` = centrals now; `reason` on disconnect |
+| `CENTRAL_SUBSCRIBED` / `CENTRAL_UNSUBSCRIBED` | `sensorType` of the local characteristic |
+| `HOST_RESET` | NimBLE host reset; slots recover on their own |
 
-### 8. ManualSensorExample
-**Location:** `examples/ManualSensorExample/ManualSensorExample.ino`
+`disconnectReasonString(int)` names NimBLE's HCI reasons (`0x200` + HCI code, e.g. `0x213` "Remote User Terminated"); other non-zero codes give "Unknown Reason".
 
-Advanced example with manual sensor management.
+### Relay server and advertising
 
-**Key Features:**
-- Dynamic sensor addition/removal
-- Runtime configuration
-- Advanced callback usage
+| Function | Notes |
+|---|---|
+| `bool advertising()` | NimBLE advertising is active. |
+| `void pause()` / `void resume()` | Advertising only; scans, connects and discovery go on. |
+| `void setNamePrefix(const char*)` + `bool refreshAdvertising()` | New prefix (lowercase, `[a-z0-9-]`), applied by the refresh. |
+| `void serverName(char* out, size_t len)` | `"<prefix>-<chip id>"`. |
+| `uint8_t centralCount()` | Connected centrals. |
 
----
+The server has one service per type in the `begin()` mask: HR `0x2A37`; CSC `0x2A5B` + Feature `0x2A5C`; CPS `0x2A63` + Feature `0x2A65` + Sensor Location `0x2A5D`. Advertising carries the flags, the name and the service UUIDs in 31 bytes, so the prefix may be at most 13 bytes with one type, 11 with two, 9 with three (`"homewind"` fits). If it does not fit, `refreshAdvertising()` returns false and the old name stays on air, while `serverName()` already returns the new one.
 
-## Architecture & Design
+- CSC Feature and CP Feature/Location take the sensor's values after it connects, without the bits that need a control point; CSC keeps bit 0 (wheel data) because raw packets are relayed although there is no SC Control Point. A central that read Feature before the sensor connected keeps the old value until it reads again.
+- The library does not pair, bond or manage bonds. NimBLE pairs on demand (Just Works, no bonding) when a sensor requires encryption; such a sensor pairs again on every connect.
 
-### Connection Workflow
+### Pause, quiesce, maintenance
 
-1. **Sensor Addition**: Call `BikeSensorServerAddSensor()` with sensor name
-2. **Discovery**: Library scans for device matching the name
-3. **Connection**: When found, automatically connects to sensor
-4. **Data Relay**: Sensor data is relayed to connected central devices
-5. **Reconnection**: On disconnect, automatically attempts reconnection
+`quiesce()` stops advertising, discovery, scans and connects and is one-way until `end()` + `begin()` (or reboot). `update()` must keep running; `quiesced()` turns true once nothing is in flight. Connected sensors may remain; remove them afterwards if needed.
 
-### Sensor Types
+### Stats
 
-The library supports three sensor types, each with its own BLE service:
+`stats()` returns counters: connects, connect fails, disconnects, notifies (truncated, malformed), dropped events/notifies/matches, scans started/failed, discovery timeouts, GATT budget aborts, host resets, cancel safety exits, advertising enforced.
 
-- **Heart Rate (HR)**: Service UUID `0x180D`, Characteristic `0x2A37`
-- **Speed/Cadence (CSC)**: Service UUID `0x1816`, Characteristic `0x2A5B`
-- **Power Meter (PWR)**: Service UUID `0x1818`, Characteristic `0x2A63`
+## Connection limits
 
-### GATT Server
+NimBLE's default `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` is 3, shared by sensors and centrals:
 
-The library creates a virtual GATT server that:
-- Advertises services based on connected sensors
-- Mirrors sensor data to connected central devices
-- Supports multiple simultaneous central connections
-- Updates advertising dynamically as sensors connect/disconnect
+- Two sensors leave one central. A further connect fails.
+- Three sensors (HR + CSC + Power) leave no central. On a classic ESP32 `-DCONFIG_BT_NIMBLE_MAX_CONNECTIONS=4` helps (more RAM). On the ESP32-S3 the core's prebuilt `sdkconfig.h` sets it to 3 after the `-D` flags, so the flag has no effect there.
 
-### Device Identity
+A sensor connect refused for lack of controller or host resources (`6`, `0x207`, `0x209`) is not counted as the sensor's fault: the slot waits without backoff or scanning until a sensor link or central goes away, at the latest after `BBS_CAPACITY_RETRY_MS` (60 s). `SENSOR_FAILED` then carries the code in `reason`, once per code. A `0x207` while advertising runs is retried once with advertising stopped (at most about 7 s).
 
-Device naming uses MAC-based identity:
-- Format: `{prefix}-xxxxxxxx` (e.g., "homewind-da4eb580")
-- Prefix is configurable (default: "homewind")
-- Suffix (`xxxxxxxx`) derived from lower 32 bits of eFuse MAC (WiFi-style suffix)
-- Ensures stable, unique device names
+## Compile-time options
 
----
+Set with `-D` (e.g. a sketch `build_opt.h` on core 3.x, which also reaches library sources):
 
-## Technical Details
-
-### NimBLE-Arduino 2.x Requirement
-
-**IMPORTANT**: This library requires **NimBLE-Arduino version 2.x**. It is **NOT compatible with version 1.x**.
-
-The library uses NimBLE-Arduino 2.x APIs for:
-- Name-based sensor connection
-- Async discovery
-- GATT server management
-- Advertising configuration
-
-### Name-Based Connection
-
-The library uses a name-based connection workflow:
-1. Sensor is added by device name (e.g., "TICKR FIT")
-2. Library scans for devices matching the name
-3. When found, connects using the discovered MAC address
-4. MAC address is stored for future connections
-
-### Sensor MAC Preservation
-
-When enabled (`BikeSensorServerSetPreserveMacOnDisconnect(true)`):
-- Sensor MAC address is preserved on disconnect
-- Direct reconnection attempt without scanning
-- Faster reconnection (~1 second vs ~5-20 seconds)
-- Ideal for sensors with stable MAC addresses
-
-When disabled (default):
-- Sensor MAC is cleared on disconnect
-- Library rescans to find device by name
-- More conservative, ensures fresh device information
-
-### Discovery Mode
-
-Discovery mode:
-- Scans for sensors matching specified types
-- Stores discovered sensors in internal list
-- Can be filtered by sensor type
-- Configurable duration and max sensors
-- Non-blocking (async)
-
-### Advertising Management
-
-Advertising is automatically managed:
-- Starts when sensors are connected
-- Stops when all sensors disconnect
-- Updates when sensor types change
-- Can be paused/resumed manually
-- Supports identity refresh for cache bypass
-
----
-
-## Troubleshooting
-
-### Sensor Not Connecting
-
-**Problem:** Sensor added but never connects
-
-**Solutions:**
-- Verify sensor name matches exactly (case-sensitive)
-- Ensure sensor is powered on and in range
-- Check Serial output for connection attempts
-- Try discovery mode to verify sensor is visible
-- Check if sensor is already connected to another device
-
-### Discovery Not Finding Sensors
-
-**Problem:** Discovery completes but finds no sensors
-
-**Solutions:**
-- Verify sensors are powered on and in range
-- Check sensor type mask matches sensor types
-- Increase discovery duration: `BikeSensorServerSetDiscoveryDuration(30000)`
-- Check Serial output for scan results
-- Ensure sensors are advertising (not connected to another device)
-
-### Central Device Not Connecting
-
-**Problem:** Sensor data available but central device doesn't connect
-
-**Solutions:**
-- Verify advertising is active: `BikeSensorServerIsAdvertising()`
-- Check device name is visible in central's scan
-- Ensure correct services are advertised (match connected sensors)
-- Try refreshing advertising: `BikeSensorServerRestartAdvertising()`
-- For Zwift: Try identity refresh to bypass cache
-
-### Reconnection Too Slow
-
-**Problem:** Sensor reconnection takes too long
-
-**Solutions:**
-- Enable Sensor MAC Preservation: `BikeSensorServerSetPreserveMacOnDisconnect(true)`
-- Ensure sensor has stable MAC address (not privacy/random)
-- Check sensor is in range and powered on
-
-### Memory Issues
-
-**Problem:** Library causes memory problems
-
-**Solutions:**
-- Reduce number of sensors
-- Disable unused sensor types
-- Check available heap: `ESP.getFreeHeap()`
-- Ensure sufficient free heap (~50KB minimum)
-
----
-
-## Best Practices
-
-1. **Sensor Names**: Use exact sensor names (case-sensitive). Use discovery mode to find exact names.
-
-2. **Loop Function**: Always call `BluetoothBikeSensorServerLoop()` regularly in your `loop()` function.
-
-3. **Callbacks**: Use callbacks for real-time data updates rather than polling.
-
-4. **Discovery**: Use discovery mode to find sensor names before adding them.
-
-5. **Reconnection**: Enable Sensor MAC Preservation for faster reconnection if sensors have stable MAC addresses.
-
-6. **Advertising**: Pause advertising when opening sensor configuration UI to prevent interference.
-
-7. **Error Handling**: Check return values from sensor management functions.
-
-8. **Debug Logging**: Enable debug logging (`#define BLE_LIB_DEBUG_GEN`) for troubleshooting.
-
----
-
-## Limitations
-
-- **NimBLE-Arduino 2.x Only**: Not compatible with version 1.x
-- **Name-Based Connection**: Requires exact sensor name match
-- **Single Sensor Per Type**: Only one sensor of each type can be connected at a time
-- **BLE Range**: Limited by BLE range (~10 meters typical)
-- **Power Consumption**: Continuous scanning during reconnection consumes power
-
----
-
-## Version History
-
-### Version 2.2.21.0 (Current)
-- Name-based sensor connection workflow
-- Multi-sensor support (HR, CSC, Power)
-- Discovery functionality
-- Sensor MAC preservation for fast reconnection
-- Runtime sensor type configuration
-- Homewind BLE Identity integration
-- Per-sensor-type callbacks
-- Battery level monitoring
-
----
+| Macro | Default |
+|---|---|
+| `BBS_COMPILE_HEART_RATE`, `BBS_COMPILE_CSC`, `BBS_COMPILE_POWER` | 1, 1, 0 |
+| `BBS_MAX_DISCOVERED` | 16 |
+| `BBS_CONNECT_TIMEOUT_MS` | 5000 |
+| `BBS_GATT_BUDGET_MS` | 8000 (worst-case `update()` stall after a connect) |
+| `BBS_SLEEP_SCAN_DURATION_MS` / `BBS_SLEEP_SCAN_INTERVAL_MS` | 5000 / 30000 |
+| `BBS_NAME_SCAN_WINDOW_MS` | 10000 |
+| `BBS_POWER_STALE_MS` | 3000 |
+| `BBS_CAPACITY_RETRY_MS` | 60000 |
+| `BBS_EVENT_QUEUE_DEPTH`, `BBS_NOTIFY_MAX_LEN` | 24, 36 |
 
 ## License
 
-MIT License – see [LICENSE](LICENSE) for details.
-
----
-
-## Contributing
-
-[Contributing guidelines to be added]
-
----
-
-## Related Libraries
-
-- **Homewind**: WebUI library that integrates with BluetoothBikeSensorServer
-- **SmartMiFanAsync**: Fan control library (planned integration)
-- **GitFirmwareUpdate**: OTA update library (used by Homewind)
-
----
-
-## Support
-
-For issues, questions, or contributions, please refer to the repository or contact the maintainer.
-
-**Maintainer**: Martin Lihs <martin@example.com>
-
----
-
-## Next Steps
-
-1. Review the examples in `examples/` directory
-2. Start with `HR_Only_Example` for basic usage
-3. Try `DiscoveryExample` to find your sensors
-4. Check `WebUI_Integration` for full integration example
-
+MIT License – see [LICENSE](LICENSE).

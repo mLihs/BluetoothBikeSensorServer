@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.0.0] - 2026-11-04
+
+New major version with a new API (`#include <BikeSensor.h>`, `namespace BikeSensor`, 35 functions). There is no 2.x compatibility layer.
+
+### Added
+- One application task: NimBLE callbacks only queue events; `update()` runs the state machines and calls the application. No `delay()` in the library, non-blocking connects, GATT pass bounded by `BBS_GATT_BUDGET_MS`.
+- Raw-GAP scanning without `NimBLEScan` results (no heap churn while scanning); host-reset detection and recovery (`HOST_RESET`).
+- Event callback with sensor, discovery and central lifecycle events (`EventInfo`), `info()`, `connected()`, `stats()`, `scanning()`, `advertising()`.
+- Discovery with a generation, a finish reason and a sorted, fixed-size table (`BBS_MAX_DISCOVERED`, default 16).
+- `quiesce()` / `quiesced()`: one-way stop for OTA and maintenance, enforced on every `update()`. `end()` tears the stack down and reports whether it did.
+- Power (`BBS_COMPILE_POWER=1`): full CPS flag parsing (`PowerSample` with cadence, balance, energy), `lastPower()`, `setPowerCallback()`, local CPS with Measurement `0x2A63`, Feature `0x2A65` and Sensor Location `0x2A5D`, cadence from the power meter when no CSC sensor is configured (`info(POWER).providesCadence`).
+- Local CSC Feature `0x2A5C` (mandatory, missing in 2.x).
+- Examples: `Basic_MAC`, `Basic_Name`, `Discovery`, `Telemetry`, `Relay_WebServer`, `Power`, `NimBLEHeapTest`.
+
+### Removed
+- Both 2.x function families (`BluetoothBikeSensorServer*`, `BikeSensorServer*`), the `HomewindBleIdentity` layer, public scan functions, `SetConnectIntervalMs`, `SetPreserveMacOnDisconnect` (the MAC is always kept), `SetMaxSensors`, string `ListSensors*`, `FullRestart` (use `end()` + `begin()`), CCCD polling.
+- `BLETelemetry` in the library; the `Telemetry` example prints `stats()` instead.
+- `BikeSensorServerSetEnabledSensorTypes`: change types with `end()` + `begin()`.
+- 2.x beacon service data (`ConfigureAdvertising` / `UpdateAdvertisingIfChanged`, used only by `IdentityExample`); 2.x's own advertising never sent it, and it would not fit next to the name.
+- CSC speed in the API (raw CSC packets are still relayed).
+- `BBS_NAME_RERESOLVE_FAILS`: NAME mode matches by name in every window.
+- Examples `HR_Only_Example`, `HR_CSC_Example`, `FastReconnectionExample`, `ManualSensorExample`, `IdentityExample`, `TelemetryExampleMac`, `TelemetryExampleMacHRCSC`, `WebUI_Integration`; `DiscoveryExample`, `TelemetryExample` and `WebSocketStreamingExample` are replaced by `Discovery`, `Telemetry` and `Relay_WebServer`.
+
+### Fixed
+- CSC cadence across the 16-bit crank counter and timer wrap (shared crank code for CSC and Power).
+- 2.x Power parsing checked 3 bytes but read 4 and ignored the flags.
+- Relay centrals: real CCCD state from `onSubscribe` instead of "a central is connected".
+
+### Behavior notes
+- `BBS_COMPILE_POWER` still defaults to 0.
+- `begin()` returns `bool` (2.x `Begin` was `void`): false while already begun, after an `end()` that returned false, or when name and service UUIDs do not fit.
+- `addByName`/`addByMac` return false for a type outside the `begin()` mask (2.x accepted it), in the other mode, for an empty name, and for a MAC (or name) held by another type.
+- A same-type `addByMac` with the same identity forces a reconnect (no `reconnectNow()`).
+- `startDiscovery()` returns false for a duration of 0 or ≥ `INT32_MAX − BBS_SCAN_END_GRACE_MS` (2.x accepted any value).
+- Discovery list: named sensors first, sorted by name; unnamed sensors last with an empty name (2.x: "(kein Name)" as the name, sorted first).
+- Discovery and NAME mode scan without the controller's duplicate filter, so a name sent only in the scan response is found (2.x scanned with the filter).
+- The cadence callback fires only when a CSC packet reports a cadence (2.x: every CSC packet).
+- Advertising data carries the flags field; the name prefix may be at most 11 bytes with HR + CSC, 9 with HR + CSC + Power. `refreshAdvertising()` returns false when the data was not applied.
+- `info()` battery is known only while the sensor is connected (as 2.x `GetBatteryLevel`); `info().encrypted` is sampled for every type.
+- `quiesced()` and `stats()` belong to the `update()` task.
+- Before a successful `begin()`, `update()`, `addBy*`, `remove()`, `startDiscovery()`, `stopDiscovery()` and `startServer()` are ignored; `end()` returns true.
+- `disconnectReasonString()` maps NimBLE's `0x200` + HCI reasons; other non-zero host codes give "Unknown Reason" (2.x looked up the raw value, so NimBLE reasons were unknown).
+- A sensor whose measurement characteristic has no CCCD, or whose link drops during the GATT pass, is not reported connected; the pass fails with `SENSOR_FAILED` and backoff.
+- A sensor connect refused with `0x207` while advertising runs is retried once with advertising stopped; advertising is off for at most 7 s.
+- Connects refused for lack of resources (`6`, `0x207`, `0x209`) wait without backoff and without scanning until a connection or central goes away, at the latest `BBS_CAPACITY_RETRY_MS` (60 s); `SENSOR_FAILED` then carries the code in `reason` and fires only when it changes. A sensor whose link just ended reconnects before a sensor that waited for capacity (best effort).
+- On the ESP32-S3 the Arduino core fixes `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` at 3 for `-D` flags, so HR + CSC + Power leave no central there.
+- On the ESP32-S3 a local `end()` terminate (`0x216`) finished in a few hundred milliseconds even with the peer boxed or powered off; an unreachable peer left without `end()` disconnected with `0x208` after about 4 s. The 3000 ms `end()==false` path was not observed.
+
+### Deliberate deviations
+- From the 2.3.0.0 power-meter work order (`BBS_POWERMETER.md`): no 2.3.0.0, the scope ships here with the new API (`PowerSample`, `lastPower`, `setPowerCallback`; no `int16_t` power callback, no 2.x getters); no `BBS_ENABLE_SENSOR_SECURITY` flag and no library pairing setup — NimBLE pairs on demand without bonding (the tested Assioma Pro, Quarq and Tacx refuse pairing and deliver data unencrypted); no `onAuthenticationComplete` log, the state is `SensorInfo.encrypted`; CP Feature bits that need a Control Point are masked.
+- The library never bonds; a sensor that requires encryption pairs again on every connect.
+- The local CSC Feature keeps bit 0 (wheel data) without an SC Control Point, matching the relayed raw packets.
+- `addBy*` rejects an address (or name) already held by another sensor type.
+
+### Compatibility
+- ⚠️ Breaking: new API, see above.
+- NimBLE-Arduino 2.5.0 or newer (`setConnectRetries`); built with 2.5.2 and arduino-esp32 3.3.12 for ESP32 and ESP32-S3; hardware-tested on the ESP32-S3.
+
+---
+
 ## [2.2.21.0] - 2026-10-31
 
 ### Fixed
