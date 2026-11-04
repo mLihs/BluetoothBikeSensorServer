@@ -29,6 +29,7 @@ New major version with a new API (`#include <BikeSensor.h>`, `namespace BikeSens
 - CSC speed in the API (raw CSC packets are still relayed).
 - `BBS_NAME_RERESOLVE_FAILS`: NAME mode matches by name in every window.
 - Examples `HR_Only_Example`, `HR_CSC_Example`, `FastReconnectionExample`, `ManualSensorExample`, `IdentityExample`, `TelemetryExampleMac`, `TelemetryExampleMacHRCSC`, `WebUI_Integration`; `DiscoveryExample`, `TelemetryExample` and `WebSocketStreamingExample` are replaced by `Discovery`, `Telemetry` and `Relay_WebServer`.
+- The 2.x documentation (`docs/00`–`09`, `ARDUINO_ESP32_3.3.7_FIX.md`) and the old refactoring plans moved to `docs/history/`; the README describes 3.0.
 
 ### Fixed
 - CSC cadence across the 16-bit crank counter and timer wrap (shared crank code for CSC and Power).
