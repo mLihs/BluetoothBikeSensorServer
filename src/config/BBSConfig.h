@@ -61,7 +61,15 @@
 // Useful to pinpoint which sub-step causes largest_free_block drops.
 // 0 = off (default), 1 = on.
 #ifndef BBS_ENABLE_INIT_HEAP_LOG
-  #define BBS_ENABLE_INIT_HEAP_LOG 1
+  #define BBS_ENABLE_INIT_HEAP_LOG 0
+#endif
+
+#ifndef BBS_CONNECT_TIMEOUT_MS
+  #define BBS_CONNECT_TIMEOUT_MS 5000
+#endif
+
+#ifndef BBS_DISCOVERY_END_GRACE_MS
+  #define BBS_DISCOVERY_END_GRACE_MS 3000
 #endif
 
 // ============================================================================

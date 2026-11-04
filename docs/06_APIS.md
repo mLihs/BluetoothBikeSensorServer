@@ -653,6 +653,8 @@ Enable/disable preserving sensor MAC address on disconnect for faster reconnecti
 **Parameters**:
 - `preserve`: `true` for faster reconnection (preserves MAC), `false` for standard reconnection (rescans)
 
+**Default**: `true`
+
 **Example**:
 ```cpp
 BikeSensorServerSetPreserveMacOnDisconnect(true);  // Enable fast reconnection
