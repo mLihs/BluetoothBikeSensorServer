@@ -872,10 +872,6 @@ class Core {
     emit(EventType::SENSOR_FAILED, s.type);
   }
 
-  static bool capacityError(int err) {
-    return err == kHsENoMem || err == kHciMemCapacity || err == kHciConnLimit;
-  }
-
   // §5.2 rev 37 capacity path: connectFails++, but no failCount, no backoff and
   // no scan. SENSOR_FAILED (reason = the code) only when the code changes.
   void capacityFail(uint8_t i, uint32_t now, int code) {
@@ -888,12 +884,13 @@ class Core {
     emit(EventType::SENSOR_FAILED, s.type, code);
   }
 
-  // Ends a capacity wait: MAC → one direct attempt; NAME → IDLE scans again.
+  // Ends a capacity wait: MAC → one direct attempt, after the direct retry of a
+  // slot whose link just ended (rev 38); NAME → IDLE scans again.
   void endCapacityWait(SensorSlot& s, uint32_t now) {
     if (quiesced_) return;
     s.capWait = false;
     if (mode_ != Mode::MAC) return;
-    hold(s, now, 0);
+    hold(s, now, kTransientRetryMs);
     enter(s, SlotState::FOUND, now);
   }
 
@@ -1286,11 +1283,7 @@ class Core {
     // CONNECT_FAIL in DISCOVERING/SUBSCRIBED is a link loss (NimBLE reason 0x3E).
     switch (state) {
       case SlotState::CONNECTING:       // fail, or link lost before onConnect
-        if (ev.kind == Ev::CONNECT_FAIL && capacityError(ev.reason)) {
-          capacityFail(i, now, ev.reason);   // never a pause; NimBLE 2.5.2 asserts first
-        } else {
-          leaveAttempt(i, now, Outcome::CONNECT_FAIL);
-        }
+        leaveAttempt(i, now, Outcome::CONNECT_FAIL);
         break;
       case SlotState::CANCELLING:
         leaveAttempt(i, now, pendingOutcome(s, Outcome::CONNECT_FAIL));
@@ -1466,6 +1459,7 @@ class Core {
       return;
     }
     if (port_.connActive()) return;
+    advPauseSlot_ = kSlotCount;         // an old pause must not match a wrapped attemptGen
     startAttempt(s);
     bool ok = port_.connect(i, s.mac, s.addrType);
     // §5.4 rev 37: the controller refuses the initiator while advertising
@@ -1487,7 +1481,7 @@ class Core {
     } else if (err == kHsENotSynced) {
       hold(s, now, BBS_SCAN_START_BACKOFF_MS);
       enter(s, SlotState::FOUND, now);
-    } else if (capacityError(err)) {
+    } else if (err == kHsENoMem || err == kHciMemCapacity || err == kHciConnLimit) {
       capacityFail(i, now, err);
     } else {
       leaveAttempt(i, now, Outcome::CONNECT_FAIL);

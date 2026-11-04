@@ -4901,20 +4901,6 @@ static void testCapacityModelRows() {
 // Only a synchronous 0x207 with advertising on pauses, and only one retry; 6,
 // 0x207 and 0x209 take the capacity path, raw 7/9 do not.
 static void testConnectPauseTrigger() {
-  {
-    Rig r;                                             // async 0x207: capacity, no pause
-    assert(r.core->startServer());
-    r.toConnecting();
-    assert(r.port.advOn);
-    r.failEv(r.gen(), bs::kHciMemCapacity);
-    r.update();
-    assert(r.state() == SlotState::WAIT_SCAN && r.hr().capWait && r.port.connects == 1);
-    assert(r.port.advStops == 0 && r.port.advOn);
-    assert(r.hr().failCount == 0 && r.core->stats().connectFails == 1);
-    assert(countEvents(EventType::SENSOR_FAILED) == 1);
-    expectEvent(g_eventCount - 1, EventType::SENSOR_FAILED, SlotState::WAIT_SCAN,
-                bs::kHciMemCapacity);
-  }
   const int codes[] = {bs::kHsENoMem, bs::kHciConnLimit, bs::kHciMemCapacity};
   for (int code : codes) {
     for (int adv = 0; adv < 2; ++adv) {
@@ -4960,6 +4946,43 @@ static void toPausedConnect(Rig& r) {
   assert(r.port.calls[0].rc == bs::kHciMemCapacity && r.port.calls[1].rc == 0);
   assert(!r.port.advOn && r.port.advStops == 1 && r.port.advStarts == 1);
   r.port.maxAct = 0;
+}
+
+// A retry that ends transient goes back to FOUND; advertising returns and the
+// next attempt pauses again: bounded to one cycle per kTransientRetryMs.
+static void testConnectPauseTransientRetry() {
+  const int transient[] = {bs::kHsEAlready, bs::kHsEBusy};
+  for (int err : transient) {
+    Rig r;
+    assert(r.core->startServer());
+    r.port.maxAct = 3;
+    r.port.connectOk = false;                          // the retry, advertising off, gets err
+    r.port.connectErr = err;
+    r.add();
+    r.update();
+    r.match(r.core->scan().epoch());
+    r.update();
+    assert(r.state() == SlotState::FOUND && r.port.connects == 2);
+    assert(r.port.calls[0].rc == bs::kHciMemCapacity && r.port.calls[1].rc == err);
+    assert(r.port.advStops == 1 && !r.port.advOn);
+    for (int cycle = 1; cycle <= 3; ++cycle) {
+      const uint32_t t = r.now;
+      r.update();                                      // advertising returns at once
+      assert(r.port.advOn && r.port.advStarts == cycle + 1);
+      r.at(t + bs::kTransientRetryMs - 1);
+      assert(r.port.connects == 2 * cycle);
+      r.at(t + bs::kTransientRetryMs);
+      assert(r.state() == SlotState::FOUND && r.port.connects == 2 * cycle + 2);
+      assert(r.port.advStops == cycle + 1 && !r.port.advOn);
+    }
+    assert(r.hr().failCount == 0 && r.core->stats().connectFails == 0);
+    assert(countEvents(EventType::SENSOR_FAILED) == 0);
+    const uint32_t t = r.now;
+    r.port.connectOk = true;
+    r.update();
+    r.at(t + bs::kTransientRetryMs);
+    assert(r.state() == SlotState::CONNECTING && r.port.connects == 10 && !r.port.advOn);
+  }
 }
 
 // The pause ends with its attempt; never before, at the latest at the watchdog.
@@ -5026,6 +5049,24 @@ static void testConnectPauseEnds() {
     assert(!r.port.advOn && r.port.advStarts == 1);
   }
   {
+    Rig r;                                             // an old pause never matches a wrapped attemptGen
+    assert(r.core->startServer());
+    toPausedConnect(r);
+    const uint16_t paused = r.gen();
+    r.failEv(paused, 13);
+    r.update();
+    assert(r.port.advOn);
+    r.port.connectOk = false;
+    r.port.connectErr = bs::kHsEBusy;
+    assert(r.core->addByMac(SensorType::HEART_RATE, kMacStr, 0, "HRM", r.now));
+    while (r.gen() != static_cast<uint16_t>(paused - 1)) r.at(r.now + bs::kTransientRetryMs);
+    r.port.connectOk = true;
+    r.at(r.now + bs::kTransientRetryMs);
+    assert(r.state() == SlotState::CONNECTING && r.gen() == paused);
+    r.update();
+    assert(r.port.advOn && r.port.advStops == 1);
+  }
+  {
     Rig r;                                             // end() during the pause
     assert(r.core->begin("homewind", 0x07, Mode::MAC));
     toPausedConnect(r);
@@ -5039,26 +5080,26 @@ static void testConnectPauseEnds() {
 }
 
 // MAC capacity wait: no backoff, scan or match; a capacity event gives one
-// direct attempt.
+// direct attempt, after the direct retry of a slot whose link ended (rev 38).
 static void testCapacityWaitMac() {
-  struct Trigger { void (*apply)(Rig&); };
+  struct Trigger { void (*apply)(Rig&); bool cscRetries; };
   const Trigger triggers[] = {
       {[](Rig& r) {
          r.port.centrals = 0;
          assert(bs::pushCentralDisconnect(r.core->queue(), 0x13));
-       }},
-      {[](Rig& r) { r.discEv(r.cscGen(), 0x08, kCsc); }},
+       }, false},
+      {[](Rig& r) { r.discEv(r.cscGen(), 0x08, kCsc); }, true},
       {[](Rig& r) {
          r.core->remove(SensorType::SPEED_CADENCE, r.now);
          r.discEv(r.cscGen(), 0x16, kCsc);
-       }},
+       }, false},
       {[](Rig& r) {
          r.port.expect[kCsc] = kOtherMac;
          assert(r.core->addByMac(SensorType::SPEED_CADENCE, kOtherMacStr, 0, "CSC2", r.now));
          r.discEv(r.cscGen(), 0x16, kCsc);
-       }},
-      {[](Rig& r) { assert(bs::pushHostReset(r.core->queue())); }},
-      {[](Rig& r) { r.core->queue().requestResync(); }},
+       }, true},
+      {[](Rig& r) { assert(bs::pushHostReset(r.core->queue())); }, false},
+      {[](Rig& r) { r.core->queue().requestResync(); }, false},
   };
   for (const Trigger& trigger : triggers) {
     Rig r;
@@ -5087,8 +5128,48 @@ static void testCapacityWaitMac() {
     r.port.connectOk = true;
     trigger.apply(r);
     r.update();
-    assert(r.state() == SlotState::CONNECTING && !r.hr().capWait);
-    assert(r.port.slotConnects[kHr] == 2 && r.port.discStarts == starts);
+    assert(r.state() == SlotState::FOUND && !r.hr().capWait && r.port.slotConnects[kHr] == 1);
+    if (trigger.cscRetries) {                          // the ended link reconnects first
+      assert(r.cscState() == SlotState::CONNECTING && r.port.lastConnectSlot == kCsc);
+      r.at(r.now + bs::kTransientRetryMs);
+      assert(r.state() == SlotState::FOUND && r.port.slotConnects[kHr] == 1);
+      r.connectedEv(r.cscGen(), kCsc);
+      r.update();
+      assert(r.cscState() == SlotState::SUBSCRIBED);
+    } else {
+      r.at(r.now + bs::kTransientRetryMs - 1);
+      assert(r.state() == SlotState::FOUND && r.port.slotConnects[kHr] == 1);
+      r.at(r.now + 1);
+    }
+    assert(r.state() == SlotState::CONNECTING && r.port.slotConnects[kHr] == 2);
+    assert(r.port.discStarts == starts);
+  }
+  {
+    Rig r;                                             // two slots wait; one attempt at a time
+    r.port.hostMax = 3;
+    r.port.centrals = 3;
+    r.add();
+    r.addCsc();
+    r.update();
+    r.match(r.core->scan().epoch());
+    r.match(r.core->scan().epoch(), kCscMac);
+    r.update();
+    assert(r.hr().capWait && r.csc().capWait && r.port.connects == 2);
+    assert(r.port.calls[0].rc == bs::kHsENoMem && r.port.calls[1].rc == bs::kHsENoMem);
+    assert(countEvents(EventType::SENSOR_FAILED) == 2 && r.core->stats().connectFails == 2);
+    r.port.centrals = 2;
+    assert(bs::pushCentralDisconnect(r.core->queue(), 0x13));
+    r.update();
+    assert(r.state() == SlotState::FOUND && r.cscState() == SlotState::FOUND);
+    r.at(r.now + bs::kTransientRetryMs);               // slot order; CSC waits for the in-flight HR
+    assert(r.state() == SlotState::CONNECTING && r.cscState() == SlotState::FOUND);
+    assert(r.port.connects == 3);
+    r.connectedEv(r.gen());
+    r.update();                                        // HR takes the last link; CSC waits again
+    assert(r.state() == SlotState::SUBSCRIBED && r.cscState() == SlotState::WAIT_SCAN);
+    assert(r.csc().capWait && r.port.connects == 4 && r.port.calls[3].rc == bs::kHsENoMem);
+    assert(countEvents(EventType::SENSOR_FAILED) == 2 && r.core->stats().connectFails == 3);
+    assert(r.core->scan().owner() == ScanOwner::OFF);
   }
   {
     Rig r;                                             // no SCAN_MATCH while waiting
@@ -5113,20 +5194,23 @@ static void testCapacityWaitMac() {
     r.match(r.core->scan().epoch());
     r.update();
     assert(r.hr().capWait && countEvents(EventType::SENSOR_FAILED) == 1);
-    uint32_t t = r.now;
-    r.at(t + BBS_CAPACITY_RETRY_MS - 1);
-    assert(r.port.connects == 1 && r.port.discStarts == 1);
-    r.at(t + BBS_CAPACITY_RETRY_MS);                   // direct, same code: silent
+    const auto retry = [&r] {
+      const uint32_t t = r.now;
+      r.at(t + BBS_CAPACITY_RETRY_MS - 1);
+      assert(r.state() == SlotState::WAIT_SCAN);
+      r.at(t + BBS_CAPACITY_RETRY_MS);
+      assert(r.state() == SlotState::FOUND);
+      r.at(r.now + bs::kTransientRetryMs);
+    };
+    retry();                                           // direct, same code: silent
     assert(r.port.connects == 2 && r.port.discStarts == 1 && r.hr().capWait);
     assert(countEvents(EventType::SENSOR_FAILED) == 1 && r.core->stats().connectFails == 2);
-    t = r.now;
     r.port.connectErr = bs::kHsENoMem;
-    r.at(t + BBS_CAPACITY_RETRY_MS);
+    retry();
     assert(r.port.connects == 3 && countEvents(EventType::SENSOR_FAILED) == 2);
     expectEvent(g_eventCount - 1, EventType::SENSOR_FAILED, SlotState::WAIT_SCAN, bs::kHsENoMem);
-    t = r.now;
     r.port.connectErr = kHardErr;                      // a hard fail clears the reported code
-    r.at(t + BBS_CAPACITY_RETRY_MS);
+    retry();
     assert(r.port.connects == 4 && !r.hr().capWait && r.hr().failCount == 1);
     assert(r.hr().holdMs == 1000 && r.core->stats().connectFails == 4);
     expectEvent(g_eventCount - 1, EventType::SENSOR_FAILED, SlotState::WAIT_SCAN);
@@ -5149,6 +5233,7 @@ static void testCapacityWaitMac() {
     r.port.connectOk = true;
     assert(bs::pushHostReset(r.core->queue()));
     r.update();
+    r.at(r.now + bs::kTransientRetryMs);
     r.connectedEv(r.gen());
     r.update();
     assert(r.state() == SlotState::SUBSCRIBED && r.hr().capReason == 0);
@@ -5932,6 +6017,7 @@ int main() {
   testStopNeverHeld();
   testCapacityModelRows();
   testConnectPauseTrigger();
+  testConnectPauseTransientRetry();
   testConnectPauseEnds();
   testCapacityWaitMac();
   testCapacityWaitName();
