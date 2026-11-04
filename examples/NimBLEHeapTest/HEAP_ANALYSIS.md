@@ -1,3 +1,5 @@
+> **2.x-Messung** (BluetoothBikeSensorServer 2.x API, vor 3.0.0); nicht für 3.0 nachgemessen.
+
 # BluetoothBikeSensorServer Heap- und Fragmentierungsanalyse
 
 **Quelle:** NimBLEHeapTest Beispiel-Log  

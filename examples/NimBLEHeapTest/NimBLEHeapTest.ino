@@ -14,7 +14,7 @@
  * Hardware: ESP32
  * 
  * Required libraries:
- * - NimBLE-Arduino (2.x required)
+ * - NimBLE-Arduino (2.5.0+)
  * - BluetoothBikeSensorServer
  * 
  * Usage:
@@ -48,7 +48,7 @@
 // If your sensor doesn't connect, try the other address type (0 or 1)!
 // Set to nullptr to skip sensor connection phase
 const char* HR_SENSOR_MAC = "f0:13:c3:ee:56:97";  // Replace with your sensor's MAC address
-const int8_t HR_ADDR_TYPE = 0;  // Use 0 or 1 from Discovery output! (or -1 to skip sensor phase)
+const int8_t HR_ADDR_TYPE = 0;  // Use 0 or 1 from Discovery output! (-1 = auto)
 
 // Heap monitoring configuration
 const uint32_t HEAP_TICK_INTERVAL_MS = 15000;  // Print every 30 seconds
@@ -173,7 +173,7 @@ void setup() {
   Serial.println("Phases:");
   Serial.println("  [NimBLE] = Only NimBLE initialized");
   Serial.println("  [NimBLE+Lib] = NimBLE + BluetoothBikeSensorServer initialized (no sensors)");
-  if (HR_SENSOR_MAC != nullptr && HR_ADDR_TYPE >= 0) {
+  if (HR_SENSOR_MAC != nullptr) {
     Serial.printf("  [NimBLE+Lib+Sensor] = NimBLE + Library + Sensor connected (MAC: %s)\n", HR_SENSOR_MAC);
   }
   Serial.println("");
@@ -210,7 +210,9 @@ void loop() {
       // Initialize BluetoothBikeSensorServer in MAC mode (required for MAC-based sensor connection)
       // Enable Heart Rate sensor type (needed for sensor connection)
       Serial.println("Initializing BluetoothBikeSensorServer (MAC mode, HR enabled)...");
-      // NimBLE is already up, so begin() skips the stack init
+      // NimBLE is already up, so begin() skips the stack init and ignores its
+      // deviceName; the advertised name takes the prefix set here.
+      BikeSensor::setNamePrefix("heaptest");
       if (BikeSensor::begin("NimBLEHeapTest", BikeSensor::typeBit(BikeSensor::SensorType::HEART_RATE),
                             BikeSensor::Mode::MAC)) {
         Serial.println("BluetoothBikeSensorServer initialized");
@@ -244,7 +246,7 @@ void loop() {
     }
     
     // Add sensor after library has been initialized for a few ticks
-    if (libraryInitialized && !sensorAdded && HR_SENSOR_MAC != nullptr && HR_ADDR_TYPE >= 0) {
+    if (libraryInitialized && !sensorAdded && HR_SENSOR_MAC != nullptr) {
       ticksSinceLibInit++;
       
       if (ticksSinceLibInit >= TICKS_BEFORE_SENSOR_ADD) {

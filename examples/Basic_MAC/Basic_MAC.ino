@@ -32,8 +32,14 @@ const char* eventName(bs::EventType type) {
 void onEvent(const bs::EventInfo& info) {
   const char* name = eventName(info.type);
   if (name == nullptr) return;
-  Serial.printf("[%lu] %s type=0x%02x reason=0x%x (%s)\n", millis(), name,
-                bs::typeBit(info.sensorType), info.reason, bs::disconnectReasonString(info.reason));
+  Serial.printf("[%lu] %s type=0x%02x reason=0x%x", millis(), name, bs::typeBit(info.sensorType),
+                info.reason);
+  // Only disconnect reasons are HCI codes; SENSOR_FAILED carries 0 or a host rc.
+  if (info.type == bs::EventType::SENSOR_DISCONNECTED ||
+      info.type == bs::EventType::CENTRAL_DISCONNECTED) {
+    Serial.printf(" (%s)", bs::disconnectReasonString(info.reason));
+  }
+  Serial.println();
 }
 
 void onHeartRate(uint16_t bpm) { Serial.printf("HR %u bpm\n", bpm); }
