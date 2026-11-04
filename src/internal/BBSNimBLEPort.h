@@ -205,7 +205,6 @@ class NimBLEPort final : public BlePort {
         }
         setLocalFeature(type, type == SensorType::POWER ? kCpFeatureDefault : kCscFeatureDefault,
                         kCpLocationDefault);
-        service->start();
         localChr_[slot] = chr;
       }
       server_ = server;
