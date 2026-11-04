@@ -884,21 +884,22 @@ class Core {
     emit(EventType::SENSOR_FAILED, s.type, code);
   }
 
-  // Ends a capacity wait: MAC → one direct attempt, after the direct retry of a
-  // slot whose link just ended (rev 38); NAME → IDLE scans again.
-  void endCapacityWait(SensorSlot& s, uint32_t now) {
+  // Ends a capacity wait: MAC → one direct attempt after holdMs; NAME → IDLE
+  // scans again.
+  void endCapacityWait(SensorSlot& s, uint32_t now, uint32_t holdMs) {
     if (quiesced_) return;
     s.capWait = false;
     if (mode_ != Mode::MAC) return;
-    hold(s, now, kTransientRetryMs);
+    hold(s, now, holdMs);
     enter(s, SlotState::FOUND, now);
   }
 
   // A link, a central or a host reset may have freed capacity (the §5.4
-  // advertising-hold events).
-  void releaseCapacity(uint32_t now) {
+  // advertising-hold events). An ended sensor link passes kTransientRetryMs,
+  // so that slot's direct retry goes first (rev 39).
+  void releaseCapacity(uint32_t now, uint32_t holdMs = 0) {
     for (SensorSlot& s : slots_) {
-      if (s.capWait) endCapacityWait(s, now);
+      if (s.capWait) endCapacityWait(s, now, holdMs);
     }
   }
 
@@ -1278,7 +1279,7 @@ class Core {
         s.lastDisconnectReason = ev.reason;
       }
       advHeld_ = false;                 // a connection is free again
-      releaseCapacity(now);
+      releaseCapacity(now, kTransientRetryMs);
     }
     // CONNECT_FAIL in DISCOVERING/SUBSCRIBED is a link loss (NimBLE reason 0x3E).
     switch (state) {
@@ -1404,7 +1405,7 @@ class Core {
 
   void advanceSlot(uint8_t i, uint32_t now) {
     SensorSlot& s = slots_[i];
-    if (s.capWait && now - s.stateSinceMs >= BBS_CAPACITY_RETRY_MS) endCapacityWait(s, now);
+    if (s.capWait && now - s.stateSinceMs >= BBS_CAPACITY_RETRY_MS) endCapacityWait(s, now, 0);
     switch (s.state) {
       case SlotState::FOUND: {
         // §5.2: no connect while a discovery is pending or open, or under quiesce.

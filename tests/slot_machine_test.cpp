@@ -4899,7 +4899,8 @@ static void testCapacityModelRows() {
 }
 
 // Only a synchronous 0x207 with advertising on pauses, and only one retry; 6,
-// 0x207 and 0x209 take the capacity path, raw 7/9 do not.
+// 0x207 and 0x209 take the capacity path. Raw 7/9 and every async code are
+// hard fails (reason 0).
 static void testConnectPauseTrigger() {
   const int codes[] = {bs::kHsENoMem, bs::kHciConnLimit, bs::kHciMemCapacity};
   for (int code : codes) {
@@ -4927,13 +4928,15 @@ static void testConnectPauseTrigger() {
       assert(r.port.advOn == (adv == 1) && r.core->scan().owner() == ScanOwner::OFF);
     }
   }
-  const int16_t raws[] = {7, 9};                       // BLE_HS_ENOTCONN, BLE_HS_EAPP
+  const int16_t raws[] = {7, 9,                        // BLE_HS_ENOTCONN, BLE_HS_EAPP
+                          bs::kHsENoMem, bs::kHciMemCapacity, bs::kHciConnLimit};
   for (int16_t raw : raws) {
     Rig r;
     r.toConnecting();
     r.failEv(r.gen(), raw);
     r.update();
     assert(r.state() == SlotState::WAIT_SCAN && !r.hr().capWait && r.hr().failCount == 1);
+    assert(r.hr().holdMs == 1000 && r.core->stats().connectFails == 1);
     expectEvent(g_eventCount - 1, EventType::SENSOR_FAILED, SlotState::WAIT_SCAN);
   }
 }
@@ -5059,7 +5062,11 @@ static void testConnectPauseEnds() {
     r.port.connectOk = false;
     r.port.connectErr = bs::kHsEBusy;
     assert(r.core->addByMac(SensorType::HEART_RATE, kMacStr, 0, "HRM", r.now));
-    while (r.gen() != static_cast<uint16_t>(paused - 1)) r.at(r.now + bs::kTransientRetryMs);
+    int n = 0;
+    for (; n < 70000 && r.gen() != static_cast<uint16_t>(paused - 1); ++n) {
+      r.at(r.now + bs::kTransientRetryMs);
+    }
+    assert(n < 70000);
     r.port.connectOk = true;
     r.at(r.now + bs::kTransientRetryMs);
     assert(r.state() == SlotState::CONNECTING && r.gen() == paused);
@@ -5080,26 +5087,27 @@ static void testConnectPauseEnds() {
 }
 
 // MAC capacity wait: no backoff, scan or match; a capacity event gives one
-// direct attempt, after the direct retry of a slot whose link ended (rev 38).
+// direct attempt, after an ended sensor link only after that slot's direct
+// retry (rev 39).
 static void testCapacityWaitMac() {
-  struct Trigger { void (*apply)(Rig&); bool cscRetries; };
+  struct Trigger { void (*apply)(Rig&); bool linkEnded; bool cscRetries; };
   const Trigger triggers[] = {
       {[](Rig& r) {
          r.port.centrals = 0;
          assert(bs::pushCentralDisconnect(r.core->queue(), 0x13));
-       }, false},
-      {[](Rig& r) { r.discEv(r.cscGen(), 0x08, kCsc); }, true},
+       }, false, false},
+      {[](Rig& r) { r.discEv(r.cscGen(), 0x08, kCsc); }, true, true},
       {[](Rig& r) {
          r.core->remove(SensorType::SPEED_CADENCE, r.now);
          r.discEv(r.cscGen(), 0x16, kCsc);
-       }, false},
+       }, true, false},
       {[](Rig& r) {
          r.port.expect[kCsc] = kOtherMac;
          assert(r.core->addByMac(SensorType::SPEED_CADENCE, kOtherMacStr, 0, "CSC2", r.now));
          r.discEv(r.cscGen(), 0x16, kCsc);
-       }, true},
-      {[](Rig& r) { assert(bs::pushHostReset(r.core->queue())); }, false},
-      {[](Rig& r) { r.core->queue().requestResync(); }, false},
+       }, true, true},
+      {[](Rig& r) { assert(bs::pushHostReset(r.core->queue())); }, false, false},
+      {[](Rig& r) { r.core->queue().requestResync(); }, false, false},
   };
   for (const Trigger& trigger : triggers) {
     Rig r;
@@ -5128,6 +5136,11 @@ static void testCapacityWaitMac() {
     r.port.connectOk = true;
     trigger.apply(r);
     r.update();
+    if (!trigger.linkEnded) {                          // the same tick
+      assert(r.state() == SlotState::CONNECTING && !r.hr().capWait);
+      assert(r.port.slotConnects[kHr] == 2 && r.port.discStarts == starts);
+      continue;
+    }
     assert(r.state() == SlotState::FOUND && !r.hr().capWait && r.port.slotConnects[kHr] == 1);
     if (trigger.cscRetries) {                          // the ended link reconnects first
       assert(r.cscState() == SlotState::CONNECTING && r.port.lastConnectSlot == kCsc);
@@ -5159,9 +5172,7 @@ static void testCapacityWaitMac() {
     assert(countEvents(EventType::SENSOR_FAILED) == 2 && r.core->stats().connectFails == 2);
     r.port.centrals = 2;
     assert(bs::pushCentralDisconnect(r.core->queue(), 0x13));
-    r.update();
-    assert(r.state() == SlotState::FOUND && r.cscState() == SlotState::FOUND);
-    r.at(r.now + bs::kTransientRetryMs);               // slot order; CSC waits for the in-flight HR
+    r.update();                                        // slot order; CSC waits for the in-flight HR
     assert(r.state() == SlotState::CONNECTING && r.cscState() == SlotState::FOUND);
     assert(r.port.connects == 3);
     r.connectedEv(r.gen());
@@ -5196,11 +5207,11 @@ static void testCapacityWaitMac() {
     assert(r.hr().capWait && countEvents(EventType::SENSOR_FAILED) == 1);
     const auto retry = [&r] {
       const uint32_t t = r.now;
+      const int connects = r.port.connects;
       r.at(t + BBS_CAPACITY_RETRY_MS - 1);
-      assert(r.state() == SlotState::WAIT_SCAN);
+      assert(r.state() == SlotState::WAIT_SCAN && r.port.connects == connects);
       r.at(t + BBS_CAPACITY_RETRY_MS);
-      assert(r.state() == SlotState::FOUND);
-      r.at(r.now + bs::kTransientRetryMs);
+      assert(r.port.connects == connects + 1);
     };
     retry();                                           // direct, same code: silent
     assert(r.port.connects == 2 && r.port.discStarts == 1 && r.hr().capWait);
@@ -5233,7 +5244,6 @@ static void testCapacityWaitMac() {
     r.port.connectOk = true;
     assert(bs::pushHostReset(r.core->queue()));
     r.update();
-    r.at(r.now + bs::kTransientRetryMs);
     r.connectedEv(r.gen());
     r.update();
     assert(r.state() == SlotState::SUBSCRIBED && r.hr().capReason == 0);
