@@ -1,8 +1,7 @@
 #pragma once
 
 // BikeSensor 3.0 compile-time defaults (design §3). Every 3.0 header includes
-// this one, so all TUs see one Event layout. The 2.x library keeps using
-// src/config/BBSConfig.h until cutover.
+// this one, so all TUs see one Event layout.
 
 #ifndef BBS_MAX_DISCOVERED
 #define BBS_MAX_DISCOVERED 16
