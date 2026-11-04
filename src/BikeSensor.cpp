@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 // arduino-esp32 3.3.7+ releases the BT controller memory unless a library
-// includes this header (docs/ARDUINO_ESP32_3.3.7_FIX.md).
+// includes this header (docs/history/ARDUINO_ESP32_3.3.7_FIX.md, written for 2.x).
 #include "esp32-hal-bt-mem.h"
 
 #include "internal/BBSCore.h"
