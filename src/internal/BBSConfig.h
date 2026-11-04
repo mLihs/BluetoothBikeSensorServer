@@ -43,6 +43,9 @@
 #ifndef BBS_STOPPING_SAFETY_MS
 #define BBS_STOPPING_SAFETY_MS BBS_SCAN_END_GRACE_MS   // escape if disc cancel fails (§5.2)
 #endif
+#ifndef BBS_CAPACITY_RETRY_MS
+#define BBS_CAPACITY_RETRY_MS 60000         // capacity wait without an event (§5.2 rev 37)
+#endif
 // Compile-time sensor selection (kept from 2.x; defaults match 2.2.21.0).
 #ifndef BBS_COMPILE_HEART_RATE
 #define BBS_COMPILE_HEART_RATE 1

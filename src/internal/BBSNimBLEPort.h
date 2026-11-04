@@ -17,6 +17,9 @@
 static_assert(BLE_HS_EALREADY == BikeSensor::internal::kHsEAlready, "");
 static_assert(BLE_HS_EBUSY == BikeSensor::internal::kHsEBusy, "");
 static_assert(BLE_HS_ENOTSYNCED == BikeSensor::internal::kHsENotSynced, "");
+static_assert(BLE_HS_ENOMEM == BikeSensor::internal::kHsENoMem, "");
+static_assert(BLE_HS_HCI_ERR(BLE_ERR_MEM_CAPACITY) == BikeSensor::internal::kHciMemCapacity, "");
+static_assert(BLE_HS_HCI_ERR(BLE_ERR_CONN_LIMIT) == BikeSensor::internal::kHciConnLimit, "");
 static_assert(BLE_HS_CONN_HANDLE_NONE == BikeSensor::internal::kConnHandleNone, "");
 
 namespace BikeSensor {
@@ -161,9 +164,10 @@ class NimBLEPort final : public BlePort {
     }
     NimBLERemoteService* batt = client->getService(NimBLEUUID(static_cast<uint16_t>(0x180F)));
     if (readLe(batt, 0x2A19, 1, value)) out.battery = static_cast<uint8_t>(value);
+    if (!client->isConnected()) return false;   // a link lost after the subscribe (rev 36)
     // Every type (§5.2): NimBLE may pair on demand during the reads or the subscribe.
     out.encrypted = client->getConnInfo().isEncrypted();
-    return client->isConnected();       // a link lost after the subscribe fails the pass (rev 36)
+    return true;
   }
 
   void gattTimerStart(uint32_t ms) override {

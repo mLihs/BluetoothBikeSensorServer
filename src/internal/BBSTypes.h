@@ -27,7 +27,8 @@ enum class FinishReason : uint8_t {
 struct EventInfo {
   EventType type;
   SensorType sensorType;
-  int reason;                 // disconnect reason, or FinishReason for DISCOVERY_DONE
+  int reason;                 // disconnect reason, FinishReason for DISCOVERY_DONE, or the
+                              // capacity code for SENSOR_FAILED (0 = hard fail, §5.2 rev 37)
   uint8_t count;
   uint32_t generation;        // DISCOVERY_DONE
 };

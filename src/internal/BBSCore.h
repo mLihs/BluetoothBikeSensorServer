@@ -128,6 +128,11 @@ struct SensorSlot {
   bool       gattDone;                  // DISCOVERING: no pass (failed, or skipped by a replace)
   bool       directRetry;               // leaveAttempt → FOUND (one direct attempt), not WAIT_SCAN
   bool       failPending;               // watchdog cancel / failed GATT pass: outcome is a hard fail
+  // §5.2 rev 37: the wait state without scan or match until a capacity event
+  // or BBS_CAPACITY_RETRY_MS. capReason: the code the last capacity
+  // SENSOR_FAILED reported; 0 after a connect, a hard fail or a new identity.
+  bool       capWait;
+  int        capReason;
 };
 
 class Core {
@@ -706,7 +711,7 @@ class Core {
   // §5.3 needScan().
   bool needScan() const {
     for (const SensorSlot& s : slots_) {
-      if (s.state == waitState()) return true;
+      if (s.state == waitState() && !s.capWait) return true;
     }
     return false;
   }
@@ -759,6 +764,8 @@ class Core {
     s.gattDone = false;
     s.directRetry = false;
     s.failPending = false;
+    s.capWait = false;
+    s.capReason = 0;
   }
 
   // The only place attemptGen changes (§3.1). The per-attempt flags are clear
@@ -821,6 +828,8 @@ class Core {
   void retarget(uint8_t i, uint32_t now) {
     SensorSlot& s = slots_[i];
     s.failCount = 0;
+    s.capWait = false;
+    s.capReason = 0;
     s.removing = false;
     s.failPending = false;              // a replace-driven end is neutral
     switch (s.state) {
@@ -855,11 +864,45 @@ class Core {
   void hardFail(SensorSlot& s, uint32_t now, bool connectFail) {
     if (s.failCount < 255) s.failCount++;
     if (connectFail) stats_.connectFails++;
+    s.capReason = 0;
     const uint8_t shift = s.failCount > 6 ? 5 : static_cast<uint8_t>(s.failCount - 1);
     const uint32_t backoff = kBackoffMinMs << shift;
     hold(s, now, backoff > kBackoffMaxMs ? kBackoffMaxMs : backoff);
     enter(s, waitState(), now);
     emit(EventType::SENSOR_FAILED, s.type);
+  }
+
+  static bool capacityError(int err) {
+    return err == kHsENoMem || err == kHciMemCapacity || err == kHciConnLimit;
+  }
+
+  // §5.2 rev 37 capacity path: connectFails++, but no failCount, no backoff and
+  // no scan. SENSOR_FAILED (reason = the code) only when the code changes.
+  void capacityFail(uint8_t i, uint32_t now, int code) {
+    SensorSlot& s = slots_[i];
+    stats_.connectFails++;
+    leaveAttempt(i, now, Outcome::NEUTRAL);
+    s.capWait = true;
+    if (code == s.capReason) return;
+    s.capReason = code;
+    emit(EventType::SENSOR_FAILED, s.type, code);
+  }
+
+  // Ends a capacity wait: MAC → one direct attempt; NAME → IDLE scans again.
+  void endCapacityWait(SensorSlot& s, uint32_t now) {
+    if (quiesced_) return;
+    s.capWait = false;
+    if (mode_ != Mode::MAC) return;
+    hold(s, now, 0);
+    enter(s, SlotState::FOUND, now);
+  }
+
+  // A link, a central or a host reset may have freed capacity (the §5.4
+  // advertising-hold events).
+  void releaseCapacity(uint32_t now) {
+    for (SensorSlot& s : slots_) {
+      if (s.capWait) endCapacityWait(s, now);
+    }
   }
 
   void emit(EventType type, SensorType sensorType, int reason = 0, uint8_t count = 0,
@@ -947,6 +990,7 @@ class Core {
         break;
       case Ev::CENTRAL_DISCONNECT:
         advHeld_ = false;
+        releaseCapacity(now);
         emit(EventType::CENTRAL_DISCONNECTED, SensorType{}, ev.reason, refreshCentralCount());
         break;
       case Ev::SUBSCRIBE:
@@ -1113,7 +1157,18 @@ class Core {
 
   // §5.4 desired state, enforced on every update(), after HOST_RESET and after
   // resync. Also stops NimBLE's own restarts (§0.9).
-  bool advertisingDesired() const { return serverStarted_ && !paused_ && !quiesced_; }
+  bool advertisingDesired() const {
+    return serverStarted_ && !paused_ && !quiesced_ && !connectPause();
+  }
+
+  // §5.4 rev 37: tryConnect() stopped advertising for this attempt; it stays
+  // off while the attempt is CONNECTING (at most kConnectWatchdogMs).
+  bool connectPause() const {
+    if (advPauseSlot_ >= kSlotCount) return false;
+    const SensorSlot& s = slots_[advPauseSlot_];
+    return s.state == SlotState::CONNECTING &&
+           s.attemptGen.load(std::memory_order_relaxed) == advPauseGen_;
+  }
 
   // ble_gatts_mutable(): no advertising, discovery or connect procedure and no
   // established connection.
@@ -1191,11 +1246,13 @@ class Core {
     if (mode_ == Mode::NAME) {
       if (ev.slot >= kSlotCount) return -1;
       const SensorSlot& s = slots_[ev.slot];
-      return s.state == SlotState::IDLE && strcmp(ev.match.name, s.name) == 0 ? ev.slot : -1;
+      return s.state == SlotState::IDLE && !s.capWait && strcmp(ev.match.name, s.name) == 0
+                 ? ev.slot
+                 : -1;
     }
     for (uint8_t i = 0; i < kSlotCount; ++i) {
       const SensorSlot& s = slots_[i];
-      if (s.state == SlotState::WAIT_SCAN && s.hasAddr &&
+      if (s.state == SlotState::WAIT_SCAN && !s.capWait && s.hasAddr &&
           memcmp(ev.match.addr, s.mac, sizeof(s.mac)) == 0) {
         return i;
       }
@@ -1209,6 +1266,7 @@ class Core {
     if (ev.kind == Ev::CONNECTED) {
       if (state == SlotState::CONNECTING) {
         stats_.connects++;
+        s.capReason = 0;
         scan_.clearRemainder();
         enter(s, SlotState::DISCOVERING, now);
       } else if (state == SlotState::CANCELLING) {
@@ -1223,11 +1281,16 @@ class Core {
         s.lastDisconnectReason = ev.reason;
       }
       advHeld_ = false;                 // a connection is free again
+      releaseCapacity(now);
     }
     // CONNECT_FAIL in DISCOVERING/SUBSCRIBED is a link loss (NimBLE reason 0x3E).
     switch (state) {
       case SlotState::CONNECTING:       // fail, or link lost before onConnect
-        leaveAttempt(i, now, Outcome::CONNECT_FAIL);
+        if (ev.kind == Ev::CONNECT_FAIL && capacityError(ev.reason)) {
+          capacityFail(i, now, ev.reason);   // never a pause; NimBLE 2.5.2 asserts first
+        } else {
+          leaveAttempt(i, now, Outcome::CONNECT_FAIL);
+        }
         break;
       case SlotState::CANCELLING:
         leaveAttempt(i, now, pendingOutcome(s, Outcome::CONNECT_FAIL));
@@ -1265,6 +1328,7 @@ class Core {
       }
     }
     advHeld_ = false;
+    releaseCapacity(now);
     enforceAdvertising(now);
     stats_.hostResets++;
     if (discovery) emitDone(done);
@@ -1285,6 +1349,7 @@ class Core {
     for (uint8_t i = 0; i < kSlotCount; ++i) resyncSlot(i, now);
     refreshCentralCount();
     advHeld_ = false;
+    releaseCapacity(now);
     enforceAdvertising(now);
   }
 
@@ -1346,6 +1411,7 @@ class Core {
 
   void advanceSlot(uint8_t i, uint32_t now) {
     SensorSlot& s = slots_[i];
+    if (s.capWait && now - s.stateSinceMs >= BBS_CAPACITY_RETRY_MS) endCapacityWait(s, now);
     switch (s.state) {
       case SlotState::FOUND: {
         // §5.2: no connect while a discovery is pending or open, or under quiesce.
@@ -1401,7 +1467,16 @@ class Core {
     }
     if (port_.connActive()) return;
     startAttempt(s);
-    if (port_.connect(i, s.mac, s.addrType)) {
+    bool ok = port_.connect(i, s.mac, s.addrType);
+    // §5.4 rev 37: the controller refuses the initiator while advertising
+    // holds its resources: stop advertising and retry once, same attempt.
+    if (!ok && port_.lastError(i) == kHciMemCapacity && port_.advActive()) {
+      port_.advStop();
+      advPauseSlot_ = i;
+      advPauseGen_ = s.attemptGen.load(std::memory_order_relaxed);
+      ok = port_.connect(i, s.mac, s.addrType);
+    }
+    if (ok) {
       enter(s, SlotState::CONNECTING, now);
       return;
     }
@@ -1412,6 +1487,8 @@ class Core {
     } else if (err == kHsENotSynced) {
       hold(s, now, BBS_SCAN_START_BACKOFF_MS);
       enter(s, SlotState::FOUND, now);
+    } else if (capacityError(err)) {
+      capacityFail(i, now, err);
     } else {
       leaveAttempt(i, now, Outcome::CONNECT_FAIL);
     }
@@ -1480,6 +1557,8 @@ class Core {
   bool gattStarted_ = false;            // port_.serverStart() succeeded once
   bool advHeld_ = false;                // last advStart() failed (rev 28 hold)
   uint32_t advHeldSinceMs_ = 0;
+  uint8_t advPauseSlot_ = kSlotCount;   // connectPause(): the attempt that stopped advertising
+  uint16_t advPauseGen_ = 0;
   bool paused_ = false;                 // pause latch (§5.5), written under tableMux_
   bool quiesced_ = false;               // quiesce latch (§4), written under tableMux_
   bool begun_ = false;                  // begin() succeeded, no successful end() since

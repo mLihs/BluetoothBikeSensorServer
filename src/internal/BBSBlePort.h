@@ -16,6 +16,11 @@ namespace internal {
 constexpr int kHsEAlready = 2;
 constexpr int kHsEBusy = 15;
 constexpr int kHsENotSynced = 22;
+// §5.2 rev 37 capacity codes: host connection pool full, controller out of
+// resources (BLE_HS_HCI_ERR(BLE_ERR_MEM_CAPACITY)), controller link limit.
+constexpr int kHsENoMem = 6;
+constexpr int kHciMemCapacity = 0x207;
+constexpr int kHciConnLimit = 0x209;
 constexpr uint16_t kConnHandleNone = 0xFFFF;         // BLE_HS_CONN_HANDLE_NONE
 
 // gattPass() reads. has* false: characteristic missing, not readable or too short.
