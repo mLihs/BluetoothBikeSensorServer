@@ -10,15 +10,14 @@
 // one task (normally the Arduino loop()). Getters marked "any task" copy
 // under a lock. Never call end() from an event or data callback.
 // Before a successful begin() (and after a successful end()), update(),
-// addByName(), addByMac(), remove(), startDiscovery(), stopDiscovery() and
-// startServer() are ignored and return false where they return a value;
-// end() returns true.
+// addByName(), addByMac(), remove(), startDiscovery() and stopDiscovery() are
+// ignored and return false where they return a value; end() returns true.
+// begin() starts the relay server.
 
 namespace BikeSensor {
 
 // Lifecycle.
 bool initStack(const char* deviceName);   // optional: NimBLE only, before begin()
-bool startServer();                       // begin() starts the server already
 bool begin(const char* deviceName, uint8_t typeMask, Mode mode);   // check the result
 void update();
 bool end();                               // false: not torn down, reboot

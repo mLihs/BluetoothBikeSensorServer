@@ -18,8 +18,6 @@ bool begun = false;   // begin() returned true, no successful end() since
 
 bool initStack(const char* deviceName) { return core.initStack(deviceName); }
 
-bool startServer() { return begun && core.startServer(); }
-
 bool begin(const char* deviceName, uint8_t typeMask, Mode mode) {
   port.attach(core);
   if (!core.begin(deviceName, typeMask, mode)) return false;
