@@ -35,7 +35,7 @@
  */
 
 #include <NimBLEDevice.h>
-#include <BluetoothBikeSensorServer.h>
+#include <BikeSensor.h>
 
 // Sensor configuration (MAC mode - no name needed, just MAC address)
 // 
@@ -210,13 +210,13 @@ void loop() {
       // Initialize BluetoothBikeSensorServer in MAC mode (required for MAC-based sensor connection)
       // Enable Heart Rate sensor type (needed for sensor connection)
       Serial.println("Initializing BluetoothBikeSensorServer (MAC mode, HR enabled)...");
-      BluetoothBikeSensorServerBegin(
-        "NimBLEHeapTest",           // Device name prefix
-        SENSOR_TYPE_HEART_RATE,     // Enable Heart Rate sensor type
-        BBS_MODE_MAC                // MAC Sleep-Scan mode (required for MAC-based connection)
-      );
-      
-      Serial.println("BluetoothBikeSensorServer initialized");
+      // NimBLE is already up, so begin() skips the stack init
+      if (BikeSensor::begin("NimBLEHeapTest", BikeSensor::typeBit(BikeSensor::SensorType::HEART_RATE),
+                            BikeSensor::Mode::MAC)) {
+        Serial.println("BluetoothBikeSensorServer initialized");
+      } else {
+        Serial.println("ERROR: begin() failed!");
+      }
       Serial.println("");
       
       // Capture heap after library initialization
@@ -266,7 +266,7 @@ void loop() {
                       HR_SENSOR_MAC, HR_ADDR_TYPE);
         
         // Add sensor by MAC address
-        if (BikeSensorServerAddSensorByMac(SENSOR_TYPE_HEART_RATE, nullptr, HR_SENSOR_MAC, HR_ADDR_TYPE)) {
+        if (BikeSensor::addByMac(BikeSensor::SensorType::HEART_RATE, HR_SENSOR_MAC, HR_ADDR_TYPE)) {
           Serial.println("Sensor added successfully (will connect when found)");
         } else {
           Serial.println("ERROR: Failed to add sensor!");
@@ -294,7 +294,7 @@ void loop() {
     // Check if sensor is connected and capture heap when connection is established
     static bool sensorConnectionLogged = false;
     if (sensorAdded && !sensorConnectionLogged) {
-      if (BikeSensorServerIsSensorConnected(SENSOR_TYPE_HEART_RATE)) {
+      if (BikeSensor::connected(BikeSensor::SensorType::HEART_RATE)) {
         Serial.println("");
         Serial.println("========================================");
         Serial.println("Sensor Connected!");
@@ -321,7 +321,7 @@ void loop() {
     }
     
     // Print heap tick with appropriate phase indicator
-    if (sensorAdded && BikeSensorServerIsSensorConnected(SENSOR_TYPE_HEART_RATE)) {
+    if (sensorAdded && BikeSensor::connected(BikeSensor::SensorType::HEART_RATE)) {
       printHeapTick("NimBLE+Lib+Sensor");
     } else if (libraryInitialized) {
       printHeapTick("NimBLE+Lib");
@@ -332,7 +332,7 @@ void loop() {
   
   // Call library loop if initialized (keeps it running)
   if (libraryInitialized) {
-    BluetoothBikeSensorServerLoop();
+    BikeSensor::update();
   }
   
   delay(10);  // Small delay to prevent overwhelming the system

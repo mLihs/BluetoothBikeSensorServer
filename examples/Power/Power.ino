@@ -1,10 +1,6 @@
 /**
  * @file Power.ino
- * @brief V3 hardware checkpoint: one power meter by name (design §8).
- *
- * EXPERIMENTAL: drives the V3 internals (src/internal) directly. This is not
- * the final public API; it will be ported to the public BikeSensor facade.
- * The 2.x API and examples are unaffected.
+ * @brief One power meter by name: watts, cadence, balance, energy.
  *
  * build_opt.h (next to this sketch; ESP32 core 3.x passes it to every
  * source, including the libraries) sets BBS_COMPILE_POWER=1.
@@ -13,23 +9,15 @@
  * Samples are printed from the power callback.
  */
 
-// Only puts this library on the include path (Arduino resolves libraries by
-// their top-level headers); nothing from the 2.x API is used.
-#include <BluetoothBikeSensorServer.h>
-#include <internal/BBSCore.h>
-#include <internal/BBSNimBLEPort.h>
+#include <BikeSensor.h>
 
 #if !BBS_COMPILE_POWER
 #error "Power needs -DBBS_COMPILE_POWER=1 (examples/Power/build_opt.h)"
 #endif
 
-// V3 names stay qualified: the 2.x header also declares a global SensorType.
 namespace bs = BikeSensor;
 
 const uint8_t POWER_MASK = bs::typeBit(bs::SensorType::POWER);
-
-bs::internal::NimBLEPort port;
-bs::internal::Core core(port, bs::Mode::NAME, POWER_MASK);
 
 char meterName[32] = "";
 bool discoveryDone = false;
@@ -71,25 +59,25 @@ void onPower(const bs::PowerSample& s) {
 }
 
 void startDiscovery() {
-  const bool ok = core.startDiscovery(POWER_MASK, 15000, millis());
+  const bool ok = bs::startDiscovery(POWER_MASK, 15000);
   Serial.printf("startDiscovery(POWER, 15 s): %s\n", ok ? "ok" : "rejected");
 }
 
 void addMeter() {
-  const bool ok = core.addByName(bs::SensorType::POWER, meterName, millis());
+  const bool ok = bs::addByName(bs::SensorType::POWER, meterName);
   Serial.printf("addByName(\"%s\"): %s\n", meterName, ok ? "ok" : "rejected");
 }
 
 // Named entries come first: take the first one with a name.
 void pickMeter() {
-  const uint8_t n = core.discoveredCount();
+  const uint8_t n = bs::discoveredCount();
   bs::DiscoveredSensor d;
   for (uint8_t i = 0; i < n; ++i) {
-    if (!core.discovered(i, d)) continue;
+    if (!bs::discovered(i, d)) continue;
     Serial.printf("  %u: \"%s\" %02x:%02x:%02x:%02x:%02x:%02x type %u\n", i, d.name, d.mac[0],
                   d.mac[1], d.mac[2], d.mac[3], d.mac[4], d.mac[5], d.addrType);
   }
-  if (n == 0 || !core.discovered(0, d) || d.name[0] == '\0') {
+  if (n == 0 || !bs::discovered(0, d) || d.name[0] == '\0') {
     Serial.println("No named power meter found; press d to search again");
     return;
   }
@@ -99,36 +87,35 @@ void pickMeter() {
 
 void printStatus() {
   bs::SensorInfo info;
-  if (core.info(bs::SensorType::POWER, info)) {
+  if (bs::info(bs::SensorType::POWER, info)) {
     Serial.printf("power \"%s\" state=%u battery=%s%u encrypted=%u cadenceSource=%u "
                   "lastReason=0x%x\n",
                   info.name, static_cast<unsigned>(info.state), info.hasBattery ? "" : "?",
                   info.hasBattery ? info.battery : 0, info.encrypted, info.providesCadence,
                   info.lastDisconnectReason);
   }
-  const bs::Stats s = core.stats();
+  const bs::Stats s = bs::stats();
   Serial.printf("gattAborts=%lu centrals=%u heap=%lu\n", s.gattBudgetAborts,
-                core.centralCount(), static_cast<unsigned long>(ESP.getFreeHeap()));
+                bs::centralCount(), static_cast<unsigned long>(ESP.getFreeHeap()));
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\nPower (experimental V3 internals)");
+  Serial.println("\nPower");
 
-  port.attach(core);
-  if (!core.begin("homewind", POWER_MASK, bs::Mode::NAME)) {
-    Serial.println("Core::begin failed");
+  if (!bs::begin("homewind", POWER_MASK, bs::Mode::NAME)) {
+    Serial.println("begin() failed");
     return;
   }
-  core.setEventCallback(onEvent);
-  core.setPowerCallback(onPower);
+  bs::setEventCallback(onEvent);
+  bs::setPowerCallback(onPower);
   startDiscovery();
   Serial.println("Commands: d=discovery, s=status");
 }
 
 void loop() {
-  core.update(millis());
+  bs::update();
 
   if (discoveryDone) {
     discoveryDone = false;
