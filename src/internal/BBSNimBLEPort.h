@@ -10,9 +10,7 @@
 // Device side of BlePort (§2): raw-GAP scan with a static callback, one
 // reused client per slot with static callbacks, the reset detector, the
 // GATT esp_timer and the local relay server. NimBLE callbacks only push
-// events (§2 callback rule).
-// Header-only until the public BikeSensor.cpp exists, so the 2.x build does
-// not compile or link it.
+// events (§2 callback rule). Included only by BikeSensor.cpp.
 
 static_assert(BLE_HS_EALREADY == BikeSensor::internal::kHsEAlready, "");
 static_assert(BLE_HS_EBUSY == BikeSensor::internal::kHsEBusy, "");

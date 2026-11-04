@@ -585,6 +585,9 @@ class Core {
   // Any task.
   bool scanning() { return scan_.owner() != ScanOwner::OFF || port_.discActive(); }
 
+  // Any task. NimBLE's state, like 2.x IsAdvertising().
+  bool advertising() { return port_.advActive(); }
+
   // A copy, with the event queue's drop counters (§3.2). update() task.
   Stats stats() {
     Stats out = stats_;

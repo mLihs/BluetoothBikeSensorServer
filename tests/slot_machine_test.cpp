@@ -4776,9 +4776,9 @@ static void testPauseResume() {
   Rig r;
   assert(r.core->startServer());
   r.update();
-  assert(r.port.advOn && r.port.advStarts == 1);
+  assert(r.port.advOn && r.port.advStarts == 1 && r.core->advertising());
   r.core->pause();
-  assert(!r.port.advOn && r.port.advStops == 1);
+  assert(!r.port.advOn && r.port.advStops == 1 && !r.core->advertising());
   r.core->pause();
   r.update();
   assert(r.port.advStops == 1 && r.port.advStarts == 1);

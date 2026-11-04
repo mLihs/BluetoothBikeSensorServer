@@ -3,7 +3,7 @@
 #include <cstdint>
 
 // Public value types from design §3.1 and §4, Arduino-free so the host tests
-// can use them. The public BikeSensor.h will include this header.
+// can use them. The public BikeSensor.h includes this header.
 
 namespace BikeSensor {
 
