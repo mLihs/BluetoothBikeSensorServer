@@ -176,7 +176,22 @@ The server has one service per type in the `begin()` mask: HR `0x2A37`; CSC `0x2
 NimBLE's default `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` is 3, shared by sensors and centrals:
 
 - Two sensors leave one central. A further connect fails.
-- Three sensors (HR + CSC + Power) leave no central. On a classic ESP32 `-DCONFIG_BT_NIMBLE_MAX_CONNECTIONS=4` helps (more RAM). On the ESP32-S3 the core's prebuilt `sdkconfig.h` sets it to 3 after the `-D` flags, so the flag has no effect there.
+- Three sensors (HR + CSC + Power) leave no central. On a classic ESP32 `-DCONFIG_BT_NIMBLE_MAX_CONNECTIONS=4` helps (more RAM). On the ESP32-S3 the core's prebuilt `sdkconfig.h` sets it to 3 after the `-D` flags, so the flag has no effect there (see below).
+
+### ESP32-S3: more than three links
+
+The prebuilt ESP32-S3 core gives 3 host links (controller `ble_max_act` 5). HR + CSC + one central works. For more links, put this `sdkconfig.h` into the sketch folder:
+
+```cpp
+#pragma once
+#include_next <sdkconfig.h>
+#undef CONFIG_BT_NIMBLE_MAX_CONNECTIONS
+#define CONFIG_BT_NIMBLE_MAX_CONNECTIONS 8
+```
+
+- Hardware-tested on the ESP32-S3 with 8 (controller `ble_max_act` 10) and with 6 (`ble_max_act` 8). With 4 links connected the free heap was about 233 KB.
+- arduino-cli puts the sketch folder first in the include path (core 3.3.12 verbose build log: `-I<sketch folder>` before the core's `include` folders, for sketch, library and core sources). The value applies to the whole build of the sketch, not only to this library.
+- Every configured link costs NimBLE host and controller memory. Use the smallest value you need.
 
 A sensor connect refused for lack of controller or host resources (`6`, `0x207`, `0x209`) is not counted as the sensor's fault: the slot waits without backoff or scanning until a sensor link or central goes away, at the latest after `BBS_CAPACITY_RETRY_MS` (60 s). `SENSOR_FAILED` then carries the code in `reason`, once per code. A `0x207` while advertising runs is retried once with advertising stopped (at most about 7 s).
 
