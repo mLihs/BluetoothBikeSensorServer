@@ -26,6 +26,7 @@ BluetoothBikeSensorServer connects an ESP32 to BLE fitness sensors (Heart Rate `
 
 - ESP32 with BLE (built for ESP32 and ESP32-S3, hardware-tested on the ESP32-S3), arduino-esp32 core 3.3.x.
 - [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) **2.5.0 or newer** (2.5.2 tested).
+  Known issue: NimBLE-Arduino 2.3.0–2.5.2 index a `BLE_MAX_CONNECTIONS + 1` array with the controller's connection handle; on the ESP32-S3 a central (relay client) can get a larger handle, which corrupts host memory and crashes on disconnect. Use a NimBLE-Arduino with the fix (per-connection flag, as in upstream esp-nimble) or a patched copy like Homewind's `NimBLE-Arduino` workspace copy (`PATCHES.md`).
 - Extended advertising (`CONFIG_BT_NIMBLE_EXT_ADV`) must be off (`#error` otherwise).
 
 Install into your Arduino `libraries` folder and include one header:

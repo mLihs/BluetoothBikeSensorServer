@@ -69,6 +69,9 @@ New major version with a new API (`#include <BikeSensor.h>`, `namespace BikeSens
 - ⚠️ Breaking: new API, see above.
 - NimBLE-Arduino 2.5.0 or newer (`setConnectRetries`); built with 2.5.2 and arduino-esp32 3.3.12 for ESP32 and ESP32-S3; hardware-tested on the ESP32-S3.
 
+### Known issues
+- NimBLE-Arduino 2.3.0–2.5.2: a peripheral link (relay client) whose connection handle is larger than `BLE_MAX_CONNECTIONS` overflows the host's `slave_conn[]` array and crashes on disconnect (seen on the ESP32-S3 with Zwift). Not a library bug; use a NimBLE-Arduino with the fix or a patched copy (Homewind workspace `NimBLE-Arduino`, `PATCHES.md`).
+
 ---
 
 ## [2.2.21.0] - 2026-10-31
