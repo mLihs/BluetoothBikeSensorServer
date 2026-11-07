@@ -22,7 +22,8 @@ inline Event makeEvent(Ev kind, uint8_t slot, int16_t reason, uint16_t gen) {
 }
 
 // name is not NUL-terminated (AD data); kept to 31 bytes plus NUL. slot: the
-// slot whose name matched (NAME mode); MAC mode routes by address.
+// slot whose name matched (NAME mode, MAC name fallback); MAC mode routes by
+// address first.
 inline bool pushScanMatch(EventQueue& q, uint16_t epoch, const uint8_t addr[6],
                           uint8_t addrType, const char* name, size_t nameLen,
                           uint8_t slot = 0) {

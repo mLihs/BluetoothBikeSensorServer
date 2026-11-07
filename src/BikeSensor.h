@@ -23,8 +23,14 @@ void update();
 bool end();                               // false: not torn down, reboot
 
 // Sensors. MAC "xx:xx:xx:xx:xx:xx"; addrType 0 public, 1 random, -1 auto.
+// nameFallback (3.1): a random address (given or detected) with a non-empty
+// name also matches a scan report with exactly that name (and the slot's
+// service, if the report lists any) from any address and adopts it
+// (info().mac); an exact MAC match wins. While such a slot waits, sleep scans
+// run without the duplicate filter. Ignored otherwise.
 bool addByName(SensorType type, const char* name);
-bool addByMac(SensorType type, const char* mac, int8_t addrType, const char* name = nullptr);
+bool addByMac(SensorType type, const char* mac, int8_t addrType, const char* name = nullptr,
+              bool nameFallback = false);
 bool remove(SensorType type);
 bool connected(SensorType type);          // any task
 bool info(SensorType type, SensorInfo& out);   // any task

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.1.0] - 2026-11-06
+
+### Added
+- Optional name fallback in MAC mode: `addByMac(type, mac, addrType, name, nameFallback = true)`. For a random address (`addrType` 1, or -1 that detects random) with a non-empty name, a slot waiting for its scan also matches a report (advertising or scan response) with exactly that name from any address and takes over the reported address and address type (`info().mac`). A report that lists 16-bit service UUIDs must list the slot's service. A report from the configured MAC wins; an address held by another slot is ignored. While such a slot waits (not in a capacity wait), MAC-mode sleep windows scan without the controller's duplicate filter, as NAME windows do, because the ESP32-S3 filter drops a scan response after the advertising of the same address. For sensors that change their random address after deep sleep (Garmin Cadence Sensor 2). The fallback trusts the exact name: use it only for names that identify one device (e.g. with a serial number). Otherwise the flag is ignored; existing calls are unchanged.
+
+---
+
 ## [3.0.0] - 2026-11-04
 
 New major version with a new API (`#include <BikeSensor.h>`, `namespace BikeSensor`, 34 functions). There is no 2.x compatibility layer.

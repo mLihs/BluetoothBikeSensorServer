@@ -2,10 +2,10 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Version**: 3.0.0
+**Version**: 3.1.0
 **Platform**: ESP32 (Arduino Core 3.x)
 **Author**: Martin Lihs
-**Last Updated**: 2026-11-04
+**Last Updated**: 2026-11-06
 
 > **3.0 is a new major version.** The 2.x functions (`BluetoothBikeSensorServer*`, `BikeSensorServer*`), `BLETelemetry` and `HomewindBleIdentity` are gone; there is no compatibility layer. See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
@@ -98,13 +98,17 @@ Before a successful `begin()` (and after a successful `end()`), `update()`, `add
 
 | Function | Notes |
 |---|---|
-| `bool addByMac(SensorType, const char* mac, int8_t addrType, const char* name = nullptr)` | MAC mode. `mac` = `xx:xx:xx:xx:xx:xx`; `addrType` 0 public, 1 random, -1 auto. |
+| `bool addByMac(SensorType, const char* mac, int8_t addrType, const char* name = nullptr, bool nameFallback = false)` | MAC mode. `mac` = `xx:xx:xx:xx:xx:xx`; `addrType` 0 public, 1 random, -1 auto. `nameFallback` (3.1): see below. |
 | `bool addByName(SensorType, const char* name)` | NAME mode. Exact, case-sensitive match. |
 | `bool remove(SensorType)` | From every state; a live link is disconnected first. True once the slot is empty or on its way there. |
 | `bool connected(SensorType)` | Subscribed: between `SENSOR_CONNECTED` and `SENSOR_DISCONNECTED`. |
 | `bool info(SensorType, SensorInfo&)` | Name, MAC, address type, state, battery, last disconnect reason, `encrypted`, `providesCadence`. False only for a type that is not compiled. |
 
 `addBy*` returns false for a type outside the `begin()` mask, in the other mode, under quiesce, for an empty name, or when **another** type already holds the same MAC (or, in NAME mode, the same name). Identical names for different types are rejected on purpose. Calling `addBy*` again for the same type replaces the identity and reconnects. In NAME mode, avoid a name that equals another sensor's shortened advertised name: the slot that resolves first keeps that address until `remove()` or a replace.
+
+Name fallback (3.1): some sensors with a random address (for example the Garmin Cadence Sensor 2) pick a new one after deep sleep. With `nameFallback = true`, a random address (`addrType` 1, or -1 that detects random) and a non-empty `name`, the waiting slot also accepts a scan report (advertising or scan response) with exactly that name from any address, takes over its address and connects; `info().mac` shows the new address, so the application can store it. A report that lists 16-bit service UUIDs must list the slot's service. A report from the configured MAC still wins, and an address held by another slot is ignored. While such a slot waits, its sleep scans run without the controller's duplicate filter (like NAME windows), so a name sent only in the scan response is seen; every advertising report then reaches the scan callback. Otherwise the flag is ignored and `addByMac()` behaves as in 3.0.
+
+> The fallback trusts the exact name. Use it only for names that identify one device, such as names with a serial number (`CAD-BLE0446949`); with a generic name a nearby sensor of the same model can be taken over.
 
 Battery and `encrypted` are only known while the sensor is connected. One device cannot fill two slots: a power meter that also advertises CSC delivers cadence through the Power slot (below).
 

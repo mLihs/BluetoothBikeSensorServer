@@ -97,9 +97,11 @@ class ScanController {
   // needScan: NAME mode → a slot is IDLE; MAC mode → a slot is WAIT_SCAN.
   // slotBusy: a slot is FOUND, STOPPING_FOR_CONNECT, CONNECTING, CANCELLING or
   // DISCOVERING. linkBusy: a slot is CONNECTING, CANCELLING or DISCOVERING.
+  // sleepUnfiltered: a SLEEP window started now runs without the duplicate
+  // filter (a name-fallback slot waits; its name may be in SCAN_RSP only).
   // Returns true if the discovery must finish with `finish`.
   bool advance(BlePort& port, uint32_t now, bool needScan, bool slotBusy, bool linkBusy,
-               Stats& stats, FinishReason& finish) {
+               Stats& stats, FinishReason& finish, bool sleepUnfiltered = false) {
     switch (owner_) {
       case ScanOwner::DISCOVERY_PENDING:
         return advancePending(port, now, linkBusy, stats, finish);
@@ -135,7 +137,7 @@ class ScanController {
                               : remainderMs_ != 0 ? remainderMs_
                                                   : BBS_SLEEP_SCAN_DURATION_MS;
     nextEpoch();
-    if (port.discStart(epoch_, duration, !name) != 0) {
+    if (port.discStart(epoch_, duration, !name && !sleepUnfiltered) != 0) {
       stats.scanStartFails++;
       hold(now, BBS_SCAN_START_BACKOFF_MS);
       return false;

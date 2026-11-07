@@ -40,8 +40,9 @@ bool addByName(SensorType type, const char* name) {
   return begun && core.addByName(type, name, millis());
 }
 
-bool addByMac(SensorType type, const char* mac, int8_t addrType, const char* name) {
-  return begun && core.addByMac(type, mac, addrType, name, millis());
+bool addByMac(SensorType type, const char* mac, int8_t addrType, const char* name,
+              bool nameFallback) {
+  return begun && core.addByMac(type, mac, addrType, name, millis(), nameFallback);
 }
 
 // True once the slot is EMPTY or on its way there.

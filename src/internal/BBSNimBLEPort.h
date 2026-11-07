@@ -362,10 +362,13 @@ class NimBLEPort final : public BlePort {
         return 0;
       }
       if (core.mode() == Mode::MAC) {
-        if (!core.scanFilterMatch(mac)) return 0;   // any slot's MAC; update() picks the slot
-        AdFields fields;
-        parseAd(desc.data, desc.length_data, fields);  // partial fields are fine for a MAC match
-        pushScanMatch(core.queue(), epoch, mac, desc.addr.type, fields.name, fields.nameLen);
+        // Any slot's MAC, else a name-fallback slot's name in this report
+        // alone, as in NAME mode.
+        AdFields fields{};
+        const int slot = core.scanMacRoute(mac, desc.data, desc.length_data, fields);
+        if (slot < 0) return 0;
+        pushScanMatch(core.queue(), epoch, mac, desc.addr.type, fields.name, fields.nameLen,
+                      static_cast<uint8_t>(slot));
         return 0;
       }
       // NAME: this report alone (ADV or SCAN_RSP, no merge); elements before a

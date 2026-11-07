@@ -96,8 +96,9 @@ constexpr uint8_t kCpLocationDefault = 0x0D;            // rear hub
 // §6b.
 enum class CadenceSource : uint8_t { NONE, CSC, POWER };
 
-// Written under tableMux for info(): state, name, mac, addrType, hasAddr,
-// battery, lastDisconnectReason, encrypted and the last measurement.
+// Written under tableMux for info() and gapScanCb: state, name, mac, addrType,
+// hasAddr, nameFallback, battery, lastDisconnectReason, encrypted and the last
+// measurement.
 struct SensorSlot {
   SensorType type;                      // fixed by the slot index
   SlotState  state;
@@ -105,6 +106,7 @@ struct SensorSlot {
   uint8_t    mac[6];
   uint8_t    addrType;
   bool       hasAddr;                   // mac is set (configured or resolved)
+  bool       nameFallback;              // MAC mode: WAIT_SCAN also matches name (3.1)
   std::atomic<uint16_t> attemptGen{0};  // never reset; read by client callbacks
   uint8_t    battery;                   // 255 = unknown; read in the pass, cleared when the link ends
   int        lastDisconnectReason;
@@ -155,9 +157,11 @@ class Core {
   // MAC mode only. addrType: 0 public, 1 random, -1 auto-detect from the MAC
   // (2.x rule: top two bits 11 → random). The same type on a non-EMPTY slot
   // replaces the identity (§4); a MAC held by another slot, a type outside
-  // the begin() mask or quiesce returns false.
+  // the begin() mask or quiesce returns false. nameFallback takes effect only
+  // for a random address (given or detected) with a non-empty name; it is
+  // ignored otherwise.
   bool addByMac(SensorType type, const char* mac, int8_t addrType, const char* name,
-                uint32_t now) {
+                uint32_t now, bool nameFallback = false) {
     const int i = enabledSlot(type);
     uint8_t bytes[6];
     if (i < 0 || quiesced_ || mode_ != Mode::MAC) return false;
@@ -172,6 +176,7 @@ class Core {
       s.hasAddr = true;
       s.addrType = addrType >= 0 ? static_cast<uint8_t>(addrType)
                                  : ((bytes[0] & 0xC0) == 0xC0 ? 1 : 0);
+      s.nameFallback = nameFallback && s.addrType == 1 && s.name[0] != '\0';
     }
     if (replace) {
       retarget(static_cast<uint8_t>(i), now);
@@ -612,7 +617,8 @@ class Core {
     orphanSweep();
     if (quiesced_) return;
     FinishReason finish;
-    if (scan_.advance(port_, now, needScan(), scanBlocked(), linkBusy(), stats_, finish)) {
+    if (scan_.advance(port_, now, needScan(), scanBlocked(), linkBusy(), stats_, finish,
+                      fallbackWaiting())) {
       tryFinish(finish);
     }
   }
@@ -626,6 +632,37 @@ class Core {
       if (s.hasAddr && memcmp(mac, s.mac, sizeof(s.mac)) == 0) return true;
     }
     return false;
+  }
+
+  // Any task (gapScanCb), MAC mode: routes one report. kSlotCount: a slot
+  // holds `mac` (update() picks it by address); a slot index: a waiting
+  // name-fallback slot whose name equals the report's name (as
+  // scanNameMatch()) and whose type the report advertises, if it lists any;
+  // -1: no match. The AD is parsed into `fields` only on a MAC match or while
+  // a fallback slot waits. At most two tableMux sections.
+  int scanMacRoute(const uint8_t mac[6], const uint8_t* data, size_t len, AdFields& fields) {
+    bool macMatch = false, fallback = false;
+    {
+      MuxGuard guard(tableMux_);
+      for (const SensorSlot& s : slots_) {
+        macMatch = macMatch || (s.hasAddr && memcmp(mac, s.mac, sizeof(s.mac)) == 0);
+        fallback = fallback || (s.nameFallback && s.state == SlotState::WAIT_SCAN);
+      }
+    }
+    if (!macMatch && !fallback) return -1;
+    parseAd(data, len, fields);         // partial fields are fine for either match
+    if (macMatch) return kSlotCount;
+    if (fields.name == nullptr || fields.nameLen == 0) return -1;
+    MuxGuard guard(tableMux_);
+    for (uint8_t i = 0; i < kSlotCount; ++i) {
+      const SensorSlot& s = slots_[i];
+      if (s.nameFallback && s.state == SlotState::WAIT_SCAN &&
+          (fields.typeMask == 0 || (fields.typeMask & typeBit(s.type)) != 0) &&
+          strlen(s.name) == fields.nameLen && memcmp(s.name, fields.name, fields.nameLen) == 0) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   // Any task (gapScanCb), NAME mode: the slot whose stored name equals the
@@ -719,6 +756,14 @@ class Core {
     return false;
   }
 
+  // A name-fallback slot waits for a scan: SLEEP windows run unfiltered.
+  bool fallbackWaiting() const {
+    for (const SensorSlot& s : slots_) {
+      if (s.nameFallback && s.state == SlotState::WAIT_SCAN && !s.capWait) return true;
+    }
+    return false;
+  }
+
   // Truncated to 31 bytes with a guaranteed NUL; nullptr → "".
   static void copyName(char (&out)[sizeof(SensorSlot::name)], const char* name) {
     size_t len = name != nullptr ? strlen(name) : 0;
@@ -751,6 +796,7 @@ class Core {
     {
       MuxGuard guard(tableMux_);
       s.hasAddr = false;
+      s.nameFallback = false;
       memset(s.name, 0, sizeof(s.name));
       memset(s.mac, 0, sizeof(s.mac));
       clearValue(s);
@@ -1242,7 +1288,8 @@ class Core {
   }
 
   // NAME: the slot gapScanCb matched, if it is still IDLE under that name.
-  // MAC: the WAIT_SCAN slot with the report's address.
+  // MAC: the WAIT_SCAN slot with the report's address, else the name-fallback
+  // slot gapScanCb matched, if it still waits under that name.
   int matchTarget(const Event& ev) const {
     if (mode_ == Mode::NAME) {
       if (ev.slot >= kSlotCount) return -1;
@@ -1258,7 +1305,12 @@ class Core {
         return i;
       }
     }
-    return -1;
+    if (ev.slot >= kSlotCount) return -1;
+    const SensorSlot& s = slots_[ev.slot];
+    return s.state == SlotState::WAIT_SCAN && !s.capWait && s.nameFallback &&
+                   strcmp(ev.match.name, s.name) == 0
+               ? ev.slot
+               : -1;
   }
 
   void onClientEvent(uint8_t i, const Event& ev, uint32_t now) {

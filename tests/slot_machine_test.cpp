@@ -5919,6 +5919,201 @@ static void testInfoConcurrent() {
   reader.join();
 }
 
+// 3.1 MAC name fallback: one report (AD 0x09 name, optional 16-bit service
+// UUID) routed by Core::scanMacRoute(), as gapScanCb does.
+static int route(Rig& r, const uint8_t* mac, const char* name, uint16_t uuid,
+                 bs::AdFields& fields) {
+  static uint8_t ad[31];                               // fields.name points into it
+  const size_t nameLen = strlen(name);
+  assert(nameLen + 6 <= sizeof(ad));
+  size_t n = 0;
+  ad[n++] = static_cast<uint8_t>(nameLen + 1);
+  ad[n++] = 0x09;
+  memcpy(ad + n, name, nameLen);
+  n += nameLen;
+  if (uuid != 0) {
+    ad[n++] = 3;
+    ad[n++] = 0x03;
+    ad[n++] = static_cast<uint8_t>(uuid);
+    ad[n++] = static_cast<uint8_t>(uuid >> 8);
+  }
+  fields = bs::AdFields{};
+  return r.core->scanMacRoute(mac, ad, n, fields);
+}
+static int route(Rig& r, const uint8_t* mac, const char* name, uint16_t uuid = 0) {
+  bs::AdFields fields;
+  return route(r, mac, name, uuid, fields);
+}
+// Routes and, on a match, pushes the SCAN_MATCH gapScanCb would push.
+static bool fallbackReport(Rig& r, const uint8_t* mac, const char* name, uint8_t addrType = 1,
+                           uint16_t uuid = 0) {
+  bs::AdFields fields;
+  const int slot = route(r, mac, name, uuid, fields);
+  if (slot < 0) return false;
+  assert(bs::pushScanMatch(r.core->queue(), r.core->scan().epoch(), mac, addrType, fields.name,
+                           fields.nameLen, static_cast<uint8_t>(slot)));
+  return true;
+}
+
+static void testNameFallback() {
+  static const uint8_t kNewMac[6] = {0xf2, 0x23, 0x97, 0xc6, 0x37, 0x12};
+  BikeSensor::SensorInfo info{};
+  {  // Flag + random + name: a report with the name from a new address is adopted.
+    Rig r;
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 1, "CAD", r.now, true));
+    assert(r.csc().nameFallback);
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW);
+    assert(!r.port.lastFilterDuplicates);                // the name may be in SCAN_RSP only
+    assert(!r.core->scanFilterMatch(kNewMac));
+    assert(route(r, kNewMac, "CA") == -1 && route(r, kNewMac, "CADX") == -1);
+    assert(route(r, kNewMac, "cad") == -1 && route(r, kNewMac, "") == -1);
+    assert(route(r, kCscMac, "Other") == bs::kSlotCount);   // own MAC: by address
+    // Type check: a report listing services needs the slot's one.
+    assert(route(r, kNewMac, "CAD", 0x180D) == -1);
+    assert(route(r, kNewMac, "CAD", 0x1816) == kCsc && route(r, kNewMac, "CAD") == kCsc);
+    assert(!fallbackReport(r, kNewMac, "Other"));
+    assert(fallbackReport(r, kNewMac, "CAD"));
+    r.port.expect[kCsc] = kNewMac;
+    r.update();
+    assert(r.cscState() == SlotState::CONNECTING && countEvents(EventType::SENSOR_FOUND) == 1);
+    assert(memcmp(r.csc().mac, kNewMac, 6) == 0 && r.csc().addrType == 1);
+    assert(r.core->info(SensorType::SPEED_CADENCE, info) && memcmp(info.mac, kNewMac, 6) == 0);
+    assert(r.core->scanFilterMatch(kNewMac) && !r.core->scanFilterMatch(kCscMac));
+    assert(route(r, kCscMac, "CAD") == -1);              // only WAIT_SCAN matches by name
+    assert(r.csc().nameFallback);                        // kept for the next address change
+    r.core->remove(SensorType::SPEED_CADENCE, r.now);
+    r.failEv(r.cscGen(), 13, kCsc);
+    r.update();
+    assert(r.cscState() == SlotState::EMPTY && !r.csc().nameFallback);
+  }
+  {  // Auto-detected random address (top bits 11) with the flag: fallback on.
+    Rig r;
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, "c0:bb:cc:dd:ee:03", -1, "CAD", r.now,
+                            true));
+    assert(r.csc().addrType == 1 && r.csc().nameFallback);
+  }
+  {  // Without the flag: no name match, the slot keeps waiting for its MAC.
+    Rig r;
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 1, "CAD", r.now));
+    assert(!r.csc().nameFallback);
+    r.update();
+    assert(r.port.lastFilterDuplicates);                 // no fallback slot: filter on
+    assert(route(r, kNewMac, "CAD") == -1);
+    assert(!fallbackReport(r, kNewMac, "CAD"));
+    // A forged slot index alone is not enough: matchTarget re-validates.
+    assert(bs::pushScanMatch(r.core->queue(), r.core->scan().epoch(), kNewMac, 1, "CAD", 3,
+                             kCsc));
+    r.update();
+    assert(r.cscState() == SlotState::WAIT_SCAN && memcmp(r.csc().mac, kCscMac, 6) == 0);
+    assert(countEvents(EventType::SENSOR_FOUND) == 0);
+  }
+  {  // Flag with addrType 0 or without a name: ignored.
+    Rig r;
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 0, "CAD", r.now, true));
+    assert(!r.csc().nameFallback);
+    r.update();
+    assert(!fallbackReport(r, kNewMac, "CAD"));
+    assert(bs::pushScanMatch(r.core->queue(), r.core->scan().epoch(), kNewMac, 1, "CAD", 3,
+                             kCsc));
+    r.update();
+    assert(r.cscState() == SlotState::WAIT_SCAN && memcmp(r.csc().mac, kCscMac, 6) == 0);
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 1, nullptr, r.now, true));
+    assert(!r.csc().nameFallback);
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 1, "", r.now, true));
+    assert(!r.csc().nameFallback);
+  }
+  {  // Exact MAC match wins: a report from the HR's MAC carrying the CSC's name.
+    Rig r;
+    r.add();
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 1, "CAD", r.now, true));
+    r.update();
+    assert(r.state() == SlotState::WAIT_SCAN && r.cscState() == SlotState::WAIT_SCAN);
+    assert(fallbackReport(r, kMac, "CAD", 0));           // routed by address
+    r.update();
+    assert(r.state() == SlotState::CONNECTING && r.cscState() == SlotState::WAIT_SCAN);
+    assert(memcmp(r.csc().mac, kCscMac, 6) == 0);
+  }
+  {  // Same, with the event naming the fallback slot: the address match still wins.
+    Rig r;
+    r.add();
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 1, "CAD", r.now, true));
+    r.update();
+    assert(bs::pushScanMatch(r.core->queue(), r.core->scan().epoch(), kMac, 0, "CAD", 3, kCsc));
+    r.update();
+    assert(r.state() == SlotState::CONNECTING && r.cscState() == SlotState::WAIT_SCAN);
+    assert(memcmp(r.csc().mac, kCscMac, 6) == 0);
+  }
+  {  // Held by another slot: a name match from the SUBSCRIBED HR's address is ignored.
+    Rig r;
+    r.toSubscribed();
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 1, "CAD", r.now, true));
+    r.update();
+    assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW);
+    assert(bs::pushScanMatch(r.core->queue(), r.core->scan().epoch(), kMac, 0, "CAD", 3, kCsc));
+    r.update();
+    assert(r.cscState() == SlotState::WAIT_SCAN && memcmp(r.csc().mac, kCscMac, 6) == 0);
+    assert(r.state() == SlotState::SUBSCRIBED && countEvents(EventType::SENSOR_FOUND) == 1);
+  }
+  static const uint8_t kThirdMac[6] = {0xd5, 0x11, 0x22, 0x33, 0x44, 0x55};
+  {  // Capacity wait: the window (kept by HR) is filtered again, matchTarget rejects.
+    Rig r;
+    r.add();
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 1, "CAD", r.now, true));
+    r.update();
+    assert(!r.port.lastFilterDuplicates);
+    assert(fallbackReport(r, kNewMac, "CAD"));
+    r.port.expect[kCsc] = kNewMac;
+    r.port.connectOk = false;
+    r.port.connectErr = bs::kHsENoMem;
+    r.update();
+    assert(r.cscState() == SlotState::WAIT_SCAN && r.csc().capWait);
+    assert(memcmp(r.csc().mac, kNewMac, 6) == 0);
+    assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW && r.port.lastFilterDuplicates);
+    assert(fallbackReport(r, kThirdMac, "CAD"));         // routed, then rejected in update()
+    r.update();
+    assert(r.cscState() == SlotState::WAIT_SCAN && memcmp(r.csc().mac, kNewMac, 6) == 0);
+  }
+  {  // Adoption → connect fail → WAIT_SCAN with the new address; an event of the
+     // window stopped for the connect is stale; the next window adopts a third address.
+    Rig r;
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 1, "CAD", r.now, true));
+    r.update();
+    const uint16_t e = r.core->scan().epoch();
+    assert(fallbackReport(r, kNewMac, "CAD"));
+    r.port.expect[kCsc] = kNewMac;
+    r.update();
+    assert(r.cscState() == SlotState::CONNECTING);
+    r.failEv(r.cscGen(), 13, kCsc);
+    assert(bs::pushScanMatch(r.core->queue(), e, kThirdMac, 1, "CAD", 3, kCsc));
+    r.update();
+    assert(r.cscState() == SlotState::WAIT_SCAN && memcmp(r.csc().mac, kNewMac, 6) == 0);
+    assert(r.csc().addrType == 1 && r.core->scanFilterMatch(kNewMac));
+    assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW && r.core->scan().epoch() != e);
+    assert(!r.port.lastFilterDuplicates);
+    assert(fallbackReport(r, kThirdMac, "CAD"));
+    r.port.expect[kCsc] = kThirdMac;
+    r.update();
+    assert(r.cscState() == SlotState::FOUND && memcmp(r.csc().mac, kThirdMac, 6) == 0);
+    r.at(r.now + 1000);                                  // hard-fail backoff
+    assert(r.cscState() == SlotState::CONNECTING && countEvents(EventType::SENSOR_FOUND) == 2);
+  }
+  {  // addByMac replace while a fallback event is still queued: the event is rejected.
+    static const uint8_t kReplaceMac[6] = {0xc4, 0xbb, 0xcc, 0xdd, 0xee, 0x04};
+    Rig r;
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, kCscMacStr, 1, "CAD", r.now, true));
+    r.update();
+    assert(fallbackReport(r, kNewMac, "CAD"));
+    assert(r.core->addByMac(SensorType::SPEED_CADENCE, "c4:bb:cc:dd:ee:04", 1, "CAD", r.now,
+                            true));
+    assert(r.cscState() == SlotState::FOUND);
+    r.port.expect[kCsc] = kReplaceMac;
+    r.update();
+    assert(r.cscState() == SlotState::CONNECTING && memcmp(r.csc().mac, kReplaceMac, 6) == 0);
+    assert(countEvents(EventType::SENSOR_FOUND) == 0);
+  }
+}
+
 int main() {
   testAddByMac();
   testHappyPath();
@@ -6045,5 +6240,6 @@ int main() {
   testNameQuiesceDiscovering();
   testInfoAndConnected();
   testInfoConcurrent();
+  testNameFallback();
   return 0;
 }
