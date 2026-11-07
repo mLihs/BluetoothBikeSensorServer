@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.1] - 2026-11-07
+
+### Changed
+- Cadence source: the CSC sensor is the source only while it is connected (slot `SUBSCRIBED`); otherwise a connected power meter, otherwise none. Before, a configured CSC sensor was the source also while asleep or away, so the cadence was 0 although the power meter sent crank data. The source changes at every connect and disconnect of either sensor; `lastCadence()`, the cadence callback and `info(POWER).providesCadence` follow it. The cadence callback's "one 0 when the cadence stops" now covers both sources: after a non-zero value it reports one 0 when the power meter is the source and sent no crank event for `BBS_POWER_STALE_MS`, or the source is none; the CSC sensor reports its own 0s. New: a CSC sensor whose last value was non-zero also gets one 0 when it disconnects, unless the power meter takes over with fresh crank data. A handover from the power meter to the CSC sensor reports no 0 first (the CSC sensor's values follow). Crank state is per sensor and reset on every link, so the first value after a handover is not computed across the handover.
+
+### Fixed
+- Duplicate cadence in the relayed power measurement: while the CSC sensor is the cadence source, the relayed Cycling Power Measurement (`0x2A63`) is sent without its crank revolution data (flag bit 5 and its 4 bytes; all other bytes unchanged). Zwift saw two cadences from one device and the cadence jumped. Without a connected CSC sensor the packet is relayed as received, and a malformed one always is. The callbacks and `lastPower()` still get the meter's full packet. With a CSC sensor set up, pair the app's cadence to the relay's CSC service.
+
+---
+
+## [3.2.0] - 2026-11-07
+
+### Added
+- `setAdvertisedTypes(typeMask)`: chooses which service UUIDs the relay server advertises, e.g. only the types that have a sensor, so apps do not offer a source without data. The mask is cut to the `begin()` mask and the compiled types; `0` advertises the name only (still connectable). Default: all (`0xFF`), so existing code is unchanged. Like `setNamePrefix()` it takes effect through `refreshAdvertising()` (or the next `begin()`) and is kept across `end()` + `begin()`. Only the advertising data changes: the GATT services of the `begin()` mask stay, so a central that already knows the device keeps working. The 31-byte check counts the advertised UUIDs only, so a longer prefix fits with fewer types. While paused, `refreshAdvertising()` applies the data without restarting advertising; under quiesce it returns false as before.
+
+---
+
 ## [3.1.0] - 2026-11-06
 
 ### Added

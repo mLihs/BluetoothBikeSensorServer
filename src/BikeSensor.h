@@ -55,9 +55,15 @@ bool quiesced();
 
 // Relay server.
 bool advertising();                       // any task
-bool refreshAdvertising();                // applies setNamePrefix(); false = data not applied
+// refreshAdvertising(): applies setNamePrefix()/setAdvertisedTypes(); false =
+// data not applied. Starts advertising at once if it is desired (not paused)
+// and no start backoff holds it; otherwise it follows from the next update() on.
+bool refreshAdvertising();
 uint8_t centralCount();                   // any task
 void setNamePrefix(const char* prefix);
+// Service UUIDs to advertise (3.2): typeMask ∩ begin() mask, 0 = name only;
+// default all. GATT services stay. Applied by refreshAdvertising() or begin().
+void setAdvertisedTypes(uint8_t typeMask);
 void serverName(char* out, size_t len);   // "<prefix>-<chip id>", any task
 
 bool scanning();                          // any task

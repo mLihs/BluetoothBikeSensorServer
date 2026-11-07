@@ -238,5 +238,32 @@ inline bool parsePower(const uint8_t* data, size_t len, uint32_t nowMs, CrankSta
   return true;
 }
 
+// §6b relay while the CSC sensor is the cadence source: the packet without
+// Crank Revolution Data (flag bit 5 and its 4 bytes); every other byte,
+// trailing bytes included, unchanged. Returns the new length, or 0 without
+// bit 5, for a packet parsePower() rejects or when it does not fit `cap`;
+// `out` is then not written and the caller relays `in` unchanged.
+inline size_t stripPowerCrank(const uint8_t* in, size_t len, uint8_t* out, size_t cap) {
+  if (in == nullptr || out == nullptr || len < 4) return 0;
+  const uint16_t flags = readU16(in);
+  if (!(flags & kCpsCrank)) return 0;
+  size_t off = 4, crankOff = 0;
+  for (uint8_t bit = 0; bit < 12; ++bit) {
+    const uint8_t fieldLen = kCpsFieldLen[bit];
+    if (fieldLen == 0 || !(flags & (1u << bit))) continue;
+    if (len - off < fieldLen) return 0;
+    if (bit == 5) crankOff = off;
+    off += fieldLen;
+  }
+  const size_t crankLen = kCpsFieldLen[5];
+  if (len - crankLen > cap) return 0;
+  const uint16_t stripped = static_cast<uint16_t>(flags & ~kCpsCrank);
+  out[0] = static_cast<uint8_t>(stripped);
+  out[1] = static_cast<uint8_t>(stripped >> 8);
+  memcpy(out + 2, in + 2, crankOff - 2);
+  memcpy(out + crankOff, in + crankOff + crankLen, len - crankOff - crankLen);
+  return len - crankLen;
+}
+
 }  // namespace internal
 }  // namespace BikeSensor

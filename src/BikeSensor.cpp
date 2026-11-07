@@ -82,6 +82,7 @@ bool advertising() { return core.advertising(); }
 bool refreshAdvertising() { return core.refreshAdvertising(millis()); }
 uint8_t centralCount() { return core.centralCount(); }
 void setNamePrefix(const char* prefix) { core.setNamePrefix(prefix); }
+void setAdvertisedTypes(uint8_t typeMask) { core.setAdvertisedTypes(typeMask); }
 void serverName(char* out, size_t len) { core.serverName(out, len); }
 
 bool scanning() { return core.scanning(); }

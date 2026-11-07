@@ -242,26 +242,26 @@ class Core {
         return;
       default:  // IDLE, WAIT_SCAN, FOUND, STOPPING_FOR_CONNECT (its stop already set the scan OFF)
         clearSlot(s);
-        refreshCadenceSource();         // remove(CSC) hands back to Power here at once;
-                                        // from a link state when the slot reaches EMPTY
+        refreshCadenceSource();         // no source change (not SUBSCRIBED); from a
+                                        // link state the source follows when it leaves SUBSCRIBED
         return;
     }
   }
 
-  // §4 startServer(), device part: local services and advertising data for
-  // the enabled types. Advertising follows the desired state from the next
-  // update() on. False if the name and UUIDs do not fit (nothing is created
-  // then), the stack is not idle before the first server start (rev 28 guard;
-  // NimBLE asserts otherwise), the server or the advertising data cannot be
-  // set up, or end() has torn the stack down.
+  // §4 startServer(), device part: local services for the enabled types,
+  // advertising data for the advertised ones. Advertising follows the desired
+  // state from the next update() on. False if the name and UUIDs do not fit
+  // (nothing is created then), the stack is not idle before the first server
+  // start (rev 28 guard; NimBLE asserts otherwise), the server or the
+  // advertising data cannot be set up, or end() has torn the stack down.
   bool startServer() {
     char name[kServerNameSize];
     serverName(name, sizeof(name));
-    if (down_ || !advertisingFits(strlen(name), localTypes())) return false;
+    if (down_ || !advertisingFits(strlen(name), advertisedTypes())) return false;
     if (!gattStarted_ && !stackIdle()) return false;
     if (!port_.serverStart(localTypes())) return false;
     gattStarted_ = true;
-    if (!port_.advSetData(name, localTypes())) return false;
+    if (!port_.advSetData(name, advertisedTypes())) return false;
     serverStarted_ = true;
     return true;
   }
@@ -276,17 +276,23 @@ class Core {
     if (!serverStarted_ || quiesced_) return false;
     char name[kServerNameSize];
     serverName(name, sizeof(name));
-    if (!advertisingFits(strlen(name), localTypes())) return false;
+    if (!advertisingFits(strlen(name), advertisedTypes())) return false;
     if (port_.advActive()) {
       advHeld_ = false;                 // a start has succeeded since the failure
       port_.advStop();
     }
     // Unreachable after the budget check in NimBLE 2.5.2 (setName truncates
     // only past 29 bytes); if it happens, advertising restarts with partial data.
-    const bool dataOk = port_.advSetData(name, localTypes());
+    const bool dataOk = port_.advSetData(name, advertisedTypes());
     enforceAdvertising(now);
     return dataOk;
   }
+
+  // Service UUIDs in the advertising data: typeMask ∩ begin() mask ∩
+  // compiled; 0 = name only. The local services stay. Default 0xFF (all);
+  // kept across end()/begin(). Takes effect through refreshAdvertising() or
+  // the next begin().
+  void setAdvertisedTypes(uint8_t typeMask) { advRequested_ = typeMask; }
 
   // Takes effect through refreshAdvertising().
   void setNamePrefix(const char* prefix) {
@@ -488,7 +494,7 @@ class Core {
     if (!port_.stackReady()) setNamePrefix(deviceName);
     char name[kServerNameSize];
     serverName(name, sizeof(name));
-    if (!advertisingFits(strlen(name), localTypes(typeMask)) || !initStack(deviceName) ||
+    if (!advertisingFits(strlen(name), advertisedTypes(typeMask)) || !initStack(deviceName) ||
         !port_.open()) {
       return false;
     }
@@ -1079,23 +1085,33 @@ class Core {
     const SensorType type = s.type;
     if (type == SensorType::HEART_RATE) {
       if (heartRateCb_ != nullptr) heartRateCb_(value);
-    } else if (hasValue && currentCadenceSource() == CadenceSource::CSC &&
-               cadenceCb_ != nullptr) {
-      cadenceCb_(value);
+    } else if (hasValue && currentCadenceSource() == CadenceSource::CSC) {
+      cadenceArmed_ = value != 0;
+      if (cadenceCb_ != nullptr) cadenceCb_(value);
     }
     emit(EventType::DATA, type);
   }
 
   // §6, §6b. The stored sample carries cadence over packets without a crank
-  // event. Relay → power callback → cadence callback (Power source, new crank
-  // delta only) → DATA.
+  // event. Relay (without crank data while CSC is the source, so a central
+  // sees one cadence) → power callback → cadence callback (Power source, new
+  // crank delta only) → DATA.
   void onPowerNotify(uint8_t i, const Event& ev, uint32_t now) {
     SensorSlot& s = slots_[i];
     PowerSample sample = s.power;       // only this task writes it
     bool crankUpdated = false;
     const bool ok = parsePower(ev.notify.data, ev.notify.len, now, s.crank, sample, crankUpdated);
     if (!ok) stats_.notifiesMalformed++;
-    port_.relay(i, ev.notify.data, ev.notify.len);
+    uint8_t stripped[BBS_NOTIFY_MAX_LEN];
+    const size_t strippedLen =
+        currentCadenceSource() == CadenceSource::CSC
+            ? stripPowerCrank(ev.notify.data, ev.notify.len, stripped, sizeof(stripped))
+            : 0;
+    if (strippedLen > 0) {
+      port_.relay(i, stripped, static_cast<uint8_t>(strippedLen));
+    } else {
+      port_.relay(i, ev.notify.data, ev.notify.len);
+    }
     if (!ok) return;
     {
       MuxGuard guard(tableMux_);
@@ -1161,12 +1177,12 @@ class Core {
     return true;
   }
 
-  // §6b source rule (rev 31): a configured (non-EMPTY) CSC slot, CSC compiled
-  // and in the begin() mask, always wins; otherwise a SUBSCRIBED Power slot;
-  // otherwise none.
+  // §6b source rule (3.2.1): a SUBSCRIBED CSC slot, CSC compiled and in the
+  // begin() mask; otherwise a SUBSCRIBED Power slot; otherwise none. Every
+  // entry into and exit from SUBSCRIBED refreshes the source.
   CadenceSource currentCadenceSource() const {
     const int csc = enabledSlot(SensorType::SPEED_CADENCE);
-    if (csc >= 0 && slots_[csc].state != SlotState::EMPTY) return CadenceSource::CSC;
+    if (csc >= 0 && slots_[csc].state == SlotState::SUBSCRIBED) return CadenceSource::CSC;
     const int p = slotIndex(SensorType::POWER);
     if (p >= 0 && slots_[p].state == SlotState::SUBSCRIBED) return CadenceSource::POWER;
     return CadenceSource::NONE;
@@ -1179,13 +1195,16 @@ class Core {
     source_ = source;
   }
 
-  // §5.1 step 5, §6b: after non-zero Power cadence callbacks, one 0 when no
-  // crank event came for BBS_POWER_STALE_MS or the source left Power.
+  // §5.1 step 5, §6b: after a non-zero cadence callback (either source), one 0
+  // when the source is Power without a crank event for BBS_POWER_STALE_MS, or
+  // none. The CSC sensor reports its own 0s.
   void advanceCadence(uint32_t now) {
     refreshCadenceSource();
     if (!cadenceArmed_) return;
     const int p = slotIndex(SensorType::POWER);
-    if (p >= 0 && currentCadenceSource() == CadenceSource::POWER &&
+    const CadenceSource source = currentCadenceSource();
+    if (source == CadenceSource::CSC) return;
+    if (p >= 0 && source == CadenceSource::POWER &&
         now - slots_[p].crank.lastCrankEventMs <= BBS_POWER_STALE_MS) {
       return;
     }
@@ -1233,9 +1252,11 @@ class Core {
   }
 
   // begin() mask ∩ compiled; each has a local service, created once per
-  // begin() (rev 31), and its UUID in the advertising.
+  // begin() (rev 31); setAdvertisedTypes() picks which UUIDs are advertised.
   uint8_t localTypes() const { return localTypes(enabled_); }
   static uint8_t localTypes(uint8_t typeMask) { return typeMask & kCompiledMask; }
+  uint8_t advertisedTypes() const { return advertisedTypes(enabled_); }
+  uint8_t advertisedTypes(uint8_t typeMask) const { return localTypes(typeMask) & advRequested_; }
 
   // §5.4: the sensor's Feature without the bits that need a Control Point (CP
   // also the Sensor Location); a missing read gives the default. HR: no-op.
@@ -1600,9 +1621,10 @@ class Core {
   void (*cadenceCb_)(uint16_t) = nullptr;
   void (*powerCb_)(const PowerSample&) = nullptr;
   CadenceSource source_ = CadenceSource::NONE;     // under tableMux_; refreshCadenceSource()
-  bool cadenceArmed_ = false;           // §6b "once": a non-zero Power cadence callback since the last 0
+  bool cadenceArmed_ = false;           // §6b "once": the last cadence callback value was non-zero (either source)
   char prefix_[kNamePrefixMax + 1] = "homewind";   // under tableMux_
   uint8_t centralCount_ = 0;            // under tableMux_
+  uint8_t advRequested_ = 0xFF;         // setAdvertisedTypes()
   bool serverStarted_ = false;
   bool gattStarted_ = false;            // port_.serverStart() succeeded once
   bool advHeld_ = false;                // last advStart() failed (rev 28 hold)

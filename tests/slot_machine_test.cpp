@@ -3200,6 +3200,40 @@ static void testCadenceData() {
   assert(g_cadCalls == 2);
 }
 
+// §6b "once" for CSC: one 0 when a CSC sensor whose last reported cadence was
+// non-zero disconnects (source none, or a meter without fresh crank data);
+// none after a reported 0.
+static void testCadenceZeroOnCscLoss() {
+  Rig r;
+  r.core->setCadenceCallback(onCadence);
+  resetValues(r);
+  cscToSubscribed(r);
+  assert(notifyEv(r, kCscFirst, sizeof(kCscFirst), kCsc));
+  assert(notifyEv(r, kCsc60, sizeof(kCsc60), kCsc));
+  r.update();
+  assert(g_cadCalls == 1 && g_cadValues[0] == 60);
+  r.at(r.now + BBS_POWER_STALE_MS + 1);                // CSC source: no timed 0
+  assert(g_cadCalls == 1);
+  r.discEv(r.cscGen(), 0x08, kCsc);
+  r.update();
+  assert(g_cadCalls == 2 && g_cadValues[1] == 0);
+  r.at(r.now + BBS_POWER_STALE_MS + 1);
+  assert(g_cadCalls == 2);
+
+  r.connectedEv(r.cscGen(), kCsc);                     // direct attempt
+  r.update();
+  assert(r.cscState() == SlotState::SUBSCRIBED);
+  const uint8_t first[] = {0x02, 20, 0, 0x00, 0x10};
+  const uint8_t still[] = {0x02, 20, 0, 0x00, 0x14};   // no new crank event: CSC reports 0
+  assert(notifyEv(r, first, sizeof(first), kCsc));
+  assert(notifyEv(r, still, sizeof(still), kCsc));
+  r.update();
+  assert(g_cadCalls == 3 && g_cadValues[2] == 0);
+  r.discEv(r.cscGen(), 0x08, kCsc);                    // last value 0: no second 0
+  r.update();
+  assert(g_cadCalls == 3);
+}
+
 static uint16_t g_getterValue = 0;
 static bool g_getterOk = false;
 static Core* g_getterCore = nullptr;
@@ -3823,32 +3857,99 @@ static void testCadenceSource() {
     assert(crankEv(r, 11, 2048));
     r.update();
     assert(g_cadCalls == 1 && r.core->lastCadence(rpm, age, r.now) && rpm == 60);
-    r.addCsc();                                        // a configured CSC wins at once
-    assert(!r.core->providesCadence() && !r.core->lastCadence(rpm, age, r.now));
-    assert(crankEv(r, 12, 3072));                      // Power data, no cadence callback
+    r.addCsc();                                        // configured, not SUBSCRIBED: Power stays
     r.update();
-    assert(g_cadCalls == 2 && g_cadValues[1] == 0);    // the 0 for the source leaving Power
-    BikeSensor::PowerSample s{};
-    assert(r.core->lastPower(s, age, r.now) && s.hasCadence && s.cadence == 60);
-    assert(r.cscState() == SlotState::WAIT_SCAN && r.port.relays[kCsc] == 0);
-    r.core->remove(SensorType::SPEED_CADENCE, r.now);  // back to Power at once
+    assert(r.cscState() == SlotState::WAIT_SCAN);
     assert(r.core->providesCadence() && r.core->lastCadence(rpm, age, r.now) && rpm == 60);
+    assert(crankEv(r, 12, 3072));
     r.update();
-    assert(g_cadCalls == 2);                           // no 0: nothing armed
+    assert(g_cadCalls == 2 && g_cadValues[1] == 60);
+    r.core->remove(SensorType::SPEED_CADENCE, r.now);  // no source change
+    assert(r.core->providesCadence());
+    r.update();
+    assert(g_cadCalls == 2);
 
     r.now += BBS_SLEEP_SCAN_DURATION_MS + BBS_SLEEP_SCAN_INTERVAL_MS;   // next sleep window
-    cscToSubscribed(r);                                // CSC and Power SUBSCRIBED: CSC
-    assert(!r.core->providesCadence());
-    assert(crankEv(r, 13, 4096));
+    r.update();                                        // stale: one 0
+    assert(g_cadCalls == 3 && g_cadValues[2] == 0);
+    assert(crankEv(r, 13, 4096));                      // armed again
+    r.update();
+    assert(g_cadCalls == 4 && g_cadValues[3] == 60);
+    cscToSubscribed(r);                                // CSC and Power SUBSCRIBED: CSC at once
+    assert(!r.core->providesCadence() && !r.core->lastCadence(rpm, age, r.now));
+    r.update();
+    assert(g_cadCalls == 4);                           // handover to CSC: no 0
+    assert(crankEv(r, 14, 5120));                      // Power data, no cadence callback
+    assert(notifyEv(r, kCscFirst, sizeof(kCscFirst), kCsc));   // fresh crank state: no value
+    r.update();
+    assert(g_cadCalls == 4 && !r.core->lastCadence(rpm, age, r.now));
+    assert(notifyEv(r, kCsc60, sizeof(kCsc60), kCsc));
+    r.update();
+    assert(g_cadCalls == 5 && g_cadValues[4] == 60 && r.port.relays[kCsc] == 2);
+    assert(r.core->lastCadence(rpm, age, r.now) && rpm == 60);
+    r.at(r.now + BBS_POWER_STALE_MS + 1);              // CSC source: no Power stale 0
+    assert(g_cadCalls == 5);
+
+    r.discEv(r.cscGen(), 0x08, kCsc);                  // CSC link lost: Power at once
+    r.update();
+    assert(r.cscState() != SlotState::SUBSCRIBED && r.core->providesCadence());
+    assert(providesAt(EventType::SENSOR_DISCONNECTED, SensorType::SPEED_CADENCE) == 1);
+    assert(r.core->lastCadence(rpm, age, r.now) && rpm == 0);   // the meter's, stale
+    assert(g_cadCalls == 6 && g_cadValues[5] == 0);    // CSC 60, stale meter: one 0
+    r.at(r.now + BBS_POWER_STALE_MS + 1);
+    assert(g_cadCalls == 6);
+    assert(crankEv(r, 15, 6144));                      // meter crank state kept: a real delta
+    r.update();
+    assert(g_cadCalls == 7 && g_cadValues[6] == 60);
+    assert(r.core->lastCadence(rpm, age, r.now) && rpm == 60 && age == 0);
+
+    assert(r.cscState() == SlotState::CONNECTING);     // direct attempt
+    r.connectedEv(r.cscGen(), kCsc);
+    r.update();                                        // CSC again: no 0
+    assert(r.cscState() == SlotState::SUBSCRIBED && !r.core->providesCadence());
+    assert(g_cadCalls == 7 && !r.core->lastCadence(rpm, age, r.now));
+    assert(notifyEv(r, kCsc60, sizeof(kCsc60), kCsc)); // crank reset on the new link: no value
+    r.update();
+    assert(g_cadCalls == 7 && !r.core->lastCadence(rpm, age, r.now));
+    r.discEv(r.core->attemptGen(kPowerSlot), 0x08, kPowerSlot);   // Power gone: CSC stays
+    r.update();
+    assert(!r.core->providesCadence() && g_cadCalls == 7);
+  }
+  {
+    Rig r;                                             // CSC 60 → CSC lost → meter without crank data
+    resetValues(r);
+    r.core->setCadenceCallback(onCadence);
+    powerToSubscribed(r);
+    r.now += BBS_SLEEP_SCAN_DURATION_MS + BBS_SLEEP_SCAN_INTERVAL_MS;
+    cscToSubscribed(r);
+    assert(notifyEv(r, kCscFirst, sizeof(kCscFirst), kCsc));
+    assert(notifyEv(r, kCsc60, sizeof(kCsc60), kCsc));
+    assert(notifyEv(r, kCpsPlain, sizeof(kCpsPlain), kPowerSlot));
+    r.update();
+    assert(g_cadCalls == 1 && g_cadValues[0] == 60);
+    r.discEv(r.cscGen(), 0x08, kCsc);
+    r.update();
+    assert(r.core->providesCadence() && !r.core->lastCadence(rpm, age, r.now));
+    assert(g_cadCalls == 2 && g_cadValues[1] == 0);    // exactly one 0
+    assert(notifyEv(r, kCpsPlain, sizeof(kCpsPlain), kPowerSlot));
+    r.at(r.now + BBS_POWER_STALE_MS + 1);
+    assert(g_cadCalls == 2);
+  }
+  {
+    Rig r;                                             // CSC only: CSC while SUBSCRIBED, else none
+    resetValues(r);
+    r.core->setCadenceCallback(onCadence);
+    cscToSubscribed(r);
     assert(notifyEv(r, kCscFirst, sizeof(kCscFirst), kCsc));
     assert(notifyEv(r, kCsc60, sizeof(kCsc60), kCsc));
     r.update();
-    assert(g_cadCalls == 3 && g_cadValues[2] == 60 && r.port.relays[kCsc] == 2);
-    assert(r.core->lastCadence(rpm, age, r.now) && rpm == 60);
-    r.discEv(r.cscGen(), 0x08, kCsc);                  // reconnecting CSC still wins
+    assert(g_cadCalls == 1 && r.core->lastCadence(rpm, age, r.now) && rpm == 60);
+    r.discEv(r.cscGen(), 0x08, kCsc);
     r.update();
-    assert(r.cscState() != SlotState::SUBSCRIBED && !r.core->providesCadence());
-    assert(!r.core->lastCadence(rpm, age, r.now));
+    assert(!r.core->providesCadence() && !r.core->lastCadence(rpm, age, r.now));
+    assert(g_cadCalls == 2 && g_cadValues[1] == 0);    // source none: one 0
+    r.at(r.now + BBS_POWER_STALE_MS + 1);
+    assert(g_cadCalls == 2);
   }
   {
     // CSC not in the begin() mask; also CSC not compiled (enabled_ is mask ∩
@@ -3876,7 +3977,8 @@ static void testCadenceSource() {
     assert(providesAt(EventType::SENSOR_CONNECTED, SensorType::POWER) == 1);
     r.now += BBS_SLEEP_SCAN_DURATION_MS + BBS_SLEEP_SCAN_INTERVAL_MS;
     cscToSubscribed(r);
-    r.core->remove(SensorType::SPEED_CADENCE, r.now);  // from SUBSCRIBED: CSC until EMPTY
+    assert(providesAt(EventType::SENSOR_CONNECTED, SensorType::SPEED_CADENCE) == 0);
+    r.core->remove(SensorType::SPEED_CADENCE, r.now);  // from SUBSCRIBED: CSC until the link ends
     assert(!r.core->providesCadence());
     r.discEv(r.cscGen(), 0x16, kCsc);
     r.update();
@@ -3886,6 +3988,55 @@ static void testCadenceSource() {
     r.update();
     assert(providesAt(EventType::SENSOR_DISCONNECTED, SensorType::POWER) == 0);
   }
+}
+
+// §6b relay: without crank data only while CSC is the source; packets without
+// crank data and malformed ones stay raw; the library still parses them all.
+static void testPowerRelayStrip() {
+  Rig r;
+  const auto relayed = [&r](const uint8_t* data, size_t len) {
+    return r.port.relayLen == len && memcmp(r.port.relayData, data, len) == 0;
+  };
+  // Balance, crank (revs 10 @ 1 s), energy: flags 0x0821, 300 W.
+  const uint8_t full[] = {0x21, 0x08, 0x2C, 0x01, 100, 10, 0, 0x00, 0x04, 0x34, 0x12};
+  const uint8_t fullStripped[] = {0x01, 0x08, 0x2C, 0x01, 100, 0x34, 0x12};
+  const uint8_t bad[] = {0x20, 0x00, 100, 0, 10, 0, 0x00};   // crank field cut by one byte
+  powerToSubscribed(r);
+  assert(notifyEv(r, full, sizeof(full), kPowerSlot));       // Power is the source: raw
+  r.update();
+  assert(relayed(full, sizeof(full)));
+  r.addCsc();                                                // configured only: raw
+  assert(notifyEv(r, full, sizeof(full), kPowerSlot));
+  r.update();
+  assert(r.cscState() == SlotState::WAIT_SCAN && relayed(full, sizeof(full)));
+
+  r.now += BBS_SLEEP_SCAN_DURATION_MS + BBS_SLEEP_SCAN_INTERVAL_MS;
+  r.update();
+  r.match(r.core->scan().epoch(), kCscMac);
+  r.update();
+  r.connectedEv(r.cscGen(), kCsc);
+  r.update();
+  assert(r.cscState() == SlotState::SUBSCRIBED);
+  assert(notifyEv(r, full, sizeof(full), kPowerSlot));       // CSC is the source: stripped
+  r.update();
+  assert(relayed(fullStripped, sizeof(fullStripped)));
+  BikeSensor::PowerSample s{};
+  uint32_t age = 0;
+  assert(r.core->lastPower(s, age, r.now) && s.flags == 0x0821 && s.balance == 100);
+  assert(s.energyKJ == 0x1234 && r.core->slot(kPowerSlot).crank.crankValid);
+  assert(notifyEv(r, kCpsPlain, sizeof(kCpsPlain), kPowerSlot));
+  r.update();
+  assert(relayed(kCpsPlain, sizeof(kCpsPlain)));
+  assert(notifyEv(r, bad, sizeof(bad), kPowerSlot));
+  r.update();
+  assert(relayed(bad, sizeof(bad)) && r.core->stats().notifiesMalformed == 1);
+  assert(r.port.relays[kPowerSlot] == 5 && r.port.relays[kCsc] == 0);
+
+  r.discEv(r.cscGen(), 0x08, kCsc);                          // back to Power: raw again
+  r.update();
+  assert(notifyEv(r, full, sizeof(full), kPowerSlot));
+  r.update();
+  assert(relayed(full, sizeof(full)) && r.port.relays[kPowerSlot] == 6);
 }
 
 // Getters: stale rule at the caller's now, now read before update(), ages.
@@ -4113,6 +4264,131 @@ static void testRefreshAdvertising() {
   r.port.advOn = true;
   assert(r.core->refreshAdvertising(r.now));
   assert(r.port.advOn && r.port.advStarts == 7 && r.port.advStops == 2);
+}
+
+// 3.2: setAdvertisedTypes() changes only the UUID list, through refreshAdvertising().
+static void testAdvertisedTypes() {
+  const uint8_t local = bs::kCompiledMask;             // begin() mask 0x07 ∩ compiled
+  {
+    Rig r;                                             // default: the begin() mask
+    assert(r.core->startServer());
+    assert(r.port.serverMask == local && r.port.advMask == local);
+  }
+  {
+    Rig r;                                             // set before the server start
+    r.core->setAdvertisedTypes(0x01);
+    assert(r.core->startServer());
+    assert(r.port.serverMask == local && r.port.advMask == 0x01);
+    r.update();
+    assert(r.port.advOn && r.port.advStarts == 1);
+
+    r.core->setAdvertisedTypes(0x02);                  // only through refreshAdvertising()
+    r.update();
+    assert(r.port.advMask == 0x01 && r.port.advDataSets == 1);
+    assert(r.core->refreshAdvertising(r.now));
+    assert(r.port.advMask == 0x02 && r.port.advDataSets == 2 && !r.port.advOnAtDataSet);
+    assert(r.port.advOn && r.port.advStarts == 2 && r.port.advStops == 1);
+    assert(r.port.serverStarts == 1 && r.port.serverMask == local);   // services stay
+    assert(strcmp(r.port.advName, "homewind-da4eb580") == 0);
+
+    r.core->setAdvertisedTypes(0x00);                  // name only, still advertising
+    assert(r.core->refreshAdvertising(r.now));
+    assert(r.port.advMask == 0x00 && r.port.advOn && r.port.advStarts == 3);
+
+    r.core->setAdvertisedTypes(0x04);                  // CPS: only if compiled
+    assert(r.core->refreshAdvertising(r.now));
+    assert(r.port.advMask == (local & 0x04));
+
+    r.core->setAdvertisedTypes(0xFF);                  // back to all
+    assert(r.core->refreshAdvertising(r.now));
+    assert(r.port.advMask == local);
+
+    r.core->pause();                                   // paused: applied, not restarted
+    const int starts = r.port.advStarts;
+    r.core->setAdvertisedTypes(0x01);
+    assert(r.core->refreshAdvertising(r.now));
+    assert(r.port.advMask == 0x01 && !r.port.advOn && r.port.advStarts == starts);
+    r.update();
+    assert(!r.port.advOn);
+    r.core->resume();
+    r.update();
+    assert(r.port.advOn && r.port.advStarts == starts + 1 && r.port.advMask == 0x01);
+
+    r.core->quiesce(r.now);                            // quiesced: not applied
+    const int sets = r.port.advDataSets;
+    r.core->setAdvertisedTypes(0x02);
+    assert(!r.core->refreshAdvertising(r.now));
+    assert(r.port.advDataSets == sets && r.port.advMask == 0x01 && !r.port.advOn);
+  }
+  {
+    Rig r(Mode::MAC, 0x01);                            // bits outside the begin() mask ignored
+    r.core->setAdvertisedTypes(0xFF);
+    assert(r.core->startServer() && r.port.advMask == 0x01);
+    r.core->setAdvertisedTypes(0x06);
+    assert(r.core->refreshAdvertising(r.now) && r.port.advMask == 0x00);
+    r.core->setAdvertisedTypes(0xF3);
+    assert(r.core->refreshAdvertising(r.now) && r.port.advMask == 0x01);
+    assert(r.port.serverMask == 0x01 && r.port.serverStarts == 1);
+  }
+  {
+    Rig r;                                             // kept across end() + begin()
+    r.core->setAdvertisedTypes(0x02);
+    assert(r.core->begin("homewind", 0x07, Mode::MAC) && r.port.advMask == 0x02);
+    assert(r.port.serverMask == local);
+    r.port.clock = r.now;
+    assert(r.core->end());
+    assert(r.core->begin("homewind", 0x03, Mode::MAC) && r.port.advMask == 0x02);
+  }
+  {
+    Rig r;                                             // refresh before the first update(): starts at once
+    assert(r.core->begin("homewind", 0x07, Mode::MAC) && !r.port.advOn && r.port.advStarts == 0);
+    r.core->setAdvertisedTypes(0x01);
+    assert(r.core->refreshAdvertising(r.now));
+    assert(r.port.advOn && r.port.advStarts == 1 && r.port.advMask == 0x01);
+    assert(r.port.advDataSets == 2 && r.port.advStops == 0);
+    r.update();
+    assert(r.port.advStarts == 1 && r.port.advMask == 0x01);
+  }
+}
+
+// §5.4 budget for the advertised UUIDs: 3 + (2 + prefix + 9) + (2 + 2n) ≤ 31, n = 0 without a list.
+static void testAdvertisedTypesBudget() {
+  struct Case { uint8_t advertised; const char* fits; const char* tooLong; };
+  const Case cases[] = {
+      {0x03, "abcdefghijk", "abcdefghijkl"},           // 2 UUIDs: 11 / 12
+      {0x02, "abcdefghijklm", "abcdefghijklmn"},       // 1 UUID: 13 / 14
+      {0x00, "abcdefghijklmnopq", "abcdefghijklmnopqr"},   // name only: 17 / 18
+#if BBS_COMPILE_POWER
+      {0x07, "abcdefghi", "abcdefghij"},               // 3 UUIDs: 9 / 10
+#endif
+  };
+  for (const Case& c : cases) {
+    Rig ok;
+    ok.core->setAdvertisedTypes(c.advertised);
+    ok.core->setNamePrefix(c.fits);
+    assert(ok.core->startServer() && ok.port.advMask == c.advertised);
+    assert(ok.port.serverMask == bs::kCompiledMask);
+
+    Rig bad;
+    bad.core->setAdvertisedTypes(c.advertised);
+    bad.core->setNamePrefix(c.tooLong);
+    assert(!bad.core->startServer());
+    assert(bad.port.serverStarts == 0 && bad.port.advDataSets == 0);
+  }
+
+  Rig r(Mode::MAC, 0x03);                              // a longer prefix fits one UUID only
+  r.core->setNamePrefix("abcdefghijklm");
+  assert(!r.core->startServer() && r.port.serverStarts == 0);
+  r.core->setAdvertisedTypes(0x01);
+  assert(r.core->startServer() && r.port.advMask == 0x01 && r.port.serverMask == 0x03);
+  r.update();
+  assert(r.port.advOn && r.port.advStarts == 1);
+  r.core->setAdvertisedTypes(0x03);                    // does not fit: old data stays on air
+  assert(!r.core->refreshAdvertising(r.now));
+  assert(r.port.advMask == 0x01 && r.port.advDataSets == 1);
+  assert(r.port.advOn && r.port.advStops == 0 && r.port.advStarts == 1);
+  r.core->setAdvertisedTypes(0x02);
+  assert(r.core->refreshAdvertising(r.now) && r.port.advMask == 0x02 && r.port.advDataSets == 2);
 }
 
 // ---- Discovery (§3.3, §5.3) ----
@@ -6184,12 +6460,15 @@ int main() {
   testAddOutsideMask();
   testHeartRateData();
   testCadenceData();
+  testCadenceZeroOnCscLoss();
   testHeartRateGetter();
   testCadenceGetter();
   testServerTypes();
   testAdvertisingBudget();
   testServerName();
   testRefreshAdvertising();
+  testAdvertisedTypes();
+  testAdvertisedTypesBudget();
   testDataCallbackReentrancy();
   testRefreshFromEventCallback();
   testLinkLossClearsMeasurement();
@@ -6199,6 +6478,7 @@ int main() {
   testPowerFeatureCopy();
   testPowerCadenceCallback();
   testCadenceSource();
+  testPowerRelayStrip();
   testPowerGetters();
   testPowerDuplicates();
   testPowerEncrypted();

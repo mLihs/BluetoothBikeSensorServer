@@ -508,6 +508,75 @@ static void testPowerResetAfterDisconnect() {
   assert(parsePower(p.d, p.n, 3500, crank, s) && s.hasCadence && s.cadence == 60);
 }
 
+// §6b relay: crank data (bit 5, 4 bytes) removed, everything else unchanged.
+static void testStripPowerCrank() {
+  uint8_t out[64];
+  const auto untouched = [&out] {
+    for (uint8_t b : out) {
+      if (b != 0xEE) return false;
+    }
+    return true;
+  };
+
+  // Crank only.
+  Buf a = powerCrank(500, 2048, 150);
+  memset(out, 0xEE, sizeof(out));
+  assert(bs::stripPowerCrank(a.d, a.n, out, sizeof(out)) == 4);
+  const uint8_t aOut[] = {0x00, 0x00, 150, 0};
+  assert(memcmp(out, aOut, sizeof(aOut)) == 0 && out[4] == 0xEE);
+
+  // After balance, torque and wheel, before force and energy; reference bits
+  // 1 and 3, reserved bits and a trailing byte are kept.
+  const uint16_t flags = 0xF87F;   // bits 0-6, 11, 12-15
+  Buf b = powerBase(flags, 280);
+  b.u8(55).fill(0xA2, 2).fill(0xA4, 6).u16(77).u16(9000).fill(0xA6, 4).u16(4321).u8(0x99);
+  Buf e = powerBase(static_cast<uint16_t>(flags & ~(1u << 5)), 280);
+  e.u8(55).fill(0xA2, 2).fill(0xA4, 6).fill(0xA6, 4).u16(4321).u8(0x99);
+  memset(out, 0xEE, sizeof(out));
+  assert(bs::stripPowerCrank(b.d, b.n, out, sizeof(out)) == e.n);
+  assert(memcmp(out, e.d, e.n) == 0 && out[e.n] == 0xEE);
+  CrankState c1{}, c2{};
+  PowerSample s1{}, s2{};
+  assert(parsePower(b.d, b.n, 0, c1, s1) && parsePower(out, e.n, 0, c2, s2));
+  assert(s2.watts == 280 && s2.balance == 55 && s2.balanceIsLeft && s2.energyKJ == 4321);
+  assert(c1.crankValid && !c2.crankValid && s2.flags == static_cast<uint16_t>(flags & ~(1u << 5)));
+
+  // All optional fields: 34 → 30 bytes, crank at offset 13.
+  Buf f = powerBase(0x0FFF, 321);
+  f.u8(60).fill(0xB1, 2).fill(0xB2, 6).u16(500).u16(2048).fill(0xB3, 4).fill(0xB4, 4)
+      .fill(0xB5, 3).fill(0xB6, 2).fill(0xB7, 2).u16(4321);
+  assert(f.n == 34);
+  memset(out, 0xEE, sizeof(out));
+  assert(bs::stripPowerCrank(f.d, f.n, out, sizeof(out)) == 30);
+  assert(out[0] == 0xDF && out[1] == 0x0F && memcmp(out + 2, f.d + 2, 11) == 0);
+  assert(memcmp(out + 13, f.d + 17, 17) == 0 && out[30] == 0xEE);
+
+  // No crank data: nothing to strip.
+  Buf n = powerBase(0x0811, 100);
+  n.u8(50).fill(0xC4, 6).u16(12);
+  memset(out, 0xEE, sizeof(out));
+  assert(bs::stripPowerCrank(n.d, n.n, out, sizeof(out)) == 0 && untouched());
+  const Buf plain = powerBase(0, 100);
+  assert(bs::stripPowerCrank(plain.d, plain.n, out, sizeof(out)) == 0 && untouched());
+
+  // Too short: every cut of the full packet is rejected, as by parsePower.
+  for (size_t len = 0; len < f.n; ++len) {
+    CrankState c{};
+    PowerSample s{};
+    assert(!parsePower(f.d, len, 0, c, s));
+    assert(bs::stripPowerCrank(f.d, len, out, sizeof(out)) == 0 && untouched());
+  }
+  Buf cut = powerBase(static_cast<uint16_t>((1u << 5) | (1u << 11)), 1);
+  cut.u16(501).u16(3072).u8(0x01);   // energy cut after a complete crank field
+  assert(bs::stripPowerCrank(cut.d, cut.n, out, sizeof(out)) == 0 && untouched());
+
+  // nullptr and a too small out buffer.
+  assert(bs::stripPowerCrank(nullptr, a.n, out, sizeof(out)) == 0);
+  assert(bs::stripPowerCrank(a.d, a.n, nullptr, sizeof(out)) == 0 && untouched());
+  assert(bs::stripPowerCrank(f.d, f.n, out, 29) == 0 && untouched());
+  assert(bs::stripPowerCrank(f.d, f.n, out, 30) == 30);
+}
+
 int main() {
   testAdNameAndUuids();
   testAdMalformed();
@@ -521,5 +590,6 @@ int main() {
   testPowerCadence();
   testPowerStale();
   testPowerResetAfterDisconnect();
+  testStripPowerCrank();
   return 0;
 }

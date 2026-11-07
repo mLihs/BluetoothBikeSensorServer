@@ -2,10 +2,10 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Version**: 3.1.0
+**Version**: 3.2.1
 **Platform**: ESP32 (Arduino Core 3.x)
 **Author**: Martin Lihs
-**Last Updated**: 2026-11-06
+**Last Updated**: 2026-11-07
 
 > **3.0 is a new major version.** The 2.x functions (`BluetoothBikeSensorServer*`, `BikeSensorServer*`), `BLETelemetry` and `HomewindBleIdentity` are gone; there is no compatibility layer. See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
@@ -19,7 +19,7 @@ BluetoothBikeSensorServer connects an ESP32 to BLE fitness sensors (Heart Rate `
 - No `delay()` in the library, non-blocking connects, no heap churn while scanning.
 - MAC mode (a 5 s sleep scan every 30 s until the MAC is seen; after a drop one direct attempt first) or NAME mode (10 s scan windows until the name is seen).
 - Discovery with name, MAC, address type and advertised types.
-- HR, CSC cadence and Power (watts, cadence, pedal balance, energy) as callbacks and getters; cadence from the power meter when no CSC sensor is configured.
+- HR, CSC cadence and Power (watts, cadence, pedal balance, energy) as callbacks and getters; cadence from the power meter while no CSC sensor is connected.
 - One-way `quiesce()` for OTA and maintenance.
 
 ## Requirements
@@ -128,13 +128,15 @@ Discovery also works while the server is paused.
 | Function | Notes |
 |---|---|
 | `setHeartRateCallback(void (*)(uint16_t bpm))` | Every HR packet. |
-| `setCadenceCallback(void (*)(uint16_t rpm))` | Only packets that report a cadence. |
+| `setCadenceCallback(void (*)(uint16_t rpm))` | Packets that report a cadence, plus one 0 when the cadence stops (cadence source below). |
 | `setPowerCallback(void (*)(const PowerSample&))` | Every valid CPS packet (needs `BBS_COMPILE_POWER=1`). |
 | `bool lastHeartRate(uint16_t&, uint32_t& ageMs)`, `bool lastCadence(...)`, `bool lastPower(PowerSample&, uint32_t& ageMs)` | False while the sensor is not connected or has not delivered yet. `ageMs` = age of the packet that produced the value. |
 
 CSC speed is not reported (raw CSC packets are still relayed). `PowerSample`: `watts`, `cadence` (0 when stale: no crank event for `BBS_POWER_STALE_MS`, 3 s), `hasCadence`, `balance` (½ %, 0xFF = none), `balanceIsLeft`, `energyKJ`/`hasEnergy`, raw `flags`.
 
-**Cadence source.** A configured CSC sensor (connected or not) is the cadence source. Without one, a connected power meter is; `info(POWER).providesCadence` then is true and the cadence callback reports 0 once after the meter stops sending crank data. A CSC sensor that is configured but left at home means no cadence until it is removed. Nothing is synthesized onto the local CSC service: pair the app's cadence to the relayed power service, which carries the meter's crank data.
+**Cadence source** (3.2.1). A connected CSC sensor (`connected(SPEED_CADENCE)`) is the cadence source. Otherwise a connected power meter is (`info(POWER).providesCadence` is then true). Otherwise there is none. The source changes as soon as the CSC sensor connects or disconnects (for example when it sleeps): from the power meter to the CSC sensor without a 0 in between (`lastCadence()` is false until the CSC sensor's second crank packet), back to the power meter with its current cadence. After a non-zero value the cadence callback reports one 0 when the cadence stops: the CSC sensor reports its own 0s; otherwise when the power meter is the source and sent no crank event for `BBS_POWER_STALE_MS`, or the source is none. So a CSC sensor whose last value was non-zero also gets one 0 when it disconnects, unless the power meter takes over with fresh crank data. While the CSC sensor is the source, the relayed Cycling Power Measurement is sent without its crank revolution data (flag bit 5 and its 4 bytes; all other bytes unchanged; a malformed packet is relayed as received), so a central such as Zwift sees one cadence; otherwise it is relayed as received, crank data included. The local CP Feature keeps the meter's value. Nothing is synthesized onto the local CSC service.
+
+Pairing: with a CSC sensor set up, pair the app's cadence to the relay's CSC service. The power service carries cadence only while the CSC sensor is not connected.
 
 ### Events
 
@@ -160,10 +162,13 @@ CSC speed is not reported (raw CSC packets are still relayed). `PowerSample`: `w
 | `bool advertising()` | NimBLE advertising is active. |
 | `void pause()` / `void resume()` | Advertising only; scans, connects and discovery go on. |
 | `void setNamePrefix(const char*)` + `bool refreshAdvertising()` | New prefix (lowercase, `[a-z0-9-]`), applied by the refresh. |
+| `void setAdvertisedTypes(uint8_t typeMask)` + `bool refreshAdvertising()` | 3.2: service UUIDs to advertise, cut to the `begin()` mask; `0` = name only; default all. Applied by the refresh (or the next `begin()`), kept across `end()` + `begin()`. |
 | `void serverName(char* out, size_t len)` | `"<prefix>-<chip id>"`. |
 | `uint8_t centralCount()` | Connected centrals. |
 
-The server has one service per type in the `begin()` mask: HR `0x2A37`; CSC `0x2A5B` + Feature `0x2A5C`; CPS `0x2A63` + Feature `0x2A65` + Sensor Location `0x2A5D`. Advertising carries the flags, the name and the service UUIDs in 31 bytes, so the prefix may be at most 13 bytes with one type, 11 with two, 9 with three (`"homewind"` fits). If it does not fit, `refreshAdvertising()` returns false and the old name stays on air, while `serverName()` already returns the new one.
+The server has one service per type in the `begin()` mask: HR `0x2A37`; CSC `0x2A5B` + Feature `0x2A5C`; CPS `0x2A63` + Feature `0x2A65` + Sensor Location `0x2A5D`. Advertising carries the flags, the name and the service UUIDs in 31 bytes, so the prefix may be at most 13 bytes with one advertised type, 11 with two, 9 with three, 17 with none (`"homewind"` fits). If it does not fit, `refreshAdvertising()` returns false and the old name and UUIDs stay on air, while `serverName()` already returns the new one.
+
+`setAdvertisedTypes()` changes only the advertised UUID list: every service of the `begin()` mask stays registered and relays, so a central that connects by address or already knows the device still finds it. Use it to advertise only the types that have a sensor (apps such as Zwift offer the device as a source for each advertised service). `refreshAdvertising()` starts advertising at once if it is desired (not paused) and no start backoff holds it, also before the first `update()` after `begin()`; otherwise advertising follows from the next `update()` on. While paused it applies the new data and advertising stays off until `resume()`; a central that is scanning may only see the change after it scans again.
 
 - CSC Feature and CP Feature/Location take the sensor's values after it connects, without the bits that need a control point; CSC keeps bit 0 (wheel data) because raw packets are relayed although there is no SC Control Point. A central that read Feature before the sensor connected keeps the old value until it reads again.
 - The library does not pair, bond or manage bonds. NimBLE pairs on demand (Just Works, no bonding) when a sensor requires encryption; such a sensor pairs again on every connect.
@@ -216,6 +221,10 @@ Set with `-D` (e.g. a sketch `build_opt.h` on core 3.x, which also reaches libra
 | `BBS_SCAN_END_GRACE_MS` | 3000 |
 | `BBS_CAPACITY_RETRY_MS` | 60000 |
 | `BBS_EVENT_QUEUE_DEPTH`, `BBS_NOTIFY_MAX_LEN` | 24, 36 |
+
+## Host tests
+
+From the library folder (silent on success): `for p in 0 1; do for t in codec_test event_queue_test slot_machine_test; do c++ -std=c++17 -Wall -Wextra -Werror -pthread -DBBS_COMPILE_POWER=$p -Isrc/internal tests/$t.cpp -o /tmp/$t && /tmp/$t || echo "FAIL $t $p"; done; done`
 
 ## License
 
