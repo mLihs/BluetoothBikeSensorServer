@@ -4,7 +4,7 @@
 
 **Version**: 3.2.1
 **Platform**: ESP32 (Arduino Core 3.x)
-**Author**: Martin Lihs
+**Author**: Martin Lihs  
 **Last Updated**: 2026-11-07
 
 > **3.0 is a new major version.** The 2.x functions (`BluetoothBikeSensorServer*`, `BikeSensorServer*`), `BLETelemetry` and `HomewindBleIdentity` are gone; there is no compatibility layer. See [CHANGELOG.md](CHANGELOG.md) for the full list.
@@ -127,7 +127,7 @@ Discovery also works while the server is paused.
 
 | Function | Notes |
 |---|---|
-| `setHeartRateCallback(void (*)(uint16_t bpm))` | Every HR packet. |
+| `setHeartRateCallback(void (*)(uint16_t bpm))` | Every HR packet from the sensor (no synthetic 0 on disconnect). |
 | `setCadenceCallback(void (*)(uint16_t rpm))` | Packets that report a cadence, plus one 0 when the cadence stops (cadence source below). |
 | `setPowerCallback(void (*)(const PowerSample&))` | Every valid CPS packet (needs `BBS_COMPILE_POWER=1`). |
 | `bool lastHeartRate(uint16_t&, uint32_t& ageMs)`, `bool lastCadence(...)`, `bool lastPower(PowerSample&, uint32_t& ageMs)` | False while the sensor is not connected or has not delivered yet. `ageMs` = age of the packet that produced the value. |
@@ -145,7 +145,7 @@ Pairing: with a CSC sensor set up, pair the app's cadence to the relay's CSC ser
 | Event | Fields |
 |---|---|
 | `SENSOR_FOUND` | scan found the configured sensor |
-| `SENSOR_CONNECTED` / `SENSOR_DISCONNECTED` | subscribed / link ended; `reason` = NimBLE disconnect reason (0 if the library found the link gone) |
+| `SENSOR_CONNECTED` / `SENSOR_DISCONNECTED` | subscribed / link ended; `reason` = NimBLE disconnect reason (0 if the library found the link gone). On HR disconnect the relay also notifies centrals once with 0 bpm so apps do not keep the last value. |
 | `SENSOR_FAILED` | attempt failed, backoff 1 s → 30 s; `reason` 0, or the NimBLE host return code `6`, `0x207` or `0x209` of a capacity wait (below) — not a disconnect reason |
 | `DATA` | a parsed packet from a sensor |
 | `DISCOVERY_DONE` | `count`, `generation`, `reason` = `FinishReason` |

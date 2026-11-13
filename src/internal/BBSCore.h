@@ -847,9 +847,16 @@ class Core {
   // fail → backoff + SENSOR_FAILED; otherwise the wait state, or FOUND for a
   // pending direct attempt (MAC only). The §6b source is current before the
   // caller's emit (SENSOR_FAILED: never from SUBSCRIBED, never to EMPTY).
+  // Leaving SUBSCRIBED for HR: one 0 bpm Measurement to centrals so apps
+  // (e.g. Zwift) do not keep the last bpm; the heart-rate callback is not
+  // called (SENSOR_DISCONNECTED is the signal, as before).
   void leaveAttempt(uint8_t i, uint32_t now, Outcome outcome) {
     SensorSlot& s = slots_[i];
     const bool direct = s.directRetry;
+    if (s.type == SensorType::HEART_RATE && s.state == SlotState::SUBSCRIBED) {
+      const uint8_t zeroHr[] = {0x00, 0x00};   // flags: uint8 bpm, value 0
+      port_.relay(i, zeroHr, sizeof(zeroHr));
+    }
     resetCrank(s.crank);
     {
       MuxGuard guard(tableMux_);

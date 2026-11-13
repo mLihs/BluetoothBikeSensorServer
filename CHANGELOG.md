@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.2] - 2026-11-13
+
+### Fixed
+- Heart rate relay: when the HR sensor leaves `SUBSCRIBED` (disconnect, remove, resync), the local Heart Rate Measurement (`0x2A37`) notifies centrals once with **0 bpm**. Apps such as Zwift otherwise kept showing the last bpm after the strap dropped. The heart-rate callback is unchanged (still no synthetic 0; `SENSOR_DISCONNECTED` remains the signal).
+
+---
+
 ## [3.2.1] - 2026-11-07
 
 ### Changed

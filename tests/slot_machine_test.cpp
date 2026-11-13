@@ -3168,6 +3168,36 @@ static void testHeartRateData() {
   assert(g_hrCalls == 2 && countEvents(EventType::DATA) == 3);
 }
 
+// Centrals (Zwift) must not keep the last bpm after the strap drops.
+static void testHeartRateZeroOnDisconnect() {
+  Rig r;
+  r.core->setHeartRateCallback(onHr);
+  resetValues(r);
+  r.toSubscribed();
+  const uint8_t hr8[] = {0x00, 125};
+  assert(notifyEv(r, hr8, sizeof(hr8)));
+  r.update();
+  assert(g_hrCalls == 1 && g_hrValues[0] == 125);
+  const int relaysBefore = r.port.relays[kHr];
+  g_eventCount = 0;
+  g_hrCalls = 0;
+  r.discEv(r.gen(), 0x208);
+  r.update();
+  assert(r.core->stats().disconnects == 1);
+  assert(r.port.relays[kHr] == relaysBefore + 1);
+  assert(r.port.relayLen == 2 && r.port.relayData[0] == 0x00 && r.port.relayData[1] == 0x00);
+  assert(g_hrCalls == 0);                              // callback stays quiet; event is enough
+  expectEvent(0, EventType::SENSOR_DISCONNECTED, SlotState::FOUND, 0x208);
+
+  Rig s;                                               // never delivered: still one 0 (clears GATT)
+  s.toSubscribed();
+  const int relays0 = s.port.relays[kHr];
+  s.discEv(s.gen(), 0x16);
+  s.update();
+  assert(s.port.relays[kHr] == relays0 + 1);
+  assert(s.port.relayLen == 2 && s.port.relayData[0] == 0x00 && s.port.relayData[1] == 0x00);
+}
+
 static void testCadenceData() {
   Rig r;
   r.core->setCadenceCallback(onCadence);
@@ -6459,6 +6489,7 @@ int main() {
   testStartServerIdleGuard();
   testAddOutsideMask();
   testHeartRateData();
+  testHeartRateZeroOnDisconnect();
   testCadenceData();
   testCadenceZeroOnCscLoss();
   testHeartRateGetter();
