@@ -2,10 +2,10 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Version**: 3.2.1
+**Version**: 3.2.2
 **Platform**: ESP32 (Arduino Core 3.x)
 **Author**: Martin Lihs  
-**Last Updated**: 2026-11-07
+**Last Updated**: 2026-11-13
 
 > **3.0 is a new major version.** The 2.x functions (`BluetoothBikeSensorServer*`, `BikeSensorServer*`), `BLETelemetry` and `HomewindBleIdentity` are gone; there is no compatibility layer. See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
@@ -20,6 +20,7 @@ BluetoothBikeSensorServer connects an ESP32 to BLE fitness sensors (Heart Rate `
 - MAC mode (a 5 s sleep scan every 30 s until the MAC is seen; after a drop one direct attempt first) or NAME mode (10 s scan windows until the name is seen).
 - Discovery with name, MAC, address type and advertised types.
 - HR, CSC cadence and Power (watts, cadence, pedal balance, energy) as callbacks and getters; cadence from the power meter while no CSC sensor is connected.
+- On HR disconnect (3.2.2): one 0 bpm notify to centrals (e.g. Zwift); the heart-rate callback is not called with a synthetic 0.
 - One-way `quiesce()` for OTA and maintenance.
 
 ## Requirements
