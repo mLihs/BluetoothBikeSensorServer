@@ -6,6 +6,9 @@
 
 #include "BBSCore.h"
 #include "BBSEventPush.h"
+#if BBS_COMPILE_TRAINER
+#include "BBSTrainerNimBLE.h"
+#endif
 
 // Device side of BlePort (§2): raw-GAP scan with a static callback, one
 // reused client per slot with static callbacks, the reset detector, the
@@ -32,6 +35,10 @@ class NimBLEPort final : public BlePort {
   void attach(Core& core) {
     core_ = &core;
     self_ = this;
+#if BBS_COMPILE_TRAINER
+    trainer_.attach(core.trainer().queue());
+    core.trainer().attach(trainer_);
+#endif
   }
 
   bool stackReady() override { return NimBLEDevice::isInitialized(); }
@@ -78,6 +85,9 @@ class NimBLEPort final : public BlePort {
     }
     locationChr_ = nullptr;
     server_ = nullptr;
+#if BBS_COMPILE_TRAINER
+    trainer_.forget();
+#endif
     return true;
   }
 
@@ -207,6 +217,9 @@ class NimBLEPort final : public BlePort {
                         kCpLocationDefault);
         localChr_[slot] = chr;
       }
+#if BBS_COMPILE_TRAINER
+      if (core_->trainer().mirror()) trainer_.build(server, core_->trainer().table());
+#endif
       server_ = server;
     }
     // The first start must happen while the stack is idle (no advertising,
@@ -231,6 +244,13 @@ class NimBLEPort final : public BlePort {
   // the restart after a host reset (NimBLEAdvertising::onHostSync).
   bool advSetData(const char* name, uint8_t typeMask) override {
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+#if BBS_COMPILE_TRAINER
+    if (core_->trainer().mirror()) {
+      return trainer_.advSet(core_->trainer().table(), name,
+                             (typeMask & typeBit(SensorType::HEART_RATE)) != 0);
+    }
+    adv->enableScanResponse(false);     // after a mirror session
+#endif
     adv->clearData();
     bool ok = adv->setName(name);
     for (SensorType type : kTypes) {
@@ -279,12 +299,23 @@ class NimBLEPort final : public BlePort {
 
   class ServerCallbacks : public NimBLEServerCallbacks {
    public:
-    void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
+    void onConnect(NimBLEServer*, [[maybe_unused]] NimBLEConnInfo& info) override {
       pushCentralConnect(self_->core_->queue());
+#if BBS_COMPILE_TRAINER
+      NimBLETrainer::push(TrnEv::APP_CONNECT, nullptr, 0, info.getConnHandle(), info.getMTU());
+#endif
     }
-    void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
+    void onDisconnect(NimBLEServer*, [[maybe_unused]] NimBLEConnInfo& info, int reason) override {
       pushCentralDisconnect(self_->core_->queue(), clampReason(reason));
+#if BBS_COMPILE_TRAINER
+      NimBLETrainer::push(TrnEv::APP_DISCONNECT, nullptr, 0, info.getConnHandle());
+#endif
     }
+#if BBS_COMPILE_TRAINER
+    void onMTUChange(uint16_t mtu, NimBLEConnInfo& info) override {
+      NimBLETrainer::push(TrnEv::APP_MTU, nullptr, 0, info.getConnHandle(), mtu);
+    }
+#endif
   };
 
   class CharacteristicCallbacks : public NimBLECharacteristicCallbacks {
@@ -353,6 +384,10 @@ class NimBLEPort final : public BlePort {
       const ble_gap_disc_desc& desc = event->disc;
       uint8_t mac[6];
       for (uint8_t i = 0; i < 6; ++i) mac[i] = desc.addr.val[5 - i];
+#if BBS_COMPILE_TRAINER
+      core.trainer().capture(mac, desc.addr.type, desc.data, desc.length_data,
+                             desc.event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
+#endif
       if (epoch == core.scan().activeDiscEpoch()) {
         // Discovery: upsert under tableMux, no event (§2 copy exception).
         // Fields before a malformed element are whole elements; they count.
@@ -405,6 +440,9 @@ class NimBLEPort final : public BlePort {
   NimBLECharacteristic* localChr_[kSlots] = {};
   NimBLECharacteristic* featureChr_[kSlots] = {};   // CSC 0x2A5C, CP 0x2A65
   NimBLECharacteristic* locationChr_ = nullptr;      // CP 0x2A5D
+#if BBS_COMPILE_TRAINER
+  NimBLETrainer trainer_;
+#endif
 };
 
 }  // namespace internal

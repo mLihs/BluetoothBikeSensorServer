@@ -74,4 +74,25 @@ void setHeartRateCallback(void (*cb)(uint16_t bpm));
 void setCadenceCallback(void (*cb)(uint16_t rpm));
 void setPowerCallback(void (*cb)(const PowerSample& sample));
 
+#if BBS_COMPILE_TRAINER
+// Trainer mirror (TRAINER_PROXY_DESIGN § 2). setTrainerMirror(): before
+// begin(); the stored table becomes the relay's GATT (CSC and Power without
+// local services), advertised only while the trainer link is ready and no
+// app is connected. trainerSetup(): a 5 s discovery for the trainer's
+// advertising (its address type comes from there), then its GATT into NVS;
+// TRAINER_SETUP_DONE carries a TrainerCheck, takes effect after end() +
+// begin() (reboot). Events TRAINER_CONNECTED (reason 1: GATT changed, not
+// mirrored, no TRAINER_DISCONNECTED follows) and TRAINER_DISCONNECTED. All
+// of them belong to the update() task, like stats().
+void setTrainerMirror(bool on);
+bool trainerSetup(const char* mac);
+bool trainerForget();                     // erases the stored table; after begin(), also a failed one
+void trainerInfo(TrainerInfo& out);
+// Subscribes the trainer's notify/indicate characteristics with this 16-bit
+// UUID for the data callback (called inside update()), with or without an
+// app. After begin().
+void trainerReadAlong(uint16_t uuid16, bool on);
+void setTrainerDataCallback(void (*cb)(uint16_t uuid16, const uint8_t* data, uint8_t len));
+#endif
+
 }  // namespace BikeSensor

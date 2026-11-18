@@ -14,6 +14,13 @@
 #include "BBSMux.h"
 #include "BBSScanController.h"
 #include "BBSTypes.h"
+#if BBS_COMPILE_TRAINER
+#include "BBSTrainer.h"
+#if BBS_TRAINER_PSRAM
+#include <esp_heap_caps.h>
+#include <new>
+#endif
+#endif
 
 // One slot per compiled sensor type, one mode for all slots (§10 steps 3–9):
 // slot machine (§5.2), event handling (§5.1), resync (§3.2), HOST_RESET, the
@@ -515,6 +522,9 @@ class Core {
     }
     down_ = false;
     advHeld_ = false;
+#if BBS_COMPILE_TRAINER
+    trainer_.begin(trainerMirror_, port_.nowMs());
+#endif
     begun_ = startServer();
     return begun_;
   }
@@ -565,6 +575,9 @@ class Core {
       MuxGuard guard(tableMux_);
       quiesced_ = true;
     }
+#if BBS_COMPILE_TRAINER
+    trainer_.stop();
+#endif
     if (port_.advActive()) port_.advStop();
     const bool discovery = scan_.discoveryOwner();
     DiscoveryDone done{};
@@ -589,6 +602,9 @@ class Core {
 
   // §4 quiesced(). update() task: reads the slot states.
   bool quiesced() {
+#if BBS_COMPILE_TRAINER
+    if (!trainer_.idle()) return false;
+#endif
     return quiesced_ && scan_.owner() == ScanOwner::OFF && !port_.discActive() &&
            !port_.advActive() && !linkBusy();
   }
@@ -616,6 +632,9 @@ class Core {
     if (queue_.takeResync()) resync(now);
     Event ev;
     for (uint8_t i = 0; i < BBS_EVENT_QUEUE_DEPTH && queue_.pop(ev); ++i) handle(ev, now);
+#if BBS_COMPILE_TRAINER
+    trainerStep(now);
+#endif
     enforceAdvertising(now);
     if (!quiesced_) gattStep(now);
     for (uint8_t i = 0; i < kSlotCount; ++i) advanceSlot(i, now);
@@ -697,6 +716,25 @@ class Core {
 
   EventQueue& queue() { return queue_; }
   GattWatchdog& watchdog() { return watchdog_; }
+#if BBS_COMPILE_TRAINER
+  Trainer& trainer() { return trainer_; }
+
+  // Takes effect at the next begin(): the mirror from the stored table, CSC
+  // and Power without local services (the table has them).
+  void setTrainerMirror(bool on) { trainerMirror_ = on; }
+
+  // A kTrnSetupScanMs discovery for the trainer's advertising (and address
+  // type), then its GATT into NVS; TRAINER_SETUP_DONE reports the
+  // TrainerCheck. Ends the mirror link until the next begin(). False if not
+  // begun, under quiesce, for a bad MAC or while a discovery is pending or open.
+  bool trainerSetup(const char* mac, uint32_t now) {
+    uint8_t bytes[6];
+    if (!begun_ || !parseMac(mac, bytes)) return false;
+    if (!startDiscovery(kCompiledMask, kTrnSetupScanMs, now)) return false;
+    trainer_.setup(bytes);
+    return true;
+  }
+#endif
   const SensorSlot& slot(uint8_t i) const { return slots_[i]; }
   const ScanController& scan() const { return scan_; }
 
@@ -731,6 +769,9 @@ class Core {
 
   // §5.3 OFF: no scan start while a slot is FOUND or in flight.
   bool scanBlocked() const {
+#if BBS_COMPILE_TRAINER
+    if (trainer_.blocksScan()) return true;
+#endif
     for (const SensorSlot& s : slots_) {
       if (s.state == SlotState::FOUND || inFlight(s.state)) return true;
     }
@@ -740,6 +781,9 @@ class Core {
   // §5.3 DISCOVERY_PENDING waits for these. A slot that becomes FOUND later
   // (direct retry, MAC replace) does not block it; it waits for DISCOVERY_DONE.
   bool linkBusy() const {
+#if BBS_COMPILE_TRAINER
+    if (trainer_.connecting()) return true;
+#endif
     for (const SensorSlot& s : slots_) {
       if (s.state == SlotState::CONNECTING || s.state == SlotState::CANCELLING ||
           s.state == SlotState::DISCOVERING) {
@@ -996,6 +1040,9 @@ class Core {
   void emitDone(const DiscoveryDone& done) {
     emit(EventType::DISCOVERY_DONE, SensorType{}, static_cast<int>(done.reason), done.count,
          done.generation);
+#if BBS_COMPILE_TRAINER
+    trainer_.discoveryDone();
+#endif
   }
 
   // Wins once per discovery: afterwards the owner is OFF.
@@ -1231,6 +1278,11 @@ class Core {
   // §5.4 desired state, enforced on every update(), after HOST_RESET and after
   // resync. Also stops NimBLE's own restarts (§0.9).
   bool advertisingDesired() const {
+#if BBS_COMPILE_TRAINER
+    // § 2.2.6: the mirror only while the trainer is READY and no app is
+    // connected; nothing while the setup connects.
+    if (trainer_.quietAdv() || (trainer_.mirror() && !trainer_.advertise())) return false;
+#endif
     return serverStarted_ && !paused_ && !quiesced_ && !connectPause();
   }
 
@@ -1260,7 +1312,12 @@ class Core {
 
   // begin() mask ∩ compiled; each has a local service, created once per
   // begin() (rev 31); setAdvertisedTypes() picks which UUIDs are advertised.
-  uint8_t localTypes() const { return localTypes(enabled_); }
+  uint8_t localTypes() const {
+#if BBS_COMPILE_TRAINER
+    if (trainer_.mirror()) return localTypes(enabled_) & typeBit(SensorType::HEART_RATE);
+#endif
+    return localTypes(enabled_);
+  }
   static uint8_t localTypes(uint8_t typeMask) { return typeMask & kCompiledMask; }
   uint8_t advertisedTypes() const { return advertisedTypes(enabled_); }
   uint8_t advertisedTypes(uint8_t typeMask) const { return localTypes(typeMask) & advRequested_; }
@@ -1406,6 +1463,9 @@ class Core {
     }
     advHeld_ = false;
     releaseCapacity(now);
+#if BBS_COMPILE_TRAINER
+    trainer_.hostReset(now);
+#endif
     enforceAdvertising(now);
     stats_.hostResets++;
     if (discovery) emitDone(done);
@@ -1424,6 +1484,9 @@ class Core {
       }
     }
     for (uint8_t i = 0; i < kSlotCount; ++i) resyncSlot(i, now);
+#if BBS_COMPILE_TRAINER
+    trainer_.resync(now);
+#endif
     refreshCentralCount();
     advHeld_ = false;
     releaseCapacity(now);
@@ -1589,8 +1652,26 @@ class Core {
     for (uint8_t i = 0; i < kSlotCount; ++i) {
       if (port_.connHandle(i) != kConnHandleNone) return true;
     }
+#if BBS_COMPILE_TRAINER
+    if (trainer_.connHandle() != kConnHandleNone) return true;
+#endif
     return false;
   }
+
+#if BBS_COMPILE_TRAINER
+  // The trainer link takes the initiator like a FOUND slot (§5.2): no slot in
+  // flight, no discovery, the scan stopped, no connect procedure; for the
+  // setup link also advertising stopped (enforceAdvertising()).
+  void trainerStep(uint32_t now) {
+    bool mayConnect = false;
+    if (!quiesced_ && trainer_.wantsLink(now) && !anyInFlight() && !scan_.discoveryOwner()) {
+      const int rc = scan_.stopForConnect(port_, now);
+      mayConnect = (rc == 0 || rc == kHsEAlready) && !port_.discActive() && !port_.connActive() &&
+                   !(trainer_.quietAdv() && port_.advActive());
+    }
+    trainer_.update(now, mayConnect, eventCb_);
+  }
+#endif
 
   // §5.1 step 6. Never in CONNECTING (NimBLE reports connected before onConnect).
   void orphanSweep() {
@@ -1642,6 +1723,20 @@ class Core {
   bool quiesced_ = false;               // quiesce latch (§4), written under tableMux_
   bool begun_ = false;                  // begin() succeeded, no successful end() since
   bool down_ = false;                   // end() tore the stack down; begin() not yet
+#if BBS_COMPILE_TRAINER
+#if BBS_TRAINER_PSRAM
+  // Program lifetime (~19.5 KB): PSRAM if the heap has it, else internal RAM.
+  static Trainer* newTrainer() {
+    void* p = heap_caps_aligned_alloc(alignof(Trainer), sizeof(Trainer),
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p != nullptr ? new (p) Trainer : new Trainer;
+  }
+  Trainer& trainer_ = *newTrainer();
+#else
+  Trainer trainer_;
+#endif
+  bool trainerMirror_ = false;          // setTrainerMirror(), applied by begin()
+#endif
 };
 
 }  // namespace internal

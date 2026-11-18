@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- Trainer mirror M1 behind `BBS_COMPILE_TRAINER=1` (default 0; with 0 the build is unchanged). Setup copies a trainer's GATT (validated, CRC-protected, NVS `bbs`/`trn_gatt`); the mirror is built in the relay server before it starts, uses a static random address derived from the structure hash and the chip's 48-bit MAC, and is advertised only while the trainer link is ready and no app is connected. Reconnect backoff up to 30 s, shortened after a failed connect once the trainer is seen advertising; notifications are dropped before control events and trainer indications (8 reserved queue slots); lost events and missed connects/disconnects are recovered by liveness checks (handle and peer, before any terminate), disconnecting unknown apps. While the mirror is active, MTU 247 applies to all links until reboot; with the flag on, static RAM grows by about 19.9 KB (with `BBS_TRAINER_PSRAM=1` the ~19.5 KB runtime is allocated once in PSRAM when the heap has it, else in internal RAM); after a host reset NimBLE briefly advertises its own random address until `update()` restores the mirror's. Ordered relay FIFO for writes and CCCD changes with a CCCD reference count (app + read-along) and CCCD retry, indication queue (8, one outstanding), trainer-side write type, 104-byte values (blob version 3; older stored tables are rejected, re-run the setup), MTU 247, retry on ENOMEM/EBUSY. New API (all on the `update()` task): `setTrainerMirror()`, `trainerSetup(mac)`, `trainerForget()`, `trainerInfo()`, `trainerReadAlong()`, `setTrainerDataCallback()`; events `TRAINER_CONNECTED`, `TRAINER_DISCONNECTED`, `TRAINER_SETUP_DONE`; example `Trainer`; host test `trainer_test`. Not hardware-tested.
+
+---
+
 ## [3.2.2] - 2026-11-13
 
 ### Fixed

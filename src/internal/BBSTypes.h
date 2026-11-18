@@ -19,7 +19,8 @@ enum class Mode : uint8_t { NAME = 0, MAC = 1 };
 enum class EventType : uint8_t {
   SENSOR_FOUND = 0, SENSOR_CONNECTED = 1, SENSOR_DISCONNECTED = 2, SENSOR_FAILED = 3,
   DATA = 4, DISCOVERY_DONE = 5, CENTRAL_CONNECTED = 6, CENTRAL_DISCONNECTED = 7,
-  CENTRAL_SUBSCRIBED = 8, CENTRAL_UNSUBSCRIBED = 9, HOST_RESET = 10
+  CENTRAL_SUBSCRIBED = 8, CENTRAL_UNSUBSCRIBED = 9, HOST_RESET = 10,
+  TRAINER_CONNECTED = 11, TRAINER_DISCONNECTED = 12, TRAINER_SETUP_DONE = 13   // BBS_COMPILE_TRAINER
 };
 enum class FinishReason : uint8_t {
   NATURAL = 0, MANUAL = 1, TIMEOUT = 2, HOST_RESET = 3, RESYNC = 4, START_FAILED = 5, QUIESCED = 6
@@ -61,6 +62,30 @@ struct PowerSample {
   uint16_t energyKJ;
   bool     hasEnergy;
   uint16_t flags;          // raw CPS flags
+};
+
+// Trainer mirror (BBS_COMPILE_TRAINER). CHANGED: the trainer's GATT no longer
+// matches the stored table; the mirror is not advertised.
+enum class TrainerState : uint8_t {
+  OFF = 0, WAITING = 1, CONNECTING = 2, DISCOVERING = 3, READY = 4, CHANGED = 5, SETUP = 6
+};
+// TRAINER_SETUP_DONE reason; anything but OK stores nothing.
+enum class TrainerCheck : uint8_t {
+  OK = 0, NOT_FOUND = 1, LINK_FAILED = 2, TOO_LARGE = 3, EMPTY = 4, EMPTY_SERVICE = 5,
+  NO_CCCD = 6, MISSING_ADVERTISED = 7, STORE_FAILED = 8
+};
+struct TrainerInfo {
+  TrainerState state;
+  bool mirror;               // begin() built the mirror from the stored table
+  bool appConnected;
+  uint8_t mac[6];            // trainer
+  uint8_t addrType;
+  uint8_t address[6];        // the mirror's static random address
+  uint32_t hash;             // structure hash of the stored table
+  uint8_t services, characteristics;
+  uint16_t mtu, appMtu;
+  uint32_t up, down;         // relayed notifications/indications, writes
+  uint32_t dropped, writeErrors, oversize;
 };
 
 }  // namespace BikeSensor

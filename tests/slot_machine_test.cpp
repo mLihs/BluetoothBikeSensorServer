@@ -6420,6 +6420,79 @@ static void testNameFallback() {
   }
 }
 
+#if BBS_COMPILE_TRAINER
+// A trainer that is off: every connect ends with CONNECT_FAIL.
+struct TrainerStub final : bs::TrainerPort {
+  Core* core = nullptr;
+  FakePort* port = nullptr;
+  int connects = 0;
+  int connect(const uint8_t*, uint8_t, uint16_t gen) override {
+    connects++;
+    assert(!port->discOn && !port->connOn);   // the initiator is free
+    bs::TrnEvent ev{};
+    ev.kind = bs::TrnEv::CONNECT_FAIL;
+    ev.gen = gen;
+    ev.status = bs::kHsETimeout;
+    assert(core->trainer().queue().push(ev));
+    return 0;
+  }
+  void cancelConnect() override {}
+  void terminate(uint16_t) override {}
+  bool connAlive(uint16_t, const uint8_t*) override { return false; }
+  int exchangeMtu(uint16_t, uint16_t) override { return 0; }
+  int discServices(uint16_t, uint16_t) override { return 0; }
+  int discChrs(uint16_t, uint16_t, uint16_t, uint16_t) override { return 0; }
+  int discDscs(uint16_t, uint16_t, uint16_t, uint16_t) override { return 0; }
+  int read(uint16_t, uint16_t, uint16_t) override { return 0; }
+  int write(uint16_t, uint16_t, const uint8_t*, uint8_t, bool, uint16_t) override { return 0; }
+  int notifyApp(uint16_t, uint8_t, const uint8_t*, uint8_t, bool) override { return 0; }
+  void disconnectApp(uint16_t) override {}
+  void disconnectApps() override {}
+  void setLocalValue(uint8_t, const uint8_t*, uint8_t) override {}
+  size_t loadTable(bs::TrnBlob& b) override {
+    b = bs::TrnBlob{};
+    memcpy(b.table.mac, kOtherMac, 6);
+    b.table.svcCount = b.table.chrCount = 1;
+    b.table.svc[0] = bs::TrnUuid{2, {0x18, 0x18}};
+    b.table.chr[0] = bs::TrnChr{bs::TrnUuid{2, {0x63, 0x2A}}, 0, bs::kPropNotify, true, 0, {}};
+    bs::sealTable(b);
+    return sizeof(b);
+  }
+  bool storeTable(const bs::TrnBlob&) override { return true; }
+  bool eraseTable() override { return true; }
+  bool setOwnAddress(const uint8_t*) override { return true; }
+  uint64_t chipMac() override { return 1; }
+};
+
+// trainerStep(): the trainer takes the initiator only with no scan or
+// connect running, backs off to 30 s while it is off, so the HR slot's
+// sleep windows run; a scan report from the trainer ends the wait.
+static void testTrainerArbitration() {
+  Rig r;
+  TrainerStub stub;
+  stub.core = r.core.get();
+  stub.port = &r.port;
+  r.core->trainer().attach(stub);
+  assert(r.core->trainer().begin(true, r.now));
+  r.add();
+  for (int k = 0; k < 4000; ++k) {    // 40 s: attempts at 0, 1, 3, 7, 15, 31 s
+    r.update();
+    r.now += 10;
+  }
+  assert(stub.connects == 6 && r.port.discStarts >= 2 && r.port.connects == 0);
+  const int cancels = r.port.discCancels;
+  if (r.core->scan().owner() != ScanOwner::SLEEP_WINDOW) {
+    r.now += BBS_SLEEP_SCAN_INTERVAL_MS;
+    r.update();
+  }
+  assert(r.core->scan().owner() == ScanOwner::SLEEP_WINDOW && stub.connects == 6);
+  r.core->trainer().capture(kOtherMac, 0, nullptr, 0, false);
+  r.update();                         // the trainer takes the report
+  r.update();
+  assert(stub.connects == 7 && r.port.discCancels == cancels + 1);
+}
+#endif
+
 int main() {
   testAddByMac();
   testHappyPath();
@@ -6515,6 +6588,9 @@ int main() {
   testPowerEncrypted();
 #else
   testPowerAbsent();
+#endif
+#if BBS_COMPILE_TRAINER
+  testTrainerArbitration();
 #endif
   testDiscoveryNatural();
   testDiscoveryFields();

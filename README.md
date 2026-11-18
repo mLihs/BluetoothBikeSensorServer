@@ -73,6 +73,7 @@ void loop() {
 | `Relay_WebServer` | HR + CSC relay plus a WebSocket page (ESPAsyncWebServer, AsyncTCP) |
 | `Power` | power meter by name; ships `build_opt.h` with `-DBBS_COMPILE_POWER=1` |
 | `NimBLEHeapTest` | heap cost of NimBLE, the library and one connection |
+| `Trainer` | trainer mirror setup and status over Serial; ships `build_opt.h` with `-DBBS_COMPILE_TRAINER=1` |
 
 ## API
 
@@ -178,6 +179,30 @@ The server has one service per type in the `begin()` mask: HR `0x2A37`; CSC `0x2
 
 `quiesce()` stops advertising, discovery, scans and connects and is one-way until `end()` + `begin()` (or reboot). `update()` must keep running; `quiesced()` turns true once nothing is in flight. Connected sensors may remain; remove them afterwards if needed.
 
+### Trainer mirror (`BBS_COMPILE_TRAINER=1`, unreleased)
+
+The relay copies a smart trainer's GATT once (setup) and serves that copy, so an app connects to the relay as if it were the trainer while the relay keeps its own trainer link and its HR service.
+
+| Function | Notes |
+|---|---|
+| `void setTrainerMirror(bool on)` | Before `begin()`. With a stored table the server gets the mirrored services instead of the local CSC and Power services (HR stays) and a static random address derived from the table's structure hash. |
+| `bool trainerSetup(const char* mac)` | After `begin()`. A 5 s discovery for the trainer's advertising and address type (also ends with `DISCOVERY_DONE`), then connect with advertising off, discover, read and check; `TRAINER_SETUP_DONE` carries a `TrainerCheck` in `reason`, and only `OK` stores the table in NVS (`bbs`/`trn_gatt`). The mirror uses it after `end()` + `begin()` or a reboot. |
+| `bool trainerForget()` | After `begin()` (also a failed one). Erases the stored table. |
+| `void trainerInfo(TrainerInfo&)` | State, MACs, hash, counts, MTUs and relay counters. |
+| `void trainerReadAlong(uint16_t uuid16, bool on)` + `setTrainerDataCallback(...)` | Subscribes the trainer's notify/indicate characteristics with that UUID for the callback (called inside `update()`), with or without an app. |
+
+All trainer functions belong to the `update()` task, like `stats()`.
+
+- The mirror advertises only while the trainer link is ready and no app is connected; losing the trainer disconnects the app. One app at a time.
+- Advertising: flags, the trainer's service data and appearance, and its first 128-bit service if it fits; the scan response holds the complete 16-bit service list (without `0x180A`/`0x180F`, HR `0x180D` last) and the name. If the scan response does not fit 31 bytes, `begin()` fails (shorter name or `setTrainerMirror(false)`).
+- Reconnects back off from 1 s up to 30 s; after a failed connect, a scan report of the trainer brings the next attempt forward to 1 s (not after a failed discovery or check).
+- Not mirrored: GAP `0x1800`, GATT `0x1801`, DFU services and the trainer's HR `0x180D`. Services without characteristics are dropped unless the trainer lists them (service UUIDs or 16-bit service data); if the setup scan caught no scan response, none are dropped. A kept empty service, a notify/indicate characteristic without CCCD or a missing advertised service fails the setup check.
+- App writes and subscriptions reach the trainer in order (a subscription before any later write), with the trainer's write type; a failed CCCD write is retried. Values are capped at 104 bytes (`BBS_TRAINER_VALUE_MAX`, the NEO's MTU 107 − 3; its ~70-byte FC82 device-info indication passes whole). Changing the cap changes the stored table's layout: an older table is rejected at `begin()` (no mirror) and the setup must run again. Indications to the app are queued (8) with one outstanding.
+- If `update()` stalls, trainer notifications are dropped (counted in `dropped`) before any control event: 8 of the 48 queue slots are kept for writes, subscriptions, link events and trainer indications (NimBLE has confirmed those to the trainer already). If a control event is still lost, the links are checked first, then the trainer link is rebuilt and every app is disconnected.
+- While the mirror is active, `NimBLEDevice::setMTU(247)` is set for all links until reboot. With the flag on, static RAM grows by about 19.9 KB (Trainer vs. Basic_MAC); include that in heap checks.
+- After a NimBLE host reset, NimBLE briefly advertises with its own random address until the next `update()` sets the mirror's address again (milliseconds; accepted).
+- `TRAINER_CONNECTED` with `reason` 1 (reported once, no `TRAINER_DISCONNECTED` follows) means the trainer's GATT no longer matches the stored table (state `CHANGED`, not advertised, retried every 30 s); run the setup again.
+
 ### Stats
 
 `stats()` returns counters: connects, connect fails, disconnects, notifies (truncated, malformed), dropped events/notifies/matches, scans started/failed, discovery timeouts, GATT budget aborts, host resets, cancel safety exits, advertising enforced.
@@ -222,10 +247,15 @@ Set with `-D` (e.g. a sketch `build_opt.h` on core 3.x, which also reaches libra
 | `BBS_SCAN_END_GRACE_MS` | 3000 |
 | `BBS_CAPACITY_RETRY_MS` | 60000 |
 | `BBS_EVENT_QUEUE_DEPTH`, `BBS_NOTIFY_MAX_LEN` | 24, 36 |
+| `BBS_COMPILE_TRAINER` | 0 (trainer mirror, see above) |
+| `BBS_TRAINER_VALUE_MAX`, `BBS_TRAINER_MAX_SERVICES`, `BBS_TRAINER_MAX_CHRS` | 104, 12, 40 |
+| `BBS_TRAINER_PSRAM` | 0; 1 puts the mirror runtime (~19.5 KB) in PSRAM if the heap has it, else internal RAM |
 
 ## Host tests
 
-From the library folder (silent on success): `for p in 0 1; do for t in codec_test event_queue_test slot_machine_test; do c++ -std=c++17 -Wall -Wextra -Werror -pthread -DBBS_COMPILE_POWER=$p -Isrc/internal tests/$t.cpp -o /tmp/$t && /tmp/$t || echo "FAIL $t $p"; done; done`
+From the library folder (silent on success): `for tr in 0 1; do for p in 0 1; do for t in codec_test event_queue_test slot_machine_test trainer_test; do c++ -std=c++17 -Wall -Wextra -Werror -pthread -DBBS_COMPILE_POWER=$p -DBBS_COMPILE_TRAINER=$tr -Isrc/internal tests/$t.cpp -o /tmp/$t && /tmp/$t || echo "FAIL $t $p $tr"; done; done; done`
+
+On macOS, if linking fails with a `tapi` error, set `SDKROOT` to an installed SDK first (e.g. `export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`).
 
 ## License
 

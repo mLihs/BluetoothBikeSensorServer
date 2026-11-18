@@ -55,12 +55,30 @@
 #ifndef BBS_COMPILE_POWER
 #define BBS_COMPILE_POWER 0
 #endif
+// Trainer mirror (TRAINER_PROXY_DESIGN § 2); off by default.
+#ifndef BBS_COMPILE_TRAINER
+#define BBS_COMPILE_TRAINER 0
+#endif
+#ifndef BBS_TRAINER_PSRAM
+#define BBS_TRAINER_PSRAM 0                 // 1: the mirror runtime in PSRAM if the heap has it
+#endif
+#ifndef BBS_TRAINER_VALUE_MAX
+#define BBS_TRAINER_VALUE_MAX 104           // attribute value cap (§ 2.2.4): NEO MTU 107 − 3
+#endif
+#ifndef BBS_TRAINER_MAX_SERVICES
+#define BBS_TRAINER_MAX_SERVICES 12
+#endif
+#ifndef BBS_TRAINER_MAX_CHRS
+#define BBS_TRAINER_MAX_CHRS 40
+#endif
 #ifndef BBS_COMPILED_SENSOR_COUNT
 #define BBS_COMPILED_SENSOR_COUNT (BBS_COMPILE_HEART_RATE + BBS_COMPILE_CSC + BBS_COMPILE_POWER)
 #endif
 static_assert(BBS_COMPILED_SENSOR_COUNT >= 1 && BBS_COMPILED_SENSOR_COUNT <= 3, "");
 static_assert(BBS_MAX_DISCOVERED >= 1 && BBS_MAX_DISCOVERED <= 255, "discoveredCount() is uint8_t");
 static_assert(BBS_NOTIFY_MAX_LEN >= 20 && BBS_NOTIFY_MAX_LEN <= 38, "Event must stay <= 48 B");
+static_assert(BBS_TRAINER_VALUE_MAX >= 20 && BBS_TRAINER_VALUE_MAX <= 244, "one ATT PDU at MTU 247");
+static_assert(BBS_TRAINER_MAX_SERVICES <= 255 && BBS_TRAINER_MAX_CHRS <= 255, "uint8_t indices");
 #if CONFIG_BT_NIMBLE_EXT_ADV
 #error "BikeSensor 3.0 uses legacy ble_gap_disc events; disable CONFIG_BT_NIMBLE_EXT_ADV"
 #endif

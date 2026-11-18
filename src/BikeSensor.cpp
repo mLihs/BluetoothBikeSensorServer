@@ -92,6 +92,19 @@ void setHeartRateCallback(void (*cb)(uint16_t)) { core.setHeartRateCallback(cb);
 void setCadenceCallback(void (*cb)(uint16_t)) { core.setCadenceCallback(cb); }
 void setPowerCallback(void (*cb)(const PowerSample&)) { core.setPowerCallback(cb); }
 
+#if BBS_COMPILE_TRAINER
+void setTrainerMirror(bool on) { core.setTrainerMirror(on); }
+bool trainerSetup(const char* mac) { return begun && core.trainerSetup(mac, millis()); }
+bool trainerForget() { return core.trainer().forget(); }
+void trainerInfo(TrainerInfo& out) { core.trainer().info(out); }
+void trainerReadAlong(uint16_t uuid16, bool on) {
+  if (begun) core.trainer().readAlong(uuid16, on);
+}
+void setTrainerDataCallback(void (*cb)(uint16_t, const uint8_t*, uint8_t)) {
+  core.trainer().setDataCallback(cb);
+}
+#endif
+
 // 2.x table (Bluetooth Core Spec Vol 2 Part D). NimBLE reports HCI reasons as
 // BLE_HS_ERR_HCI_BASE (0x200) + code; other non-zero host codes are not HCI.
 const char* disconnectReasonString(int reason) {
