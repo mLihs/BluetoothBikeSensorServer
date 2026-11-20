@@ -45,6 +45,7 @@ struct SensorInfo {
   SlotState state; uint8_t battery; bool hasBattery; int lastDisconnectReason;
   bool encrypted;             // end of the GATT pass, every type; false when not SUBSCRIBED
   bool providesCadence;       // POWER only: this slot is the cadence source (§6b)
+  uint8_t failCount; bool nameFallback; bool capWait; int capReason;   // diagnostics (§5.2)
 };
 
 struct Stats {

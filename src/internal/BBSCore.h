@@ -100,8 +100,8 @@ constexpr uint32_t kCpFeatureDefault = 0;
 constexpr uint32_t kCpFeatureMask = 0x000301FF;
 constexpr uint8_t kCpLocationDefault = 0x0D;            // rear hub
 
-// §6b.
-enum class CadenceSource : uint8_t { NONE, CSC, POWER };
+// §6b; TRAINER: the mirror's read-along (TRAINER_PROXY_DESIGN § 3).
+enum class CadenceSource : uint8_t { NONE, CSC, POWER, TRAINER };
 
 // Written under tableMux for info() and gapScanCb: state, name, mac, addrType,
 // hasAddr, nameFallback, battery, lastDisconnectReason, encrypted and the last
@@ -156,6 +156,11 @@ class Core {
       if (slotIndex(type) >= 0) slots_[slotIndex(type)].type = type;
     }
     for (SensorSlot& s : slots_) clearSlot(s);
+#if BBS_COMPILE_TRAINER
+    trainer_.setCpsHook(this, [](void* core, const uint8_t* data, uint8_t len, uint32_t now) {
+      static_cast<Core*>(core)->onTrainerCps(data, len, now);
+    });
+#endif
   }
 
   Core(const Core&) = delete;
@@ -332,8 +337,8 @@ class Core {
   bool lastHeartRate(uint16_t& bpm, uint32_t& ageMs, uint32_t now) {
     return lastValue(slotIndex(SensorType::HEART_RATE), bpm, ageMs, now);
   }
-  // §6b source. Power: false until a crank delta (hasCadence); the stale rule
-  // applies and ageMs is the time since the last crank event.
+  // §6b source. Power and trainer: false until a crank delta (hasCadence); the
+  // stale rule applies and ageMs is the time since the last crank event.
   bool lastCadence(uint16_t& rpm, uint32_t& ageMs, uint32_t now) {
     CadenceSource source;
     {
@@ -345,10 +350,11 @@ class Core {
     }
     PowerSample sample;
     uint32_t at, crankMs;
-    if (source != CadenceSource::POWER || !readPower(sample, at, crankMs, now) ||
-        !sample.hasCadence) {
-      return false;
-    }
+    bool ok = source == CadenceSource::POWER && readPower(sample, at, crankMs, now);
+#if BBS_COMPILE_TRAINER
+    ok = ok || (source == CadenceSource::TRAINER && readPower(trnPower_, sample, at, crankMs, now));
+#endif
+    if (!ok || !sample.hasCadence) return false;
     rpm = sample.cadence;
     ageMs = now - crankMs;
     return true;
@@ -382,6 +388,10 @@ class Core {
     out.lastDisconnectReason = s.lastDisconnectReason;
     out.encrypted = s.encrypted;
     out.providesCadence = type == SensorType::POWER && source_ == CadenceSource::POWER;
+    out.failCount = s.failCount;
+    out.nameFallback = s.nameFallback;
+    out.capWait = s.capWait;
+    out.capReason = s.capReason;
     return true;
   }
 
@@ -523,7 +533,7 @@ class Core {
     down_ = false;
     advHeld_ = false;
 #if BBS_COMPILE_TRAINER
-    trainer_.begin(trainerMirror_, port_.nowMs());
+    if (trainer_.begin(trainerMirror_, port_.nowMs())) trainer_.readAlong(0x2A63, true);
 #endif
     begun_ = startServer();
     return begun_;
@@ -722,6 +732,16 @@ class Core {
   // Takes effect at the next begin(): the mirror from the stored table, CSC
   // and Power without local services (the table has them).
   void setTrainerMirror(bool on) { trainerMirror_ = on; }
+
+  // Any task: the read-along 0x2A63 sample (stale rule at now); false until
+  // one arrived on the current READY link.
+  bool trainerPower(PowerSample& out, uint32_t& ageMs, uint32_t now) {
+    uint32_t at, crankMs;
+    if (!readPower(trnPower_, out, at, crankMs, now)) return false;
+    ageMs = now - at;
+    return true;
+  }
+  void setTrainerPowerCallback(void (*cb)(const PowerSample&)) { trainerPowerCb_ = cb; }
 
   // A kTrnSetupScanMs discovery for the trainer's advertising (and address
   // type), then its GATT into NVS; TRAINER_SETUP_DONE reports the
@@ -1167,6 +1187,13 @@ class Core {
       port_.relay(i, ev.notify.data, ev.notify.len);
     }
     if (!ok) return;
+    storePower(s, sample, crankUpdated, now, CadenceSource::POWER, powerCb_);
+    emit(EventType::DATA, SensorType::POWER);
+  }
+  // S: the Power slot or trnPower_.
+  template <typename S>
+  void storePower(S& s, const PowerSample& sample, bool crankUpdated, uint32_t now,
+                  CadenceSource source, void (*cb)(const PowerSample&)) {
     {
       MuxGuard guard(tableMux_);
       s.power = sample;
@@ -1174,12 +1201,11 @@ class Core {
       s.valueMs = now;
       s.crankMs = s.crank.lastCrankEventMs;
     }
-    if (powerCb_ != nullptr) powerCb_(sample);
-    if (crankUpdated && currentCadenceSource() == CadenceSource::POWER) {
+    if (cb != nullptr) cb(sample);
+    if (crankUpdated && currentCadenceSource() == source) {
       cadenceArmed_ = sample.cadence != 0;
       if (cadenceCb_ != nullptr) cadenceCb_(sample.cadence);
     }
-    emit(EventType::DATA, SensorType::POWER);
   }
 
   // Any task: the Power slot's sample with the stale rule at now (moved up to
@@ -1187,12 +1213,16 @@ class Core {
   bool readPower(PowerSample& out, uint32_t& at, uint32_t& crankMs, uint32_t& now) {
     const int p = slotIndex(SensorType::POWER);
     if (p < 0) return false;
+    return readPower(slots_[p], out, at, crankMs, now);
+  }
+  template <typename S>
+  bool readPower(const S& s, PowerSample& out, uint32_t& at, uint32_t& crankMs, uint32_t& now) {
     {
       MuxGuard guard(tableMux_);
-      if (!slots_[p].hasValue) return false;
-      out = slots_[p].power;
-      at = slots_[p].valueMs;
-      crankMs = slots_[p].crankMs;
+      if (!s.hasValue) return false;
+      out = s.power;
+      at = s.valueMs;
+      crankMs = s.crankMs;
     }
     if (static_cast<int32_t>(now - at) < 0) now = at;
     CrankState crank{};
@@ -1232,13 +1262,17 @@ class Core {
   }
 
   // §6b source rule (3.2.1): a SUBSCRIBED CSC slot, CSC compiled and in the
-  // begin() mask; otherwise a SUBSCRIBED Power slot; otherwise none. Every
-  // entry into and exit from SUBSCRIBED refreshes the source.
+  // begin() mask; otherwise a SUBSCRIBED Power slot; otherwise a READY
+  // trainer link; otherwise none. Every entry into and exit from SUBSCRIBED
+  // refreshes the source, update() the trainer's.
   CadenceSource currentCadenceSource() const {
     const int csc = enabledSlot(SensorType::SPEED_CADENCE);
     if (csc >= 0 && slots_[csc].state == SlotState::SUBSCRIBED) return CadenceSource::CSC;
     const int p = slotIndex(SensorType::POWER);
     if (p >= 0 && slots_[p].state == SlotState::SUBSCRIBED) return CadenceSource::POWER;
+#if BBS_COMPILE_TRAINER
+    if (trainer_.ready()) return CadenceSource::TRAINER;
+#endif
     return CadenceSource::NONE;
   }
 
@@ -1249,19 +1283,20 @@ class Core {
     source_ = source;
   }
 
-  // §5.1 step 5, §6b: after a non-zero cadence callback (either source), one 0
-  // when the source is Power without a crank event for BBS_POWER_STALE_MS, or
-  // none. The CSC sensor reports its own 0s.
+  // §5.1 step 5, §6b: after a non-zero cadence callback (any source), one 0
+  // when the source is Power or the trainer without a crank event for
+  // BBS_POWER_STALE_MS, or none. The CSC sensor reports its own 0s.
   void advanceCadence(uint32_t now) {
     refreshCadenceSource();
     if (!cadenceArmed_) return;
     const int p = slotIndex(SensorType::POWER);
     const CadenceSource source = currentCadenceSource();
     if (source == CadenceSource::CSC) return;
-    if (p >= 0 && source == CadenceSource::POWER &&
-        now - slots_[p].crank.lastCrankEventMs <= BBS_POWER_STALE_MS) {
-      return;
-    }
+    uint32_t lastCrank = p >= 0 ? slots_[p].crank.lastCrankEventMs : 0;
+#if BBS_COMPILE_TRAINER
+    if (source == CadenceSource::TRAINER) lastCrank = trnPower_.crank.lastCrankEventMs;
+#endif
+    if (source != CadenceSource::NONE && now - lastCrank <= BBS_POWER_STALE_MS) return;
     cadenceArmed_ = false;
     if (cadenceCb_ != nullptr) cadenceCb_(0);
   }
@@ -1670,6 +1705,22 @@ class Core {
                    !(trainer_.quietAdv() && port_.advActive());
     }
     trainer_.update(now, mayConnect, eventCb_);
+    if (trainer_.linkEnds() != trnLinkEnds_) {   // an ended trainer link frees a connection
+      trnLinkEnds_ = trainer_.linkEnds();
+      releaseCapacity(now);
+    }
+    if (trnPower_.hasValue && !trainer_.ready()) {
+      MuxGuard guard(tableMux_);
+      trnPower_ = {};
+    }
+  }
+
+  // Read-along 0x2A63, §6 as the Power slot.
+  void onTrainerCps(const uint8_t* data, uint8_t len, uint32_t now) {
+    PowerSample sample = trnPower_.power;
+    bool updated = false;
+    if (!parsePower(data, len, now, trnPower_.crank, sample, updated)) return;
+    storePower(trnPower_, sample, updated, now, CadenceSource::TRAINER, trainerPowerCb_);
   }
 #endif
 
@@ -1736,6 +1787,11 @@ class Core {
   Trainer trainer_;
 #endif
   bool trainerMirror_ = false;          // setTrainerMirror(), applied by begin()
+  uint16_t trnLinkEnds_ = 0;            // trainer_.linkEnds() at the last trainerStep()
+  // The read-along sample, fields as in SensorSlot; under tableMux_ except
+  // crank. Cleared when the link leaves READY.
+  struct { bool hasValue; PowerSample power; uint32_t valueMs, crankMs; CrankState crank; } trnPower_{};
+  void (*trainerPowerCb_)(const PowerSample&) = nullptr;
 #endif
 };
 

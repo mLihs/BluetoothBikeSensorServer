@@ -104,7 +104,7 @@ Before a successful `begin()` (and after a successful `end()`), `update()`, `add
 | `bool addByName(SensorType, const char* name)` | NAME mode. Exact, case-sensitive match. |
 | `bool remove(SensorType)` | From every state; a live link is disconnected first. True once the slot is empty or on its way there. |
 | `bool connected(SensorType)` | Subscribed: between `SENSOR_CONNECTED` and `SENSOR_DISCONNECTED`. |
-| `bool info(SensorType, SensorInfo&)` | Name, MAC, address type, state, battery, last disconnect reason, `encrypted`, `providesCadence`. False only for a type that is not compiled. |
+| `bool info(SensorType, SensorInfo&)` | Name, MAC, address type, state, battery, last disconnect reason, `encrypted`, `providesCadence`; for diagnostics `failCount`, `nameFallback`, `capWait`, `capReason`. False only for a type that is not compiled. |
 
 `addBy*` returns false for a type outside the `begin()` mask, in the other mode, under quiesce, for an empty name, or when **another** type already holds the same MAC (or, in NAME mode, the same name). Identical names for different types are rejected on purpose. Calling `addBy*` again for the same type replaces the identity and reconnects. In NAME mode, avoid a name that equals another sensor's shortened advertised name: the slot that resolves first keeps that address until `remove()` or a replace.
 
@@ -189,9 +189,13 @@ The relay copies a smart trainer's GATT once (setup) and serves that copy, so an
 | `bool trainerSetup(const char* mac)` | After `begin()`. A 5 s discovery for the trainer's advertising and address type (also ends with `DISCOVERY_DONE`), then connect with advertising off, discover, read and check; `TRAINER_SETUP_DONE` carries a `TrainerCheck` in `reason`, and only `OK` stores the table in NVS (`bbs`/`trn_gatt`). The mirror uses it after `end()` + `begin()` or a reboot. |
 | `bool trainerForget()` | After `begin()` (also a failed one). Erases the stored table. |
 | `void trainerInfo(TrainerInfo&)` | State, MACs, hash, counts, MTUs and relay counters. |
-| `void trainerReadAlong(uint16_t uuid16, bool on)` + `setTrainerDataCallback(...)` | Subscribes the trainer's notify/indicate characteristics with that UUID for the callback (called inside `update()`), with or without an app. |
+| `void trainerReadAlong(uint16_t uuid16, bool on)` + `setTrainerDataCallback(...)` | Subscribes the trainer's notify/indicate characteristics with that UUID for the callback (called inside `update()`), with or without an app. `begin()` turns it on for `0x2A63` when the mirror is on. |
+| `bool trainerPower(PowerSample&, uint32_t& ageMs)` + `setTrainerPowerCallback(void (*)(const PowerSample&))` | The trainer's Cycling Power Measurement (`0x2A63` read-along), decoded and stale-checked like `lastPower()`. False until a sample arrived on the ready link; cleared when the link drops. Any task. The callback runs inside `update()` on each sample. |
+| `bool trainerInPsram()` | The mirror runtime lies in PSRAM (diagnostics). |
 
-All trainer functions belong to the `update()` task, like `stats()`.
+All other trainer functions belong to the `update()` task, like `stats()`.
+
+- The trainer's crank data is the lowest-priority cadence source: CSC sensor, then power meter, then the trainer while its link is ready. `lastCadence()` and the cadence callback (including the one 0 after `BBS_POWER_STALE_MS` without a crank event) work as for the power meter.
 
 - The mirror advertises only while the trainer link is ready and no app is connected; losing the trainer disconnects the app. One app at a time.
 - Advertising: flags, the trainer's service data and appearance, and its first 128-bit service if it fits; the scan response holds the complete 16-bit service list (without `0x180A`/`0x180F`, HR `0x180D` last) and the name. If the scan response does not fit 31 bytes, `begin()` fails (shorter name or `setTrainerMirror(false)`).

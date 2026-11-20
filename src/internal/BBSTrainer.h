@@ -165,10 +165,17 @@ class Trainer {
   bool advertise() const { return link_ == Link::READY && appConn_ == kConnHandleNone && addrSet_; }
   bool idle() const { return link_ == Link::DOWN; }
   bool connecting() const { return link_ == Link::CONNECTING; }
+  bool ready() const { return link_ == Link::READY; }
   // The setup link connects with advertising off (S3 controller resources).
   bool quietAdv() const { return mode_ == Mode::SETUP && !capturing_; }
   uint16_t connHandle() const { return conn_; }
+  uint16_t linkEnds() const { return linkEnds_; }   // ended links (mirror or setup)
   void setDataCallback(void (*cb)(uint16_t, const uint8_t*, uint8_t)) { dataCb_ = cb; }
+  // Core's decoder for the read-along 0x2A63, called before the data callback.
+  void setCpsHook(void* ctx, void (*hook)(void*, const uint8_t*, uint8_t, uint32_t)) {
+    cpsCtx_ = ctx;
+    cpsHook_ = hook;
+  }
   bool forget() { return port_ != nullptr && port_->eraseTable(); }
 
   // Core::begin(), before the server starts: a fresh session. With `on`,
@@ -477,6 +484,7 @@ class Trainer {
   // it, not the mirror link setup() closed.
   void linkLost(uint32_t now, int reason) {
     const Link was = link_;
+    if (conn_ != kConnHandleNone) linkEnds_++;
     link_ = Link::DOWN;
     conn_ = kConnHandleNone;
     clearRelay();
@@ -771,7 +779,11 @@ class Trainer {
     info_.up++;
     const bool toApp = appConn_ != kConnHandleNone && appSub_[i] != 0;
     if (ev.status > ev.len || (toApp && ev.len + 3u > info_.appMtu)) info_.oversize++;
-    if (internal_[i] && dataCb_ != nullptr) dataCb_(uuid16(table_.chr[i].uuid), ev.data, ev.len);
+    if (internal_[i]) {
+      const uint16_t uuid = uuid16(table_.chr[i].uuid);
+      if (uuid == 0x2A63 && cpsHook_ != nullptr) cpsHook_(cpsCtx_, ev.data, ev.len, lastNow_);
+      if (dataCb_ != nullptr) dataCb_(uuid, ev.data, ev.len);
+    }
     if (!toApp) return;
     if ((appSub_[i] & 1) != 0) {
       if (port_->notifyApp(appConn_, i, ev.data, ev.len, false) != 0) info_.dropped++;
@@ -814,6 +826,8 @@ class Trainer {
   TrainerPort* port_ = nullptr;
   EventCallback cb_ = nullptr;
   void (*dataCb_)(uint16_t, const uint8_t*, uint8_t) = nullptr;
+  void* cpsCtx_ = nullptr;
+  void (*cpsHook_)(void*, const uint8_t*, uint8_t, uint32_t) = nullptr;
   TrnQueue queue_;
   TrnBlob stored_{};                    // the mirror's table, read-only after begin()
   const TrnTable& table_ = stored_.table;
@@ -829,6 +843,7 @@ class Trainer {
   uint8_t peer_[6] = {};                // address of the current link
   TrainerInfo info_{};                  // counters, MTUs, hash, address; info() adds the rest
   uint16_t linkGen_ = 0;
+  uint16_t linkEnds_ = 0;
   uint16_t conn_ = kConnHandleNone;
   uint32_t lastNow_ = 0;
   uint32_t sinceMs_ = 0;                // entry into CONNECTING, DISCOVERING or CLOSING

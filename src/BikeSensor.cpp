@@ -4,6 +4,9 @@
 // arduino-esp32 3.3.7+ releases the BT controller memory unless a library
 // includes this header (docs/history/ARDUINO_ESP32_3.3.7_FIX.md, written for 2.x).
 #include "esp32-hal-bt-mem.h"
+#if BBS_COMPILE_TRAINER
+#include <esp_memory_utils.h>
+#endif
 
 #include "internal/BBSCore.h"
 #include "internal/BBSNimBLEPort.h"
@@ -103,6 +106,9 @@ void trainerReadAlong(uint16_t uuid16, bool on) {
 void setTrainerDataCallback(void (*cb)(uint16_t, const uint8_t*, uint8_t)) {
   core.trainer().setDataCallback(cb);
 }
+bool trainerPower(PowerSample& out, uint32_t& ageMs) { return core.trainerPower(out, ageMs, millis()); }
+void setTrainerPowerCallback(void (*cb)(const PowerSample&)) { core.setTrainerPowerCallback(cb); }
+bool trainerInPsram() { return esp_ptr_external_ram(&core.trainer()); }
 #endif
 
 // 2.x table (Bluetooth Core Spec Vol 2 Part D). NimBLE reports HCI reasons as

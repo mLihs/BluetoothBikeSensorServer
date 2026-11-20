@@ -6421,30 +6421,76 @@ static void testNameFallback() {
 }
 
 #if BBS_COMPILE_TRAINER
-// A trainer that is off: every connect ends with CONNECT_FAIL.
+// A trainer that is off: every connect ends with CONNECT_FAIL. on: the
+// stored table's GATT (CPS 0x1818 with 0x2A63 at handle 3, CCCD 4) answers.
 struct TrainerStub final : bs::TrainerPort {
+  static constexpr uint16_t kConn = 7;
   Core* core = nullptr;
   FakePort* port = nullptr;
-  int connects = 0;
-  int connect(const uint8_t*, uint8_t, uint16_t gen) override {
+  bool on = false, linked = false;
+  uint16_t gen = 0;
+  int connects = 0, cccdWrites = 0;
+  void push(bs::TrnEv kind, int16_t status = 0, uint16_t h1 = 0, uint16_t h2 = 0,
+            uint16_t uuid = 0, const uint8_t* data = nullptr, uint8_t len = 0) {
+    bs::TrnEvent ev{};
+    ev.kind = kind;
+    ev.gen = gen;
+    ev.status = status;
+    ev.h1 = h1;
+    ev.h2 = h2;
+    ev.idx = kind == bs::TrnEv::CHR ? bs::kPropNotify : 0;
+    if (uuid != 0) ev.uuid = bs::TrnUuid{2, {static_cast<uint8_t>(uuid), static_cast<uint8_t>(uuid >> 8)}};
+    ev.len = len;
+    if (data != nullptr) memcpy(ev.data, data, len);
+    assert(core->trainer().queue().push(ev));
+  }
+  void notify(const uint8_t* data, uint8_t len) { push(bs::TrnEv::NOTIFY, len, 3, 0, 0, data, len); }
+  void drop() {
+    linked = false;
+    push(bs::TrnEv::DISCONNECTED, 0x08);
+  }
+  int connect(const uint8_t*, uint8_t, uint16_t g) override {
     connects++;
     assert(!port->discOn && !port->connOn);   // the initiator is free
-    bs::TrnEvent ev{};
-    ev.kind = bs::TrnEv::CONNECT_FAIL;
-    ev.gen = gen;
-    ev.status = bs::kHsETimeout;
-    assert(core->trainer().queue().push(ev));
+    gen = g;
+    linked = on;
+    if (on) {
+      push(bs::TrnEv::CONNECTED, 0, kConn);
+    } else {
+      push(bs::TrnEv::CONNECT_FAIL, bs::kHsETimeout);
+    }
     return 0;
   }
   void cancelConnect() override {}
-  void terminate(uint16_t) override {}
-  bool connAlive(uint16_t, const uint8_t*) override { return false; }
-  int exchangeMtu(uint16_t, uint16_t) override { return 0; }
-  int discServices(uint16_t, uint16_t) override { return 0; }
-  int discChrs(uint16_t, uint16_t, uint16_t, uint16_t) override { return 0; }
-  int discDscs(uint16_t, uint16_t, uint16_t, uint16_t) override { return 0; }
+  void terminate(uint16_t) override {
+    if (linked) drop();
+  }
+  bool connAlive(uint16_t conn, const uint8_t* peer) override { return linked && peer && conn == kConn; }
+  int exchangeMtu(uint16_t, uint16_t) override {
+    push(bs::TrnEv::MTU, 0, 107);
+    return 0;
+  }
+  int discServices(uint16_t, uint16_t) override {
+    push(bs::TrnEv::SVC, 0, 1, 4, 0x1818);
+    push(bs::TrnEv::PROC_DONE);
+    return 0;
+  }
+  int discChrs(uint16_t, uint16_t, uint16_t, uint16_t) override {
+    push(bs::TrnEv::CHR, 0, 2, 3, 0x2A63);
+    push(bs::TrnEv::PROC_DONE);
+    return 0;
+  }
+  int discDscs(uint16_t, uint16_t, uint16_t, uint16_t) override {
+    push(bs::TrnEv::DSC, 0, 4, 0, 0x2902);
+    push(bs::TrnEv::PROC_DONE);
+    return 0;
+  }
   int read(uint16_t, uint16_t, uint16_t) override { return 0; }
-  int write(uint16_t, uint16_t, const uint8_t*, uint8_t, bool, uint16_t) override { return 0; }
+  int write(uint16_t, uint16_t handle, const uint8_t*, uint8_t, bool response, uint16_t) override {
+    cccdWrites += handle == 4;
+    if (response) push(bs::TrnEv::WRITE_DONE);
+    return 0;
+  }
   int notifyApp(uint16_t, uint8_t, const uint8_t*, uint8_t, bool) override { return 0; }
   void disconnectApp(uint16_t) override {}
   void disconnectApps() override {}
@@ -6490,6 +6536,159 @@ static void testTrainerArbitration() {
   r.update();                         // the trainer takes the report
   r.update();
   assert(stub.connects == 7 && r.port.discCancels == cancels + 1);
+}
+
+static BikeSensor::PowerSample g_trnSamples[8];
+static int g_trnCalls = 0;
+static void onTrainerPower(const BikeSensor::PowerSample& s) {
+  assert(g_trnCalls < 8);
+  g_trnSamples[g_trnCalls++] = s;
+}
+
+// NEO 2T CPS (flags 0x0030: wheel + crank): watts, crank revs, event time (1/1024 s).
+static void trainerCps(TrainerStub& stub, int16_t watts, uint16_t revs, uint16_t t) {
+  const uint8_t p[] = {0x30, 0x00, static_cast<uint8_t>(watts), static_cast<uint8_t>(watts >> 8),
+                       0, 0, 0, 0, 0, 0, static_cast<uint8_t>(revs), static_cast<uint8_t>(revs >> 8),
+                       static_cast<uint8_t>(t), static_cast<uint8_t>(t >> 8)};
+  stub.notify(p, sizeof(p));
+}
+
+// § 3 read-along: begin() with the mirror subscribes 0x2A63; trainerPower()
+// and its callback per sample; the trainer crank is the cadence source after
+// CSC and Power; stale → one 0; a lost link clears the sample.
+static void testTrainerReadAlong() {
+  Rig r;
+  TrainerStub stub;
+  stub.core = r.core.get();
+  stub.port = &r.port;
+  stub.on = true;
+  r.core->trainer().attach(stub);
+  r.core->setTrainerMirror(true);
+  r.core->setCadenceCallback(onCadence);
+  r.core->setTrainerPowerCallback(onTrainerPower);
+  resetValues(r);
+  g_trnCalls = 0;
+  assert(r.core->begin("homewind", 0x07, Mode::MAC));
+  BikeSensor::PowerSample s{};
+  uint32_t age = 0;
+  uint16_t rpm = 0;
+  for (int k = 0; k < 20 && !r.core->trainer().ready(); ++k) r.at(r.now + 10);
+  assert(r.core->trainer().ready() && stub.cccdWrites == 1);
+  assert(!r.core->trainerPower(s, age, r.now) && !r.core->lastCadence(rpm, age, r.now));
+
+  trainerCps(stub, 150, 10, 1024);    // first crank packet: no cadence yet
+  r.update();
+  assert(g_trnCalls == 1 && g_trnSamples[0].watts == 150 && g_cadCalls == 0);
+  assert(r.core->trainerPower(s, age, r.now + 5) && s.watts == 150 && age == 5);
+  assert(!r.core->lastCadence(rpm, age, r.now));
+  r.now += 1000;
+  trainerCps(stub, 160, 11, 2048);    // +1 rev in 1 s
+  r.update();
+  assert(g_trnCalls == 2 && g_cadCalls == 1 && g_cadValues[0] == 60);
+  assert(r.core->lastCadence(rpm, age, r.now) && rpm == 60 && age == 0);
+
+  cscToSubscribed(r);                 // CSC first: no cadence callback from the trainer
+  r.now += 1000;
+  trainerCps(stub, 170, 13, 3072);
+  r.update();
+  assert(g_trnCalls == 3 && g_cadCalls == 1);
+  assert(notifyEv(r, kCscFirst, sizeof(kCscFirst), kCsc));
+  r.update();
+  assert(!r.core->lastCadence(rpm, age, r.now));       // the CSC sensor's, none yet
+  r.core->remove(SensorType::SPEED_CADENCE, r.now);
+  r.discEv(r.cscGen(), 0x16, kCsc);
+  r.update();
+  assert(r.core->lastCadence(rpm, age, r.now) && rpm == 120);
+  r.now += 1000;
+  trainerCps(stub, 170, 14, 4096);
+  r.update();
+  assert(g_cadCalls == 2 && g_cadValues[1] == 60);
+  r.at(r.now + BBS_POWER_STALE_MS + 1);                // no crank event: one 0
+  assert(g_cadCalls == 3 && g_cadValues[2] == 0);
+  r.at(r.now + 10);
+  assert(g_cadCalls == 3);
+#if BBS_COMPILE_POWER
+  powerToSubscribed(r);               // Power before the trainer
+  trainerCps(stub, 180, 16, 5120);
+  r.update();
+  assert(g_trnCalls == 5 && g_cadCalls == 3 && !r.core->lastCadence(rpm, age, r.now));
+#endif
+
+  stub.drop();
+  r.update();
+  assert(!r.core->trainer().ready() && !r.core->trainerPower(s, age, r.now));
+}
+
+// Link drop with a non-zero cadence → one 0; the reconnect subscribes 0x2A63
+// again without a cadence spike; with the mirror off nothing connects.
+static void testTrainerLinkCycle() {
+  {
+    Rig r;
+    TrainerStub stub;
+    stub.core = r.core.get();
+    stub.port = &r.port;
+    stub.on = true;
+    r.core->trainer().attach(stub);
+    assert(r.core->begin("homewind", 0x07, Mode::MAC));
+    for (int k = 0; k < 1000; ++k) r.at(r.now + 10);
+    assert(stub.connects == 0 && !r.core->trainer().ready());
+  }
+  Rig r;
+  TrainerStub stub;
+  stub.core = r.core.get();
+  stub.port = &r.port;
+  stub.on = true;
+  r.core->trainer().attach(stub);
+  r.core->setTrainerMirror(true);
+  r.core->setCadenceCallback(onCadence);
+  resetValues(r);
+  assert(r.core->begin("homewind", 0x07, Mode::MAC));
+  for (int k = 0; k < 20 && !r.core->trainer().ready(); ++k) r.at(r.now + 10);
+  assert(r.core->trainer().ready());
+  trainerCps(stub, 150, 10, 1024);
+  r.update();
+  r.now += 1000;
+  trainerCps(stub, 150, 11, 2048);
+  r.update();
+  assert(g_cadCalls == 1 && g_cadValues[0] == 60);
+  stub.drop();
+  r.update();
+  assert(g_cadCalls == 2 && g_cadValues[1] == 0);
+  for (int k = 0; k < 1000 && !r.core->trainer().ready(); ++k) r.at(r.now + 10);
+  assert(r.core->trainer().ready() && stub.cccdWrites == 2);
+  trainerCps(stub, 150, 500, 9000);   // revs and time far ahead: no delta yet
+  r.update();
+  assert(g_cadCalls == 2);
+  r.now += 1000;
+  trainerCps(stub, 150, 501, 10024);
+  r.update();
+  assert(g_cadCalls == 3 && g_cadValues[2] == 60);
+}
+
+// A slot parked by a capacity failure (capWait) resumes when the trainer
+// link ends, as after an ended sensor link (§5.2 rev 37).
+static void testTrainerLinkReleasesCapacity() {
+  Rig r;
+  TrainerStub stub;
+  stub.core = r.core.get();
+  stub.port = &r.port;
+  stub.on = true;
+  r.core->trainer().attach(stub);
+  r.core->setTrainerMirror(true);
+  assert(r.core->begin("homewind", 0x07, Mode::MAC));
+  for (int k = 0; k < 20 && !r.core->trainer().ready(); ++k) r.at(r.now + 10);
+  assert(r.core->trainer().ready());
+  r.port.connectOk = false;
+  r.port.connectErr = bs::kHsENoMem;
+  r.add();
+  matchInNextWindow(r, kMac);
+  assert(r.state() == SlotState::WAIT_SCAN && r.hr().capWait);
+  r.at(r.now + 1000);
+  assert(r.hr().capWait);                              // no event: still parked
+  r.port.connectOk = true;
+  stub.drop();
+  r.update();
+  assert(!r.hr().capWait && (r.state() == SlotState::FOUND || r.state() == SlotState::CONNECTING));
 }
 #endif
 
@@ -6591,6 +6790,9 @@ int main() {
 #endif
 #if BBS_COMPILE_TRAINER
   testTrainerArbitration();
+  testTrainerReadAlong();
+  testTrainerLinkCycle();
+  testTrainerLinkReleasesCapacity();
 #endif
   testDiscoveryNatural();
   testDiscoveryFields();

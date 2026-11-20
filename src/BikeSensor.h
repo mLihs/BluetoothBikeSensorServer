@@ -90,9 +90,17 @@ bool trainerForget();                     // erases the stored table; after begi
 void trainerInfo(TrainerInfo& out);
 // Subscribes the trainer's notify/indicate characteristics with this 16-bit
 // UUID for the data callback (called inside update()), with or without an
-// app. After begin().
+// app. After begin(). begin() turns it on for 0x2A63 with the mirror; off
+// also stops trainerPower() updates (the last sample stays, stale-zeroed).
 void trainerReadAlong(uint16_t uuid16, bool on);
 void setTrainerDataCallback(void (*cb)(uint16_t uuid16, const uint8_t* data, uint8_t len));
+// The trainer's Cycling Power Measurement 0x2A63 decoded as lastPower();
+// false until a sample arrived on the ready link. Any task. The callback runs
+// inside update() on each sample. The trainer's crank is the cadence source
+// after CSC and Power (lastCadence(), setCadenceCallback()).
+bool trainerPower(PowerSample& out, uint32_t& ageMs);
+void setTrainerPowerCallback(void (*cb)(const PowerSample& sample));
+bool trainerInPsram();                    // the mirror runtime lies in PSRAM (BBS_TRAINER_PSRAM)
 #endif
 
 }  // namespace BikeSensor
