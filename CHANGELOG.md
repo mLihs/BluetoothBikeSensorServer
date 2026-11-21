@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.4] - 2026-11-21
+
+### Fixed
+- Trainer mirror advertising can no longer fail: a 16-bit service list that does not fit next to the name in the scan response is cut and sent as incomplete (AD type 0x02), FTMS (0x1826) first; a name longer than 29 bytes is shortened (0x08). Before, a trainer with five or more mirrored 16-bit services passed setup, and then every `begin()` failed (no BLE until the NVS table was erased).
+- A failed trainer setup during a mirror session resumes the mirror. Before, any setup left the relay without advertising (also no HR) and without a trainer link until the next `begin()`. After a stored setup the mirror stays off until the next `begin()` as before.
+
+### Documentation
+- Mirrored characteristics: an app's read returns the value read when the trainer link became ready (or the app's own last write), not a fresh read from the trainer. A trainer indication dropped because the event queue was full (`update()` stalled for about 48 events) is not resent.
+- `disconnectReasonString()` also applies to `TRAINER_DISCONNECTED` (0 when the library ended the link).
+
 ## [3.3.3] - 2026-11-20
 
 Published as 3.3.3 to match the GitHub release; 3.3.0 was never released.

@@ -294,10 +294,9 @@ inline TrainerCheck checkTable(const TrnTable& t, bool overflow, const TrnAdv* a
 }
 
 // § 2.4 (prototype layout): advertising = flags + the copied elements + the
-// first 128-bit service if it fits; scan response = the complete 16-bit list
-// (the table's without DIS 0x180A and battery 0x180F, then HR if hr) + the
-// complete name. False if the scan response does not fit.
-inline bool buildMirrorAdv(const TrnTable& t, const char* name, bool hr, TrnAdv& out) {
+// first 128-bit service if it fits; scan response = the 16-bit list (the
+// table's without DIS 0x180A and battery 0x180F, then HR if hr) + the name.
+inline void buildMirrorAdv(const TrnTable& t, const char* name, bool hr, TrnAdv& out) {
   out = TrnAdv{};
   const uint8_t flags[3] = {0x02, 0x01, 0x06};
   memcpy(out.adv, flags, sizeof(flags));
@@ -308,19 +307,25 @@ inline bool buildMirrorAdv(const TrnTable& t, const char* name, bool hr, TrnAdv&
     if (out.advLen + 18 <= 31) putAd(out.adv, out.advLen, 0x07, t.svc[s].b, 16);
     break;
   }
+  // FTMS first: apps filter the scan on it.
   uint8_t list[2 * (kTrnSvcMax + 1)];
   uint8_t n = 0;
-  for (uint8_t s = 0; s <= t.svcCount; ++s) {
-    const uint16_t u = s < t.svcCount ? uuid16(t.svc[s]) : hr ? 0x180D : 0;
-    if (u == 0 || u == 0x180A || u == 0x180F) continue;
-    list[n++] = static_cast<uint8_t>(u);
-    list[n++] = static_cast<uint8_t>(u >> 8);
+  for (uint8_t pass = 0; pass < 2; ++pass) {
+    for (uint8_t s = 0; s <= t.svcCount; ++s) {
+      const uint16_t u = s < t.svcCount ? uuid16(t.svc[s]) : hr ? 0x180D : 0;
+      if (u == 0 || u == 0x180A || u == 0x180F || (u == 0x1826) != (pass == 0)) continue;
+      list[n++] = static_cast<uint8_t>(u);
+      list[n++] = static_cast<uint8_t>(u >> 8);
+    }
   }
-  const size_t nameLen = strlen(name);
-  if ((n > 0 ? 2u + n : 0u) + 2u + nameLen > 31) return false;
-  if (n > 0) putAd(out.rsp, out.rspLen, 0x03, list, n);
-  putAd(out.rsp, out.rspLen, 0x09, name, nameLen);
-  return true;
+  // The name wins over the list; what does not fit is cut (0x02 incomplete
+  // list, 0x08 shortened name), so a stored table can always advertise.
+  const size_t nameLen = strlen(name) < 29 ? strlen(name) : 29;
+  const size_t room = 31 - 2 - nameLen;
+  const uint8_t fit = room >= 4 ? static_cast<uint8_t>((room - 2) & ~1u) : 0;
+  const uint8_t listLen = n < fit ? n : fit;
+  if (listLen > 0) putAd(out.rsp, out.rspLen, listLen < n ? 0x02 : 0x03, list, listLen);
+  putAd(out.rsp, out.rspLen, nameLen < strlen(name) ? 0x08 : 0x09, name, nameLen);
 }
 
 }  // namespace internal

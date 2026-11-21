@@ -61,7 +61,7 @@ class NimBLETrainer final : public TrainerPort {
   // reset (NimBLEAdvertising::onHostSync).
   bool advSet(const TrnTable& t, const char* name, bool hr) {
     TrnAdv a;
-    if (!buildMirrorAdv(t, name, hr, a)) return false;
+    buildMirrorAdv(t, name, hr, a);
     NimBLEAdvertisementData data, rsp;
     data.addData(a.adv, a.advLen);
     rsp.addData(a.rsp, a.rspLen);

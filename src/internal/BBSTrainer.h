@@ -210,8 +210,9 @@ class Trainer {
   }
 
   // After Core started the setup discovery: ends the mirror link and
-  // captures the target's advertising and address type. The mirror stays
-  // off until the next begin(); the GATT cannot change at runtime (F12).
+  // captures the target's advertising and address type. After a stored setup
+  // the mirror stays off until the next begin(); the GATT cannot change at
+  // runtime (F12).
   void setup(const uint8_t mac[6]) {
     dropLink();
     target(mac, true);
@@ -434,13 +435,18 @@ class Trainer {
     }
   }
 
+  // A failed setup resumes the running mirror (nothing was stored); after a
+  // stored one it stays off until the next begin().
   void finishSetup(TrainerCheck result) {
-    mode_ = Mode::OFF;
-    {
+    dropLink();
+    if (mirror_ && result != TrainerCheck::OK) {
+      mode_ = Mode::MIRROR;
+      target(table_.mac, false);
+    } else {
+      mode_ = Mode::OFF;
       MuxGuard guard(adMux_);
       capturing_ = false;
     }
-    dropLink();
     emit(EventType::TRAINER_SETUP_DONE, static_cast<int>(result));
   }
 

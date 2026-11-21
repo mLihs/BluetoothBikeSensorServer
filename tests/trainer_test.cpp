@@ -611,14 +611,35 @@ static void testAdv() {
   bs::copyAdFields(neoAd(true, true), t);   // service data (ADV), appearance (SCAN_RSP)
   assert(t.adLen == 9 && t.ad[1] == 0x16 && t.ad[2] == 0x82 && t.ad[3] == 0xFC && t.ad[6] == 0x19);
   bs::TrnAdv a;
-  assert(bs::buildMirrorAdv(t, "Tacx Neo 2T 14189", true, a));
+  bs::buildMirrorAdv(t, "Tacx Neo 2T 14189", true, a);
   assert(a.advLen == 3 + 9 + 18 && a.adv[12] == 17 && a.adv[13] == 0x07 && a.adv[14] == 0x9E);
   // 1816, 1818, FC82 (no DIS), HR, then the name.
   const uint8_t rsp[] = {0x09, 0x03, 0x16, 0x18, 0x18, 0x18, 0x82, 0xFC, 0x0D, 0x18, 0x12, 0x09};
   assert(a.rspLen == sizeof(rsp) + 17 && memcmp(a.rsp, rsp, sizeof(rsp)) == 0);
   assert(memcmp(a.rsp + sizeof(rsp), "Tacx Neo 2T 14189", 17) == 0);
-  assert(bs::buildMirrorAdv(t, "Homewind Relay Train1", false, a) && a.rspLen == 31);
-  assert(!bs::buildMirrorAdv(t, "Homewind Relay Train1", true, a));
+  bs::buildMirrorAdv(t, "Homewind Relay Train1", false, a);
+  assert(a.rspLen == 31);
+  assert(a.rsp[0] == 7 && a.rsp[1] == 0x03);
+  // Too many UUIDs: the list is cut (0x02), the name stays whole.
+  bs::buildMirrorAdv(t, "Homewind Relay Train1", true, a);
+  assert(a.rspLen == 31);
+  assert(a.rsp[0] == 7 && a.rsp[1] == 0x02 && a.rsp[8] == 22 && a.rsp[9] == 0x09);
+  // A name longer than the scan response: shortened (0x08), no list.
+  const char* longName = "homewind-0123456789abcdef-trainer-mirror";
+  bs::buildMirrorAdv(t, longName, true, a);
+  assert(a.rspLen == 31);
+  assert(a.rsp[0] == 30 && a.rsp[1] == 0x08 && memcmp(a.rsp + 2, longName, 29) == 0);
+  // FTMS goes first, also when the table lists it last.
+  bs::TrnTable f = t;
+  assert(f.svcCount < bs::kTrnSvcMax);
+  f.svc[f.svcCount++] = bs::TrnUuid{2, {0x26, 0x18}};
+  bs::buildMirrorAdv(f, "homewind-01234567", true, a);
+  assert(a.rsp[0] == 11 && a.rsp[1] == 0x03 && a.rsp[2] == 0x26 && a.rsp[3] == 0x18);
+  // A sixth UUID no longer fits next to the 17-character relay name.
+  f.svc[f.svcCount++] = bs::TrnUuid{2, {0x10, 0xFE}};
+  bs::buildMirrorAdv(f, "homewind-01234567", true, a);
+  assert(a.rspLen == 31);
+  assert(a.rsp[0] == 11 && a.rsp[1] == 0x02 && a.rsp[2] == 0x26 && a.rsp[3] == 0x18);
 }
 
 // ---- Runtime
@@ -1227,6 +1248,23 @@ static void testSetupWhileMirror() {
   }
 }
 
+// A failed setup during a mirror session resumes the mirror.
+static void testFailedSetupResumesMirror() {
+  static bs::Trainer t;
+  static FakePort p(t);
+  uint32_t now = 1000;
+  ready(t, p, now, false);
+  const int connects = p.connects;
+  t.setup(kNeoMac);
+  run(t, now, 1);
+  assert(info(t).state == TrainerState::SETUP && !t.advertise());
+  t.discoveryDone();   // the trainer was not seen
+  run(t, now);
+  assert(countEvents(EventType::TRAINER_SETUP_DONE, int(TrainerCheck::NOT_FOUND)) == 1);
+  assert(t.mirror() && info(t).state == TrainerState::READY && t.advertise());
+  assert(p.connects > connects);
+}
+
 // M-2: a stalled update() fills the queue with notifications; the reserve
 // still takes writes, subscriptions and a disconnect; only notifications drop.
 static void testNotifyReserve() {
@@ -1340,6 +1378,7 @@ int main() {
   testChanged();
   testDiscoveryFailure();
   testSetupWhileMirror();
+  testFailedSetupResumesMirror();
   testNotifyReserve();
   testLostAppConnect();
   testLongIndication();

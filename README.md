@@ -2,10 +2,10 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Version**: 3.3.3
+**Version**: 3.3.4
 **Platform**: ESP32 (Arduino Core 3.x)
 **Author**: Martin Lihs  
-**Last Updated**: 2026-11-13
+**Last Updated**: 2026-11-21
 
 > **3.0 is a new major version.** The 2.x functions (`BluetoothBikeSensorServer*`, `BikeSensorServer*`), `BLETelemetry` and `HomewindBleIdentity` are gone; there is no compatibility layer. See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
@@ -155,7 +155,7 @@ Pairing: with a CSC sensor set up, pair the app's cadence to the relay's CSC ser
 | `CENTRAL_SUBSCRIBED` / `CENTRAL_UNSUBSCRIBED` | `sensorType` of the local characteristic |
 | `HOST_RESET` | NimBLE host reset; slots recover on their own |
 
-`disconnectReasonString(int)` names NimBLE's HCI reasons (`0x200` + HCI code, e.g. `0x213` "Remote User Terminated"); other non-zero codes give "Unknown Reason". Use it only for `SENSOR_DISCONNECTED`/`CENTRAL_DISCONNECTED` reasons and `info().lastDisconnectReason`.
+`disconnectReasonString(int)` names NimBLE's HCI reasons (`0x200` + HCI code, e.g. `0x213` "Remote User Terminated"); other non-zero codes give "Unknown Reason". Use it only for `SENSOR_DISCONNECTED`/`CENTRAL_DISCONNECTED`/`TRAINER_DISCONNECTED` reasons and `info().lastDisconnectReason` (`TRAINER_DISCONNECTED` gives 0 when the library ended the link itself).
 
 ### Relay server and advertising
 
@@ -179,14 +179,14 @@ The server has one service per type in the `begin()` mask: HR `0x2A37`; CSC `0x2
 
 `quiesce()` stops advertising, discovery, scans and connects and is one-way until `end()` + `begin()` (or reboot). `update()` must keep running; `quiesced()` turns true once nothing is in flight. Connected sensors may remain; remove them afterwards if needed.
 
-### Trainer mirror (`BBS_COMPILE_TRAINER=1`, unreleased)
+### Trainer mirror (`BBS_COMPILE_TRAINER=1`)
 
 The relay copies a smart trainer's GATT once (setup) and serves that copy, so an app connects to the relay as if it were the trainer while the relay keeps its own trainer link and its HR service.
 
 | Function | Notes |
 |---|---|
 | `void setTrainerMirror(bool on)` | Before `begin()`. With a stored table the server gets the mirrored services instead of the local CSC and Power services (HR stays) and a static random address derived from the table's structure hash. |
-| `bool trainerSetup(const char* mac)` | After `begin()`. A 5 s discovery for the trainer's advertising and address type (also ends with `DISCOVERY_DONE`), then connect with advertising off, discover, read and check; `TRAINER_SETUP_DONE` carries a `TrainerCheck` in `reason`, and only `OK` stores the table in NVS (`bbs`/`trn_gatt`). The mirror uses it after `end()` + `begin()` or a reboot. |
+| `bool trainerSetup(const char* mac)` | After `begin()`. A 5 s discovery for the trainer's advertising and address type (also ends with `DISCOVERY_DONE`), then connect with advertising off, discover, read and check; `TRAINER_SETUP_DONE` carries a `TrainerCheck` in `reason`, and only `OK` stores the table in NVS (`bbs`/`trn_gatt`). The mirror uses it after `end()` + `begin()` or a reboot. A running mirror stops for the setup; a failed setup resumes it. |
 | `bool trainerForget()` | After `begin()` (also a failed one). Erases the stored table. |
 | `void trainerInfo(TrainerInfo&)` | State, MACs, hash, counts, MTUs and relay counters. |
 | `void trainerReadAlong(uint16_t uuid16, bool on)` + `setTrainerDataCallback(...)` | Subscribes the trainer's notify/indicate characteristics with that UUID for the callback (called inside `update()`), with or without an app. `begin()` turns it on for `0x2A63` when the mirror is on. |
@@ -198,11 +198,11 @@ All other trainer functions belong to the `update()` task, like `stats()`.
 - The trainer's crank data is the lowest-priority cadence source: CSC sensor, then power meter, then the trainer while its link is ready. `lastCadence()` and the cadence callback (including the one 0 after `BBS_POWER_STALE_MS` without a crank event) work as for the power meter.
 
 - The mirror advertises only while the trainer link is ready and no app is connected; losing the trainer disconnects the app. One app at a time.
-- Advertising: flags, the trainer's service data and appearance, and its first 128-bit service if it fits; the scan response holds the complete 16-bit service list (without `0x180A`/`0x180F`, HR `0x180D` last) and the name. If the scan response does not fit 31 bytes, `begin()` fails (shorter name or `setTrainerMirror(false)`).
+- Advertising: flags, the trainer's service data and appearance, and its first 128-bit service if it fits; the scan response holds the 16-bit service list (without `0x180A`/`0x180F`; FTMS `0x1826` first, HR `0x180D` last) and the name. What does not fit 31 bytes is cut: the list first (sent as incomplete, AD type 0x02), a name over 29 bytes is shortened (0x08).
 - Reconnects back off from 1 s up to 30 s; after a failed connect, a scan report of the trainer brings the next attempt forward to 1 s (not after a failed discovery or check).
 - Not mirrored: GAP `0x1800`, GATT `0x1801`, DFU services and the trainer's HR `0x180D`. Services without characteristics are dropped unless the trainer lists them (service UUIDs or 16-bit service data); if the setup scan caught no scan response, none are dropped. A kept empty service, a notify/indicate characteristic without CCCD or a missing advertised service fails the setup check.
-- App writes and subscriptions reach the trainer in order (a subscription before any later write), with the trainer's write type; a failed CCCD write is retried. Values are capped at 104 bytes (`BBS_TRAINER_VALUE_MAX`, the NEO's MTU 107 − 3; its ~70-byte FC82 device-info indication passes whole). Changing the cap changes the stored table's layout: an older table is rejected at `begin()` (no mirror) and the setup must run again. Indications to the app are queued (8) with one outstanding.
-- If `update()` stalls, trainer notifications are dropped (counted in `dropped`) before any control event: 8 of the 48 queue slots are kept for writes, subscriptions, link events and trainer indications (NimBLE has confirmed those to the trainer already). If a control event is still lost, the links are checked first, then the trainer link is rebuilt and every app is disconnected.
+- App writes and subscriptions reach the trainer in order (a subscription before any later write), with the trainer's write type; a failed CCCD write is retried. Values are capped at 104 bytes (`BBS_TRAINER_VALUE_MAX`, the NEO's MTU 107 − 3; its ~70-byte FC82 device-info indication passes whole). Changing the cap changes the stored table's layout: an older table is rejected at `begin()` (no mirror) and the setup must run again. Indications to the app are queued (8) with one outstanding. An app's read gets the value read when the trainer link became ready (or the app's own last write), not a fresh read from the trainer.
+- If `update()` stalls, trainer notifications are dropped (counted in `dropped`) before any control event: 8 of the 48 queue slots are kept for writes, subscriptions, link events and trainer indications (NimBLE has confirmed those to the trainer already); a trainer indication that finds even those full is dropped and not resent. If a control event is still lost, the links are checked first, then the trainer link is rebuilt and every app is disconnected.
 - While the mirror is active, `NimBLEDevice::setMTU(247)` is set for all links until reboot. With the flag on, static RAM grows by about 19.9 KB (Trainer vs. Basic_MAC); include that in heap checks.
 - After a NimBLE host reset, NimBLE briefly advertises with its own random address until the next `update()` sets the mirror's address again (milliseconds; accepted).
 - `TRAINER_CONNECTED` with `reason` 1 (reported once, no `TRAINER_DISCONNECTED` follows) means the trainer's GATT no longer matches the stored table (state `CHANGED`, not advertised, retried every 30 s); run the setup again.

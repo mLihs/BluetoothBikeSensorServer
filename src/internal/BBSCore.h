@@ -745,7 +745,8 @@ class Core {
 
   // A kTrnSetupScanMs discovery for the trainer's advertising (and address
   // type), then its GATT into NVS; TRAINER_SETUP_DONE reports the
-  // TrainerCheck. Ends the mirror link until the next begin(). False if not
+  // TrainerCheck. Ends the mirror link; a failed setup resumes it, a stored
+  // one keeps it off until the next begin(). False if not
   // begun, under quiesce, for a bad MAC or while a discovery is pending or open.
   bool trainerSetup(const char* mac, uint32_t now) {
     uint8_t bytes[6];
