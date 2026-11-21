@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [3.3.0] - 2026-11-20
+## [3.3.3] - 2026-11-20
+
+Published as 3.3.3 to match the GitHub release; 3.3.0 was never released.
 
 Trainer mirror (M1/M2a) for Homewind 2.0. Default remains `BBS_COMPILE_TRAINER=0`; Homewind release builds enable it via `build_opt.h`.
 

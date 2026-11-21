@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Version**: 3.3.0
+**Version**: 3.3.3
 **Platform**: ESP32 (Arduino Core 3.x)
 **Author**: Martin Lihs  
 **Last Updated**: 2026-11-13
